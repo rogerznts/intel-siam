@@ -82,15 +82,32 @@ fazemos hoje com a nuvem Intelbras. É HTTP, não o protocolo P2P binário.
   runtime). Precisam vir da decompilação do init ou de uma captura ao vivo.
 - `[H]` A conta de e-mail/telefone do usuário é obrigatória para o login; sem ela não há o que ler.
 
-Dois jeitos de executar a rota E:
-1. **Captura ao vivo (mais barato).** Rodar o iCSee sob um proxy HTTPS com CA local, logar no app e gravar as
-   requisições de login e de lista. Entrega os endpoints exatos, a assinatura e um `userToken` real, sem reimplementar
-   a cripto. Bloqueia só se houver pinning nos endpoints XM (não observado).
-2. **Reimplementar o HTTP.** Extrair `uuid`/`appKey`/`appSecret` e o algoritmo de sign do binário e refazer o login
-   em Rust. Mais trabalho, mas vira código no Intel SIAM.
+### Captura ao vivo (2026-10-27): o que a conta expõe por HTTP
 
-Em ambos, a lista traz série, usuário e senha de cada câmera; o vídeo em si ainda usa P2P/DSS (rotas B/C) ou, se a
-câmera estiver no DVR, o túnel Intelbras que já temos.
+Proxy HTTPS (mitmproxy) com CA local; o app auto-logou com o token salvo e abriu a lista. SSL pinning só nas libs de
+anúncio; os endpoints XM passaram em claro.
+
+- `[O]` O app manda em todo request os headers fixos `uuid: xmeye` e um `appKey` (header), mais `timemillis` e
+  `signature` (MD5 hex). São as chaves da aplicação; valem para qualquer instalação do iCSee, não são do usuário.
+- `[O]` Token de conta: `POST boss-api.jftechsoft.com/account/userToken/login` com o `accessToken` salvo (JWT, 30
+  dias) devolve `accessToken` + `publicKey` RSA. O login por e-mail/senha (`/ios/login/va1`) não disparou porque o
+  token ainda era válido.
+- `[O]` Token de dispositivo: `POST api-sa.jftechws.com/gwp/v3/rtc/device/token` com `{"sns":[...],"accessToken":…}`
+  devolve um token opaco por aparelho, usado nos serviços de nuvem.
+- `[O]` Com esse token dá para `getDeviceAlarmList` (eventos de IA: detecção de pessoa, horário, canal) e `getPicUrl`
+  (URL assinada de um **snapshot** JPEG do evento). Imagens periódicas, não vídeo ao vivo.
+- `[O]` **Veredito: a conta por HTTP NÃO entrega vídeo ao vivo nem a credencial RTSP da câmera.** Não apareceu
+  nenhuma URL `rtsp/hls/m3u8/livestream`, nenhuma senha de câmera e nenhuma lista de dispositivos com credencial. O
+  vídeo ao vivo e a lista com senha trafegam pelo protocolo P2P binário da Xiongmai, fora do HTTPS.
+- `[I]` Ler da conta serve para metadados (séries que a conta possui, alarmes de IA, snapshots). Para o Intel SIAM
+  mostrar vídeo ao vivo das câmeras iCSee continua valendo a rota C (reimplementar o P2P, caro) ou a rota pelo DVR
+  (ONVIF), se a câmera estiver no gravador.
+
+Dois jeitos de ler o que a conta expõe (metadados):
+1. **Captura ao vivo.** Feito aqui; entrega endpoints, assinatura e um token real sem reimplementar cripto.
+2. **Reimplementar o HTTP em Rust.** As chaves (`uuid`/`appKey`) e o algoritmo de sign estão no binário.
+
+O vídeo em si ainda usa P2P/DSS (rotas B/C) ou, se a câmera estiver no DVR, o túnel Intelbras que já temos.
 
 ## Como o SIM da Intelbras "suporta" essas câmeras
 
