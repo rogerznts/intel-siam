@@ -1,0 +1,66 @@
+{
+  "count": 1,
+  "next": null,
+  "previous": null,
+  "results": [
+    {
+      "id": 1000001,
+      "serial_number": "ABC0000000001",
+      "type": "DVR",
+      "data": {
+        "ddns": "",
+        "name": "casa",
+        "model": "MHDX 3108-C",
+        "main_ip": "",
+        "channels": [
+          {
+            "name": "Canal1",
+            "index": 0
+          },
+          {
+            "name": "Canal2",
+            "index": 1
+          },
+          {
+            "name": "Canal3",
+            "index": 2
+          },
+          {
+            "name": "Canal4",
+            "index": 3
+          },
+          {
+            "name": "Canal5",
+            "index": 4
+          },
+          {
+            "name": "Canal6",
+            "index": 5
+          },
+          {
+            "name": "Canal7",
+            "index": 6
+          },
+          {
+            "name": "Canal8",
+            "index": 7
+          }
+        ],
+        "extra_ip": [],
+        "password": "fake-pass",
+        "username": "fake-user",
+        "web_port": 0,
+        "http_port": 0,
+        "useDomain": false,
+        "useMainIp": false,
+        "useExtraIp": false,
+        "autoConnect": false,
+        "service_port": 37777,
+        "fisheye_support": false,
+        "compatibility_mode": false,
+        "useCloudConnection": true,
+        "connection_provider": 1
+      }
+    }
+  ]
+}

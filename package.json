@@ -1,0 +1,7 @@
+{
+  "name": "intel-siam",
+  "private": true,
+  "devDependencies": {
+    "rea-agents": "6.4.0"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "rea": {
+      "type": "stdio",
+      "command": "npx",
+      "args": ["--no-install", "rea", "mcp"],
+      "env": {
+        "GHIDRA_INSTALL_DIR": "/opt/homebrew/opt/ghidra/libexec"
+      }
+    }
+  }
+}

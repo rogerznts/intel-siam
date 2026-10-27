@@ -1,0 +1,17 @@
+# Intelbras-owned binaries: never commit or redistribute
+/references/
+
+node_modules/
+.DS_Store
+
+# Credenciais locais
+.env
+
+# Probe build artifacts
+tools/probe/t2u_tunnel
+tools/probe/libt2u.so
+
+# Resposta da nuvem com credenciais do DVR
+video-devices.json
+
+/target
