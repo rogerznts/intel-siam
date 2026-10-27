@@ -15,7 +15,11 @@ fn main() -> eframe::Result {
         viewport: egui::ViewportBuilder::default()
             .with_title("Intel SIAM")
             .with_inner_size([1280.0, 760.0])
-            .with_min_inner_size([480.0, 300.0]),
+            .with_min_inner_size([480.0, 300.0])
+            .with_icon(
+                eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon-512.png"))
+                    .expect("embedded icon is a valid PNG"),
+            ),
         persist_window: true,
         ..Default::default()
     };

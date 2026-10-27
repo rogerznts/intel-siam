@@ -11,6 +11,10 @@ use crate::plan::{Tools, TunnelBackend, Unavailable};
 use crate::procs::Supervisor;
 use crate::status::{ExitReason, TileStatus, tile_status};
 
+/// Greens sampled from the top and bottom of the app icon's tiles.
+const BRAND_GREEN: Color32 = Color32::from_rgb(26, 250, 127);
+const BRAND_GREEN_DIM: Color32 = Color32::from_rgb(2, 212, 101);
+
 pub enum AccountAction {
     SignIn,
     Retry,
@@ -45,7 +49,11 @@ pub fn draw(ui: &mut egui::Ui, scene: &Scene, state: &mut UiState) -> Actions {
 
     egui::Panel::top("toolbar").show(ui, |ui| {
         ui.horizontal(|ui| {
-            ui.toggle_value(&mut state.show_picker, "Câmeras");
+            let fill = if state.show_picker { BRAND_GREEN } else { BRAND_GREEN_DIM };
+            let label = egui::RichText::new("Câmeras").color(Color32::BLACK).strong();
+            if ui.add(egui::Button::new(label).fill(fill)).clicked() {
+                state.show_picker = !state.show_picker;
+            }
             ui.separator();
             ui.label(account_summary(scene.account.state()));
             if matches!(scene.account.state(), Account::SignedOut) && ui.button("Entrar").clicked() {
