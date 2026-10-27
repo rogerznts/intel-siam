@@ -59,6 +59,39 @@ Alvo: `/Applications/iCSee.app` 2.6.7 (`com.XM.CSee`), app de iOS rodando no Mac
 - `wire67/xmeye_cloud_to_rtsp` faz o mesmo que a rota C com o `NetSdk.dll` da Xiongmai (Windows), por CloudID +
   usuário + senha, e reemite o stream. Relata HEVC, main 3696×1080 e sub 1280×360 numa câmera dupla.
 
+## Ler da conta própria do iCSee (rota E)
+
+Reproduzir o login da conta do app e baixar a lista de dispositivos com as credenciais locais de cada câmera, como
+fazemos hoje com a nuvem Intelbras. É HTTP, não o protocolo P2P binário.
+
+- `[O]` O app principal (`iCSee`, Mach-O arm64) tem só 4096 bytes cifrados (`LC_ENCRYPTION_INFO cryptsize 0x1000`)
+  e `flags=0x0` (sem hardened runtime). Quase todo o Objective-C e as strings são legíveis.
+- `[O]` Login de conta é HTTP assinado em `https://rs.jftechws.com`: `{base}/ios/login/va1/{timeMillis}/{sign}.rs`
+  (usuário/senha), além de `/mobilephone/`, `/wx/`, `/fb/`, `/line/login/va1/…`. É o mesmo `rs.jftechws.com/login/va1`
+  da OpenAPI, mas com o `uuid`/`appKey` do próprio app, não de uma conta de open platform.
+- `[O]` Classes de login no binário: `accountLoginWithAccount:pass:comletion:`, `cloudAccountLogin`,
+  `AccountLoginResult`.
+- `[O]` Criptografia observada no binário: `AESCryptoWithString:key:isECB:option:` (AES, modo ECB opcional) para
+  conta/senha, e `hmacMd5:hmacKey:` para a assinatura; `uuid`, `appKey`, `appSecret`, `appMoveCard` são ivars de init
+  (`SetParmeValue[_uuid,_appKey,_movedCard]`).
+- `[O]` Hosts da nuvem do consumidor: `api.jftechws.com`, `boss22-api.xmcsrv.net`, `app-support.jftech.com`,
+  `secu100.net`. A lista de dispositivos é um endpoint de nuvem sob o `userToken`, ainda não isolado.
+- `[O]` SSL pinning só nas libs de anúncio (`AdScopeAFSecurityPolicy`, `AFLRSSLPinningMode…`); o networking do app
+  usa `AFSecurityPolicy` padrão. Um proxy HTTPS com CA confiável deve capturar login e lista.
+- `[H]` `uuid`/`appKey`/`appSecret` do iCSee: os campos existem, os valores não foram fixados (podem ser montados em
+  runtime). Precisam vir da decompilação do init ou de uma captura ao vivo.
+- `[H]` A conta de e-mail/telefone do usuário é obrigatória para o login; sem ela não há o que ler.
+
+Dois jeitos de executar a rota E:
+1. **Captura ao vivo (mais barato).** Rodar o iCSee sob um proxy HTTPS com CA local, logar no app e gravar as
+   requisições de login e de lista. Entrega os endpoints exatos, a assinatura e um `userToken` real, sem reimplementar
+   a cripto. Bloqueia só se houver pinning nos endpoints XM (não observado).
+2. **Reimplementar o HTTP.** Extrair `uuid`/`appKey`/`appSecret` e o algoritmo de sign do binário e refazer o login
+   em Rust. Mais trabalho, mas vira código no Intel SIAM.
+
+Em ambos, a lista traz série, usuário e senha de cada câmera; o vídeo em si ainda usa P2P/DSS (rotas B/C) ou, se a
+câmera estiver no DVR, o túnel Intelbras que já temos.
+
 ## Como o SIM da Intelbras "suporta" essas câmeras
 
 - `[O]` O SIM Next não fala o protocolo da Xiongmai. Manual 1.12.5, nota 1 das Características: "A conexão com os
