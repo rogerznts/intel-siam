@@ -59,6 +59,24 @@ Alvo: `/Applications/iCSee.app` 2.6.7 (`com.XM.CSee`), app de iOS rodando no Mac
 - `wire67/xmeye_cloud_to_rtsp` faz o mesmo que a rota C com o `NetSdk.dll` da Xiongmai (Windows), por CloudID +
   usuário + senha, e reemite o stream. Relata HEVC, main 3696×1080 e sub 1280×360 numa câmera dupla.
 
+## Como o SIM da Intelbras "suporta" essas câmeras
+
+- `[O]` O SIM Next não fala o protocolo da Xiongmai. Manual 1.12.5, nota 1 das Características: "A conexão com os
+  dispositivos ocorre utilizando o protocolo de comunicação Intelbras. Dispositivos que não possuam este protocolo
+  (ex.: câmeras com conexão exclusiva via Onvif) precisam estar conectadas à um dispositivo de gravação (DVR ou NVR)
+  para que o SIM Next possa acessar suas imagens." O FAQ do SIM Next lista só IP, Domínio, Intelbras Cloud e
+  Registro Automático como modos de conexão.
+- `[O]` O SIMPlay 1.4.1 decompilado também não tem cliente Xiongmai: busca por `xmeye`, `icsee`, `xiongmai`,
+  `FunSDK`, `NetSdk`, `34567`, `DVRIP`, `secu100`, `jftech` e `xmcsrv` em `references/decompiled/` sem resultado.
+- `[O]` O DVR do usuário, MHDX 3108-C, aceita "8 canais BNC + 4 canal IP ou 12 canais IP no modo NVR", com
+  protocolos "Intelbras-1 e Onvif Perfil S" (datasheet Intelbras, fev/2026).
+- `[I]` A compatibilidade vem portanto do DVR: a câmera iCSee entra como canal IP via ONVIF, e o SIM (ou o Intel
+  SIAM) a vê como mais um canal do DVR pela nuvem Intelbras. Requisito: o DVR alcançar a câmera pela rede, na prática
+  a mesma rede local.
+- `[H]` As câmeras iCSee costumam ter ONVIF na porta 8899, às vezes desligado de fábrica; confirmar em cada modelo.
+- `[H]` Os canais IP do DVR devem aparecer como canais 9 a 12 no RTSP do DVR; a lista de `/video-devices` observada
+  tinha só os 8 canais BNC.
+
 ## Limites desta análise
 
 - Busca negativa: não procurei no binário principal (cifrado) nem nos handlers internos de `CDataCenter`.
