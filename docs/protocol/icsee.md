@@ -109,6 +109,59 @@ Dois jeitos de ler o que a conta expõe (metadados):
 
 O vídeo em si ainda usa P2P/DSS (rotas B/C) ou, se a câmera estiver no DVR, o túnel Intelbras que já temos.
 
+## Reimplementar o P2P da Xiongmai (rota C, detalhada)
+
+
+O vídeo das câmeras XM/iCSee se divide em duas camadas independentes. Mapeia direto na arquitetura que já temos para
+a Intelbras (cloud → túnel → RTSP).
+
+### Camada 1: o protocolo do aparelho (fácil, documentado)
+
+- `[O]` DVRIP ("Sofia") em TCP 34567 é a interface real; RTSP em 554 sozinho já basta para vídeo
+  (refs: `Moxnatiy/hass-xmeye/docs/protocol.md`, `OpenIPC/python-dvr`, `alexshpilkin/dvrip`).
+- `[O]` Login: `sofia_hash(senha)` = MD5 da senha, cada par de bytes mapeado num alfabeto base62, 8 chars;
+  payload `{"EncryptType":"MD5","LoginType":"DVRIP-Web","PassWord":<hash>,"UserName":<user>}`, msgid 1000.
+- `[O]` RTSP direto: `rtsp://HOST:554/user=USER&password=PASS&channel=N&stream=0.sdp?real_stream` (canal a partir de
+  1; stream 0 = main, 1 = sub). O `ffmpeg` abre essa URL como já faz com a Intelbras.
+- `[I]` Portar isso para Rust é trabalho moderado, análogo ao que o Intel SIAM já faz com RTSP sobre o túnel `libt2u`.
+
+### Camada 2: o túnel P2P de nuvem (difícil, pouco documentado)
+
+- `[O]` Para alcançar a câmera remota sem IP público, o app usa o "XMEye P2P Cloud": protocolo UDP proprietário
+  (hole punching / relay) contra `xmeye.net`/`secu100.net`, pelo CloudID do aparelho. É a única parte que exige
+  engenharia reversa; a `hass-xmeye/protocol.md` diz isso explicitamente.
+- `[O]` É o papel equivalente ao da `libt2u` no lado Intelbras: abre um caminho e deixa o DVRIP/RTSP correr por dentro.
+- `[O]` **Diferença crítica.** A `libt2u` é Mach-O e por isso roda no helper x86_64 sob Rosetta. O NetSDK PC da
+  Xiongmai (que faz esse túnel) é DLL do Windows ou `.so` do Linux, e **não** carrega no macOS nem sob Rosetta
+  (Rosetta roda Mach-O x86_64, não PE/ELF). Não há lib nativa para reusar no Mac.
+- `[O]` `wire67/xmeye_cloud_to_rtsp` faz exatamente este caminho, mas no Windows, via `NetSdk.dll` (não é
+  reimplementação). Relata que o build 2024 do NetSDK tem o login de nuvem quebrado (`-12003`); o de 2018 funciona.
+
+### Caminhos possíveis
+
+| Caminho | Como | Esforço | macOS nativo |
+|---|---|---|---|
+| C1. Reimplementar o UDP P2P em Rust | do zero, a partir da RE do protocolo de nuvem XM | alto (semanas) | sim |
+| C2. Helper em Linux com o NetSDK `.so` da XM | FFI do NetSDK num processo/VM Linux, DVRIP por dentro | médio | não (precisa de Linux) |
+| C3. Ponte na LAN das câmeras | qualquer máquina sempre-ligada no local das câmeras fala DVRIP/RTSP direto | mínimo | n/a |
+
+- `[I]` C3 é de longe o mais simples: sem nuvem, sem P2P. Se houver um aparelho sempre ligado na rede das câmeras
+  (um Raspberry Pi, um PC, o próprio DVR), ele abre o RTSP local e o Intel SIAM consome. Só não resolve acesso remoto
+  sozinho.
+- `[H]` Modelo de credencial: o DVRIP aceita usuário/senha locais (`admin` + senha definida no app). Câmeras iCSee
+  novas podem exigir só token do app; confirmar com um teste real antes de qualquer porte.
+
+### Antes de codar: spike de de-risco
+
+Provar a cadeia com UMA câmera e uma ferramenta pronta, antes de escrever Rust:
+1. Se a câmera for alcançável numa LAN: `python-dvr`/`dvrip` + `ffmpeg` no RTSP 554. Responde "a senha funciona?" e
+   "o vídeo é H.264/H.265?".
+2. Se só por nuvem: `wire67/xmeye_cloud_to_rtsp` num Windows, por CloudID + usuário + senha. Responde "o túnel de
+   nuvem funciona daqui?" e "a credencial é senha ou token?".
+
+Precisa do usuário: a senha de uma câmera (definida no iCSee) e onde ela é alcançável (há máquina sempre-ligada na
+rede dela?).
+
 ## Como o SIM da Intelbras "suporta" essas câmeras
 
 - `[O]` O SIM Next não fala o protocolo da Xiongmai. Manual 1.12.5, nota 1 das Características: "A conexão com os
