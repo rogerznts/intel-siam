@@ -24,7 +24,8 @@ Spec: docs/spec/viewer.md. Fluxo: pstack poteto-mode / Feature + architect.
 
 ## Depois do esqueleto
 - [ ] HW decode atrás do trait (VAAPI/D3D11VA/VideoToolbox) — NFR-003.
-- [ ] Empacotamento macOS, depois Linux, depois Windows.
+- [x] App macOS (`tools/package/macos.sh`, assinatura ad-hoc, instalado em /Applications).
+- [ ] Assinar com Developer ID e notarizar; empacotar Linux, depois Windows.
 
 ## Roadmap (futuro)
 - [ ] Gravação contínua e por evento.

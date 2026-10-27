@@ -1,5 +1,7 @@
 # Intel SIAM
 
+<img src="assets/icon-512.png" alt="Ícone do Intel SIAM" width="128">
+
 Visualizador nativo de câmeras para gravadores Intelbras acessados pela nuvem, escrito em Rust. Substitui o SIMPlay
 no dia a dia: abre direto nas câmeras que você escolheu, na ordem em que você as deixou.
 
@@ -68,6 +70,17 @@ câmeras no painel **Câmeras**.
 Sem uma variável obrigatória, o app abre e mostra qual falta.
 
 Token de sessão, layout e logs ficam em `~/Library/Application Support/intel-siam/`, fora do repositório.
+
+### App para macOS
+
+```sh
+tools/package/macos.sh --install
+install -m 600 .env ~/Library/Application\ Support/intel-siam/config.env
+```
+
+O script gera `Intel SIAM.app` com o ícone e o instala em `/Applications`. Aberto pelo Finder ou pelo Dock, o app
+não recebe as variáveis do terminal; ele as lê de `config.env` na pasta de dados. Variáveis definidas no ambiente
+têm prioridade.
 
 ## Roadmap
 
