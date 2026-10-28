@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt;
 use std::path::PathBuf;
@@ -34,6 +34,8 @@ pub struct Tools {
     pub ffmpeg: Option<PathBuf>,
     pub tunnel: TunnelBackend,
     pub logs: PathBuf,
+    pub vision: Option<PathBuf>,
+    pub sensors_data: PathBuf,
 }
 
 /// Contains the DVR password; `Debug` redacts it.
@@ -128,18 +130,27 @@ pub fn desired_children(
     devices: Option<&BTreeMap<DvrSerial, Dvr>>,
     ports: &BTreeMap<DvrSerial, LocalPort>,
     tools: &Tools,
+    sensor_feeds: &BTreeSet<StreamKey>,
 ) -> BTreeMap<ChildKey, ChildSpec> {
     let mut out = BTreeMap::new();
+    if let Some(program) = &tools.vision {
+        let ffmpeg = tools.ffmpeg.clone().unwrap_or_else(|| "ffmpeg".into());
+        out.insert(ChildKey::Vision, crate::sensors::vision_child(program, &tools.sensors_data, &ffmpeg, &tools.logs));
+    }
     let Some(devices) = devices else { return out };
     let solo = match view {
         ViewMode::Solo(cam) => Some(cam),
         ViewMode::Grid => None,
     };
+    for serial in layout.tiles().iter().map(|cam| &cam.dvr).chain(sensor_feeds.iter().map(|key| &key.camera.dvr)) {
+        if devices.contains_key(serial)
+            && let Some(spec) = tunnel_spec(&tools.tunnel, serial, tools)
+        {
+            out.insert(ChildKey::Tunnel(serial.clone()), spec);
+        }
+    }
     for cam in layout.tiles() {
         let Some(dvr) = devices.get(&cam.dvr) else { continue };
-        if let Some(spec) = tunnel_spec(&tools.tunnel, &dvr.serial, tools) {
-            out.insert(ChildKey::Tunnel(dvr.serial.clone()), spec);
-        }
         let (Some(ffmpeg), Some(&port)) = (&tools.ffmpeg, ports.get(&cam.dvr)) else { continue };
         let kinds: &[StreamKind] = if solo == Some(cam) { &[StreamKind::Sub, StreamKind::Main] } else { &[StreamKind::Sub] };
         for &kind in kinds {
@@ -161,6 +172,13 @@ pub fn desired_children(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn desired_children(
+        layout: &Layout, view: &ViewMode, devices: Option<&BTreeMap<DvrSerial, Dvr>>,
+        ports: &BTreeMap<DvrSerial, LocalPort>, tools: &Tools,
+    ) -> BTreeMap<ChildKey, ChildSpec> {
+        super::desired_children(layout, view, devices, ports, tools, &BTreeSet::new())
+    }
+
     use crate::cloud::Secret;
     use crate::model::{ChannelIndex, Intent, SavedLayout, reduce};
 
@@ -187,6 +205,8 @@ mod tests {
             ffmpeg: Some("/opt/homebrew/bin/ffmpeg".into()),
             tunnel: TunnelBackend::Helper { program: "/x/t2u_tunnel".into(), libt2u: "/x/libt2u.so".into() },
             logs: "/x/logs".into(),
+            vision: None,
+            sensors_data: "/x/sensors".into(),
         }
     }
 
@@ -198,7 +218,7 @@ mod tests {
         set.keys()
             .filter_map(|k| match k {
                 ChildKey::Decoder(s) => Some((s.camera.channel.rtsp_channel(), s.kind)),
-                ChildKey::Tunnel(_) | ChildKey::UrlDecoder(..) => None,
+                ChildKey::Tunnel(_) | ChildKey::UrlDecoder(..) | ChildKey::Vision => None,
             })
             .collect()
     }
@@ -246,5 +266,18 @@ mod tests {
         let url = rtsp_url(LocalPort::new(14239), &devs[&serial()].creds, &cam(0), StreamKind::Sub);
         assert_eq!(url.0, "rtsp://admin:p%40ss%3Aw%2Frd@127.0.0.1:14239/cam/realmonitor?channel=1&subtype=1");
         assert!(!format!("{url:?}").contains("p%40ss"));
+    }
+
+    #[test]
+    fn vision_runs_without_an_account_and_sensor_only_cameras_keep_their_tunnel() {
+        let mut tools = tools();
+        tools.vision = Some("/x/intel-siam-vision".into());
+        let wanted = BTreeSet::from([StreamKey { camera: cam(7), kind: StreamKind::Main }]);
+        let signed_out = super::desired_children(&Layout::default(), &ViewMode::Grid, None, &BTreeMap::new(), &tools, &wanted);
+        assert_eq!(signed_out.keys().collect::<Vec<_>>(), [&ChildKey::Vision]);
+        let specs = super::desired_children(&Layout::default(), &ViewMode::Grid, Some(&devices()), &BTreeMap::new(), &tools, &wanted);
+        assert!(specs.contains_key(&ChildKey::Tunnel(serial())));
+        assert!(decoders(&specs).is_empty(), "sensor feeds are decoded only by vision");
+        assert!(specs[&ChildKey::Vision].args.iter().all(|arg| !arg.to_string_lossy().contains("p@ss")));
     }
 }

@@ -23,6 +23,10 @@ no dia a dia: abre direto nas câmeras que você escolheu, na ordem em que você
   principal (1080p).
 - **Reconexão automática.** Uma câmera que cai volta sozinha, sem afetar as outras. Senha recusada pelo gravador não
   gera novas tentativas, para não bloquear o usuário local.
+- **Sensores de Estado.** No painel **Sensores**, crie um sensor de câmera do inventário ou URL RTSP/snapshot
+  HTTP, desenhe um retângulo ou polígono e ensine até nove estados com botões ou teclas 1–9. O valor aparece
+  no painel e no tile da câmera. Amostras podem ser corrigidas; a revisão e o histórico guardam as checagens.
+  Inferência e armazenamento rodam num processo separado. O modelo é baixado após o primeiro ensino.
 
 ## Como funciona
 
@@ -53,11 +57,18 @@ instalação do SIMPlay 1.4.1 e rode:
 
 ```sh
 set -a; . ./.env; set +a
+cargo build --release
 cargo run --release
 ```
 
 Na primeira abertura, clique em **Entrar** e faça login com a sua conta Intelbras no navegador. Depois marque as
 câmeras no painel **Câmeras**.
+
+Em **Sensores**, escolha **Novo sensor de Estado**. A região nasce como o quadro inteiro. Na aba **Ao vivo**,
+arraste um retângulo ou clique nos pontos de um polígono, feche-o e salve a região. Ensine quadros diferentes
+para pelo menos dois estados. As configurações do painel controlam a retenção do histórico; amostras não expiram.
+Uma câmera usada só por sensores não precisa estar na grade. URL avulsa aparece apenas no painel.
+As [evidências de verificação dos sensores](docs/spec/sensors-ui-verification.md) registram o smoke e seus limites.
 
 | Variável | Obrigatória | Conteúdo |
 |---|---|---|
@@ -87,10 +98,9 @@ têm prioridade.
 - Gravação contínua e por evento.
 - Screenshots de uma câmera ou da grade.
 - Envio de gravações e screenshots para o Google Drive.
-- Análise com IA em tempo real.
-- Reconhecimento facial.
-- Áreas de detecção de carros com YOLO.
-- Leitura de placas.
+- Sensores de Objetos e Pessoas.
+- Sensores de Leituras (placas, texto e valores).
+- Publicação MQTT dos valores dos sensores.
 - Modo servidor por linha de comando, sem interface.
 - Servidor MCP para consultar câmeras e eventos a partir de agentes de IA.
 - Decodificação por hardware (VideoToolbox, VAAPI, D3D11VA).

@@ -18,7 +18,7 @@ use crate::sensors::wire::{Command, Desired, PROTOCOL, Report, read_frame, write
 const PATIENCE: Duration = Duration::from_secs(10);
 
 /// Builds the binary with the same cargo, so the test always runs the current code.
-fn vision_binary() -> PathBuf {
+pub(in crate::sensors) fn vision_binary() -> PathBuf {
     let mut cargo = Process::new(env!("CARGO"));
     cargo.args(["build", "--quiet", "--bin", "intel-siam-vision", "--message-format=json"]);
     cargo.args(["--manifest-path", concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml")]);

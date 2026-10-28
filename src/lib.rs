@@ -8,3 +8,4 @@ pub mod procs;
 pub mod sensors;
 pub mod status;
 mod ui;
+mod sensors_ui;

@@ -3,8 +3,9 @@ use std::ffi::OsString;
 use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::{Arc, OnceLock, mpsc};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -20,6 +21,7 @@ use crate::status::{ExitReason, classify_exit};
 pub enum ChildKey {
     Tunnel(DvrSerial),
     Decoder(StreamKey),
+    Vision,
     /// A decoder for a camera typed in by URL, outside any DVR.
     UrlDecoder(UrlKey, StreamKind),
 }
@@ -28,6 +30,7 @@ impl ChildKey {
     fn log_name(&self) -> String {
         match self {
             Self::Tunnel(serial) => format!("tunnel-{}.log", serial.as_str()),
+            Self::Vision => "vision.log".into(),
             Self::Decoder(k) => format!(
                 "decoder-{}-{}-{}.log",
                 k.camera.dvr.as_str(),
@@ -64,6 +67,23 @@ pub struct ChildSpec {
 pub enum ChildIo {
     TunnelLines,
     Frames(StreamKind),
+    Duplex,
+}
+
+pub struct Pipes {
+    pub pid: u32,
+    pub stdin: ChildStdin,
+    pub stdout: ChildStdout,
+    pub progress: Arc<Progress>,
+}
+
+#[derive(Default)]
+pub struct Progress(AtomicU64);
+
+impl Progress {
+    pub fn bump(&self) {
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -136,6 +156,8 @@ struct Running {
     child: Child,
     /// Held open for the helper's lifetime; dropping it is how a tunnel is asked to shut down.
     stdin: Option<ChildStdin>,
+    pipes: Option<Pipes>,
+    progress: Option<Arc<Progress>>,
     phase: ChildPhase,
     attempt: u32,
     slot: Option<Arc<FrameSlot>>,
@@ -215,8 +237,21 @@ impl Supervisor {
         match self.try_spawn(&key, &spec, &log, Arc::clone(&geometry)) {
             Ok((mut child, logger)) => {
                 let stdout = child.stdout.take().expect("stdout is piped");
-                let stdin = child.stdin.take();
+                let mut stdin = child.stdin.take();
+                let mut pipes = None;
+                let mut progress = None;
                 let slot = match spec.io {
+                    ChildIo::Duplex => {
+                        let counter = Arc::new(Progress::default());
+                        pipes = Some(Pipes {
+                            pid: child.id(),
+                            stdin: stdin.take().expect("duplex stdin"),
+                            stdout,
+                            progress: Arc::clone(&counter),
+                        });
+                        progress = Some(counter);
+                        None
+                    }
                     ChildIo::Frames(kind) => {
                         let slot = Arc::new(FrameSlot::default());
                         let (s, wake) = (Arc::clone(&slot), Arc::clone(&self.wake));
@@ -248,6 +283,8 @@ impl Supervisor {
                         spec,
                         child,
                         stdin,
+                        pipes,
+                        progress,
                         phase: ChildPhase::Starting { since: now },
                         attempt,
                         slot,
@@ -270,16 +307,17 @@ impl Supervisor {
 
     fn try_spawn(
         &self,
-        key: &ChildKey,
+        _key: &ChildKey,
         spec: &ChildSpec,
         log: &Path,
         geometry: Arc<OnceLock<[u32; 2]>>,
     ) -> io::Result<(Child, JoinHandle<()>)> {
         fs::create_dir_all(&self.logs)?;
         let mut log_file = fs::File::create(log)?;
-        let stdin = match key {
-            ChildKey::Tunnel(_) => Stdio::piped(),
-            ChildKey::Decoder(_) | ChildKey::UrlDecoder(..) => Stdio::null(),
+        let stdin = if matches!(spec.io, ChildIo::TunnelLines | ChildIo::Duplex) {
+            Stdio::piped()
+        } else {
+            Stdio::null()
         };
         let mut child =
             Command::new(&spec.program).args(&spec.args).stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
@@ -329,8 +367,9 @@ impl Supervisor {
 
         let mut exited = Vec::new();
         for (key, r) in &mut self.running {
-            if let Some(slot) = &r.slot {
-                let frames = slot.frames();
+            let progress = r.slot.as_ref().map(|slot| slot.frames())
+                .or_else(|| r.progress.as_ref().map(|p| p.0.load(Ordering::Relaxed)));
+            if let Some(frames) = progress {
                 if frames > r.seen_frames {
                     r.seen_frames = frames;
                     r.phase = match r.phase {
@@ -384,11 +423,28 @@ impl Supervisor {
         let busy = !self.stopping.is_empty()
             || self.running.values().any(|r| !matches!(r.phase, ChildPhase::Up { .. }))
             || self.down.values().any(|p| matches!(p, ChildPhase::Down { retry_at: Some(_), .. }));
-        busy.then_some(BUSY_POLL)
+        let stall = self.running.values().filter_map(|r| match r.phase {
+            ChildPhase::Up { last_progress, .. } if r.progress.is_some() => {
+                Some((last_progress + r.spec.stall_after).saturating_duration_since(now) + Duration::from_millis(1))
+            }
+            _ => None,
+        }).min();
+        busy.then_some(BUSY_POLL).into_iter().chain(stall).min()
     }
 
     pub fn phase(&self, key: &ChildKey) -> Option<&ChildPhase> {
         self.running.get(key).map(|r| &r.phase).or_else(|| self.down.get(key))
+    }
+
+    pub fn take_pipes(&mut self, key: &ChildKey) -> Option<Pipes> {
+        self.running.get_mut(key)?.pipes.take()
+    }
+
+    pub fn fail(&mut self, key: &ChildKey, reason: ExitReason) {
+        if let Some(r) = self.running.get_mut(key) {
+            r.exit_reason = Some(reason);
+            let _ = r.child.kill();
+        }
     }
 
     pub fn tunnel_ports(&self) -> BTreeMap<DvrSerial, LocalPort> {
@@ -519,7 +575,15 @@ fn discover_ffmpeg() -> Option<PathBuf> {
 }
 
 pub fn discover_tools(storage: &Path) -> Tools {
-    Tools { ffmpeg: discover_ffmpeg(), tunnel: discover_tunnel(storage), logs: storage.join("logs") }
+    let vision = std::env::current_exe().ok().and_then(|exe| {
+        let dir = exe.parent()?;
+        [Some(dir.join("intel-siam-vision")), dir.parent().filter(|_| dir.ends_with("deps")).map(|p| p.join("intel-siam-vision"))]
+            .into_iter().flatten().find(|p| p.is_file())
+    });
+    Tools {
+        ffmpeg: discover_ffmpeg(), tunnel: discover_tunnel(storage), logs: storage.join("logs"),
+        vision, sensors_data: storage.join("sensors"),
+    }
 }
 
 #[cfg(all(test, unix))]

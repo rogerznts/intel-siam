@@ -14,6 +14,7 @@ pub enum ExitReason {
     /// RTSP 401: the DVR's local account rejected the credential. Terminal, never retried automatically,
     /// so repeated attempts cannot lock the account.
     AuthRejected,
+    Incompatible,
     Unreachable,
     TimedOut,
     Stalled,
@@ -26,7 +27,7 @@ pub enum ExitReason {
 
 impl ExitReason {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::AuthRejected)
+        matches!(self, Self::AuthRejected | Self::Incompatible)
     }
 
     /// What the user is told, in pt-BR.
@@ -34,6 +35,7 @@ impl ExitReason {
         match self {
             Self::SpawnFailed(kind) => format!("não iniciou ({kind})"),
             Self::AuthRejected => "senha recusada".into(),
+            Self::Incompatible => "versão incompatível do processo de visão".into(),
             Self::Unreachable => "conexão recusada".into(),
             Self::TimedOut => "tempo esgotado".into(),
             Self::Stalled => "sem frames".into(),
@@ -191,7 +193,7 @@ mod tests {
         }
 
         fn tools(tunnel: TunnelBackend) -> Tools {
-            Tools { ffmpeg: Some("/bin/ffmpeg".into()), tunnel, logs: "/tmp".into() }
+            Tools { ffmpeg: Some("/bin/ffmpeg".into()), tunnel, logs: "/tmp".into(), vision: None, sensors_data: "/tmp/sensors".into() }
         }
 
         fn status(account: &Account, tools: &Tools) -> TileStatus {

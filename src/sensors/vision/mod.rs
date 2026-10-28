@@ -14,7 +14,7 @@ mod infer;
 mod logic;
 mod pixels;
 #[cfg(test)]
-mod process_tests;
+pub(super) mod process_tests;
 mod store;
 
 use std::ffi::OsString;

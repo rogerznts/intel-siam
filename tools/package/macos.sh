@@ -13,6 +13,14 @@ cargo build --release
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp target/release/intel-siam "$APP/Contents/MacOS/intel-siam"
+cp target/release/intel-siam-vision "$APP/Contents/MacOS/intel-siam-vision"
+for dylib in target/release/*.dylib; do
+    [ -f "$dylib" ] || continue
+    cp "$dylib" "$APP/Contents/MacOS/"
+    codesign --force --sign - "$APP/Contents/MacOS/$(basename "$dylib")"
+done
+otool -L "$APP/Contents/MacOS/intel-siam-vision"
+codesign --force --sign - "$APP/Contents/MacOS/intel-siam-vision"
 cp assets/icon.icns "$APP/Contents/Resources/AppIcon.icns"
 cat > "$APP/Contents/Info.plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>

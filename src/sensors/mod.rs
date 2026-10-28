@@ -3,6 +3,9 @@
 //! This module owns both ends of the app ↔ vision process boundary. The wire protocol and the
 //! vision process are private submodules: code outside `sensors` cannot name a protocol message.
 
+mod client;
+#[cfg(test)]
+mod client_tests;
 mod types;
 mod vision;
 mod wire;
@@ -12,6 +15,20 @@ use std::path::Path;
 use std::process::ExitCode;
 
 pub use types::*;
+pub use client::Sensors;
+
+pub fn vision_child(program: &Path, data: &Path, ffmpeg: &Path, logs: &Path) -> crate::procs::ChildSpec {
+    crate::procs::ChildSpec {
+        program: program.into(),
+        args: vec![
+            "--data".into(), data.into(),
+            "--logs".into(), logs.join("vision").into(),
+            "--ffmpeg".into(), ffmpeg.into(),
+        ],
+        io: crate::procs::ChildIo::Duplex,
+        stall_after: wire::HEARTBEAT * 6,
+    }
+}
 
 /// A neural network run on the CPU. The `intel-siam-vision` binary supplies the ONNX Runtime one,
 /// so the library never names ONNX Runtime and the UI binary links none of it.

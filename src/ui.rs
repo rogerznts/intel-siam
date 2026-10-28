@@ -24,6 +24,7 @@ pub enum AccountAction {
 pub struct Actions {
     pub intents: Vec<Intent>,
     pub account: Option<AccountAction>,
+    pub sensors: Vec<crate::sensors::UserCommand>,
 }
 
 /// Read-only view of everything the UI shows.
@@ -34,6 +35,7 @@ pub struct Scene<'a> {
     pub tools: &'a Tools,
     pub procs: &'a Supervisor,
     pub now: Instant,
+    pub sensors: &'a crate::sensors::SensorsView,
 }
 
 /// UI-owned state that survives frames but is never part of the domain.
@@ -41,6 +43,7 @@ pub struct Scene<'a> {
 pub struct UiState {
     pub textures: HashMap<StreamKey, TextureHandle>,
     pub show_picker: bool,
+    pub sensors: crate::sensors_ui::SensorsPanel,
 }
 
 pub fn draw(ui: &mut egui::Ui, scene: &Scene, state: &mut UiState) -> Actions {
@@ -54,6 +57,10 @@ pub fn draw(ui: &mut egui::Ui, scene: &Scene, state: &mut UiState) -> Actions {
             if ui.add(egui::Button::new(label).fill(fill)).clicked() {
                 state.show_picker = !state.show_picker;
             }
+            if ui.selectable_label(state.sensors.open, "Sensores").clicked() {
+                state.sensors.open = !state.sensors.open;
+                if state.sensors.open { state.show_picker = false; }
+            }
             ui.separator();
             ui.label(account_summary(scene.account.state()));
             if matches!(scene.account.state(), Account::SignedOut) && ui.button("Entrar").clicked() {
@@ -64,6 +71,11 @@ pub fn draw(ui: &mut egui::Ui, scene: &Scene, state: &mut UiState) -> Actions {
     if state.show_picker {
         egui::Panel::right("picker").resizable(false).default_size(240.0).show(ui, |ui| {
             picker(ui, scene, &mut actions);
+        });
+    }
+    if state.sensors.open {
+        egui::Panel::right("sensors").resizable(true).default_size(450.0).show(ui, |ui| {
+            crate::sensors_ui::draw(ui, scene, &mut state.sensors, &mut actions);
         });
     }
     egui::CentralPanel::no_frame().frame(egui::Frame::NONE.fill(Color32::from_gray(12))).show(ui, |ui| {
@@ -113,6 +125,7 @@ fn grid(ui: &mut egui::Ui, area: Rect, scene: &Scene, state: &UiState, actions: 
         let status = tile_status(cam, StreamKind::Sub, scene.account.state(), scene.tools, scene.procs, scene.now);
         let dragging_this = response.dragged();
         paint_tile(ui, rect.shrink(1.0), state.textures.get(&key), &status, &camera_name(scene, cam), dragging_this);
+        paint_sensor_badges(ui, rect, cam, scene);
 
         if response.dnd_hover_payload::<usize>().is_some_and(|from| *from != index) {
             ui.painter().rect_stroke(rect.shrink(2.0), 4.0, Stroke::new(3.0, Color32::from_rgb(80, 160, 255)), StrokeKind::Inside);
@@ -140,10 +153,26 @@ fn solo(ui: &mut egui::Ui, area: Rect, cam: &CameraId, scene: &Scene, state: &Ui
     };
     let status = tile_status(cam, kind, scene.account.state(), scene.tools, scene.procs, scene.now);
     paint_tile(ui, rect, texture, &status, &camera_name(scene, cam), false);
+    paint_sensor_badges(ui, rect, cam, scene);
     if response.double_clicked() || ui.input(|i| i.key_pressed(egui::Key::Escape)) {
         actions.intents.push(Intent::ToggleSolo(cam.clone()));
     }
 }
+fn paint_sensor_badges(ui: &egui::Ui, rect: Rect, cam: &CameraId, scene: &Scene) {
+    let painter = ui.painter_at(rect);
+    let ready = scene.sensors.link == crate::sensors::LinkState::Ready;
+    let color = if ready { Color32::LIGHT_GREEN } else { Color32::GRAY };
+    let mut top = rect.top() + 30.0;
+    for entry in scene.sensors.on_camera(cam) {
+        let text = format!("{}: {}", entry.settings.name.as_str(), crate::sensors_ui::value_label(entry));
+        let galley = painter.layout(text, FontId::proportional(13.0), color, (rect.width() - 20.0).max(1.0));
+        let badge = Rect::from_min_size(pos2(rect.right() - galley.size().x - 16.0, top), galley.size() + vec2(10.0, 4.0));
+        painter.rect_filled(badge, 3.0, Color32::from_black_alpha(190));
+        painter.galley(badge.min + vec2(5.0, 2.0), galley, color);
+        top = badge.bottom() + 4.0;
+    }
+}
+
 
 fn paint_tile(ui: &egui::Ui, rect: Rect, texture: Option<&TextureHandle>, status: &TileStatus, name: &str, dimmed: bool) {
     let painter = ui.painter_at(rect);

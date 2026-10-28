@@ -471,6 +471,24 @@ relação ao esboço e ao texto acima:
 - A linha `Stream #0:0: Video: …, WxH` foi observada com o ffmpeg 9.0.2 numa entrada `lavfi` (704x480); de um DVR
   real continua [H] (pergunta 3 abaixo).
 
+**Lado do app (`sensors/client`, `sensors_ui`, `plan`, `procs`).**
+
+- `Sensors::new` recebe o mesmo `Waker` do supervisor em vez de `egui::Context`. O leitor converte os
+  pixels fora da UI; `FocusView::images()` limita tanto o cache de imagens quanto o de texturas.
+- `ChildIo::Duplex` entrega os pipes uma vez por instância e um contador de progresso. `fail` comunica
+  o erro terminal de versão ao supervisor. O cliente conserva entradas e `Wants` enquanto aguarda a nova
+  instância; o primeiro `Focus` encerra o snapshot e remove entradas ausentes. Foco e imagens são
+  descartados ao adotar o filho, porque os ids de prévia reiniciam.
+- Comandos do usuário descem antes do `Desired` no mesmo frame. Assim, o `Create` existe quando chega
+  o interesse que o seleciona. Ações com o link fora são descartadas na entrada e na desconexão.
+- A ausência de ffmpeg não impede abrir a visão para sensores HTTP; nesse caso o argv recebe `ffmpeg`
+  para resolver pelo PATH. Ausência do binário de visão aparece no painel. `cargo run` tem binário
+  padrão explícito, e o README pede `cargo build --release` antes para construir também o companheiro.
+- O formulário cria as chaves 1–9 uma vez. Não há remoção/adição de estados depois de criar, portanto
+  nenhuma chave apagada é reaproveitada. A região e a pausa são alteradas por `Configure`.
+- Os logs dos decoders de visão ficam em `logs/vision`, separados dos decoders da grade. Paginação
+  oferece a página seguinte mais antiga e retorno à mais recente, sem uma pilha de cursores na UI.
+
 ## Open questions and risks
 
 Resolvidas na síntese (padrão conservador; reverta se discordar):
