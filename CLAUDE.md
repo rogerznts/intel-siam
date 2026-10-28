@@ -13,6 +13,10 @@ do anvil no `~/.claude/CLAUDE.md` global **não valem aqui**, exceto a seção "
   `pstack:poteto-mode`. Com intenção já específica, entre direto na skill: `pstack:architect`, `pstack:how`,
   `pstack:why`, `pstack:tdd`, `pstack:arena`, `pstack:interrogate`.
 - Subagentes de código são `pstack:poteto-agent`, não `general-purpose`.
+- Grill (`anvil-grill`, `anvil-grilling` ou equivalente): cada rodada de perguntas vai pelo tool `ask` (no Claude Code,
+  `AskUserQuestion`), uma pergunta por decisão, com as alternativas como opções, a recomendada marcada e o
+  trade-off na descrição de cada opção; `multi` quando as opções se combinam. Contexto que o usuário precisa para
+  decidir vem em texto antes da chamada.
 
 O idioma continua o mesmo: chat e documentação em pt-BR; código, identificadores, caminhos e mensagens de commit
 em inglês.
