@@ -3,10 +3,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use eframe::egui::{Color32, ColorImage};
+use serde::{Deserialize, Serialize};
 
 use crate::model::CameraId;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub enum StreamKind {
     Sub,
     Main,
@@ -37,7 +38,7 @@ impl StreamKind {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
 pub struct StreamKey {
     pub camera: CameraId,
     pub kind: StreamKind,
@@ -93,6 +94,18 @@ pub fn pump_frames(mut stdout: impl Read, kind: StreamKind, slot: &FrameSlot, wa
     }
 }
 
+/// The picture size on one of ffmpeg's stream lines, such as
+/// `  Stream #0:0: Video: h264 (Main), yuv420p(progressive), 704x480, 25 fps`. ffmpeg prints the
+/// input's streams before the output's, so the first match is the input's size.
+pub fn parse_input_geometry(line: &str) -> Option<[u32; 2]> {
+    let (_, video) = line.trim_start().strip_prefix("Stream #")?.split_once(": Video: ")?;
+    video.split([' ', ',']).find_map(|word| {
+        let (w, h) = word.split_once('x')?;
+        let size = [w.parse().ok()?, h.parse().ok()?];
+        (size[0] > 0 && size[1] > 0).then_some(size)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +124,22 @@ mod tests {
         assert_eq!(frame.size, [w, h]);
         assert!(frame.pixels.iter().all(|p| p.to_array() == [20; 4]));
         assert!(slot.take().is_none());
+    }
+
+    #[test]
+    fn input_geometry_comes_from_stream_lines_only() {
+        let lines = [
+            "Input #0, rtsp, from 'rtsp://***@127.0.0.1:5704/cam':",
+            "  Stream #0:0: Video: h264 (Main), yuv420p(progressive), 704x480, 25 fps, 25 tbr, 90k tbn",
+            "  Stream #0:0 -> #0:0 (h264 (native) -> rawvideo (native))",
+            "  Stream #0:0: Video: rawvideo (RGBA / 0x41424752), rgba(pc, gbr/unknown/unknown, progressive), \
+             640x360 [SAR 33:40 DAR 22:15], q=2-31, 14745 kb/s, 2 fps, 2 tbn",
+        ];
+        let sizes: Vec<_> = lines.iter().map(|l| parse_input_geometry(l)).collect();
+        assert_eq!(sizes, [None, Some([704, 480]), None, Some([640, 360])]);
+        assert_eq!(
+            parse_input_geometry("  Stream #0:1[0x1](und): Video: hevc (avc1 / 0x31637661), yuv420p(tv, bt709), 1920x1080"),
+            Some([1920, 1080])
+        );
     }
 }

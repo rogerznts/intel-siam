@@ -4,13 +4,14 @@ use std::fs;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use eframe::egui::ColorImage;
+use sha2::{Digest, Sha256};
 
-use crate::frames::{FrameSlot, StreamKey, StreamKind, pump_frames};
+use crate::frames::{FrameSlot, StreamKey, StreamKind, parse_input_geometry, pump_frames};
 use crate::model::DvrSerial;
 use crate::plan::{Tools, TunnelBackend, Unavailable};
 use crate::status::{ExitReason, classify_exit};
@@ -19,6 +20,8 @@ use crate::status::{ExitReason, classify_exit};
 pub enum ChildKey {
     Tunnel(DvrSerial),
     Decoder(StreamKey),
+    /// A decoder for a camera typed in by URL, outside any DVR.
+    UrlDecoder(UrlKey, StreamKind),
 }
 
 impl ChildKey {
@@ -31,7 +34,19 @@ impl ChildKey {
                 k.camera.channel.rtsp_channel(),
                 k.kind.name()
             ),
+            Self::UrlDecoder(url, kind) => format!("decoder-url-{:016x}-{}.log", url.0, kind.name()),
         }
+    }
+}
+
+/// Names a URL without carrying it, so a key, a log name or a `Debug` line never holds the password.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct UrlKey(u64);
+
+impl UrlKey {
+    pub fn of(url: &str) -> Self {
+        let digest = Sha256::digest(url.as_bytes());
+        Self(u64::from_le_bytes(digest[..8].try_into().expect("8 bytes")))
     }
 }
 
@@ -130,6 +145,8 @@ struct Running {
     log: PathBuf,
     /// Copies stderr into `log`; joined before the log is read so the tail is complete.
     logger: Option<JoinHandle<()>>,
+    /// The decoder's input size, as ffmpeg reports it on stderr.
+    geometry: Arc<OnceLock<[u32; 2]>>,
 }
 
 /// A child that was asked to stop: stdin closed, killed at `deadline` if still alive.
@@ -194,7 +211,8 @@ impl Supervisor {
 
     fn spawn(&mut self, key: ChildKey, spec: ChildSpec, attempt: u32, now: Instant) {
         let log = self.logs.join(key.log_name());
-        match self.try_spawn(&key, &spec, &log) {
+        let geometry = Arc::new(OnceLock::new());
+        match self.try_spawn(&key, &spec, &log, Arc::clone(&geometry)) {
             Ok((mut child, logger)) => {
                 let stdout = child.stdout.take().expect("stdout is piped");
                 let stdin = child.stdin.take();
@@ -238,6 +256,7 @@ impl Supervisor {
                         exit_reason: None,
                         log,
                         logger: Some(logger),
+                        geometry,
                     },
                 );
             }
@@ -249,12 +268,18 @@ impl Supervisor {
         }
     }
 
-    fn try_spawn(&self, key: &ChildKey, spec: &ChildSpec, log: &Path) -> io::Result<(Child, JoinHandle<()>)> {
+    fn try_spawn(
+        &self,
+        key: &ChildKey,
+        spec: &ChildSpec,
+        log: &Path,
+        geometry: Arc<OnceLock<[u32; 2]>>,
+    ) -> io::Result<(Child, JoinHandle<()>)> {
         fs::create_dir_all(&self.logs)?;
         let mut log_file = fs::File::create(log)?;
         let stdin = match key {
             ChildKey::Tunnel(_) => Stdio::piped(),
-            ChildKey::Decoder(_) => Stdio::null(),
+            ChildKey::Decoder(_) | ChildKey::UrlDecoder(..) => Stdio::null(),
         };
         let mut child =
             Command::new(&spec.program).args(&spec.args).stdin(stdin).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn()?;
@@ -262,7 +287,14 @@ impl Supervisor {
         // ffmpeg echoes the input URL, DVR password included; it must never reach the log file.
         let logger = thread::spawn(move || {
             for line in BufReader::new(stderr).split(b'\n').map_while(Result::ok) {
-                let _ = writeln!(log_file, "{}", redact_userinfo(&String::from_utf8_lossy(&line)));
+                let line = String::from_utf8_lossy(&line);
+                // ffmpeg describes the input before the output, so the first size seen is the input's.
+                if geometry.get().is_none()
+                    && let Some(size) = parse_input_geometry(&line)
+                {
+                    let _ = geometry.set(size);
+                }
+                let _ = writeln!(log_file, "{}", redact_userinfo(&line));
             }
         });
         Ok((child, logger))
@@ -369,8 +401,13 @@ impl Supervisor {
             .collect()
     }
 
-    pub fn take_frame(&self, key: &StreamKey) -> Option<Arc<ColorImage>> {
-        self.running.get(&ChildKey::Decoder(key.clone()))?.slot.as_ref()?.take()
+    pub fn take_frame(&self, key: &ChildKey) -> Option<Arc<ColorImage>> {
+        self.running.get(key)?.slot.as_ref()?.take()
+    }
+
+    /// The running decoder's input size, once ffmpeg has reported it.
+    pub fn input_geometry(&self, key: &ChildKey) -> Option<[u32; 2]> {
+        self.running.get(key)?.geometry.get().copied()
     }
 
     /// Decoders are killed; tunnels get their stdin closed so the helper can remove its port, and are
@@ -399,7 +436,7 @@ impl Drop for Supervisor {
 }
 
 /// Replaces the userinfo of every `scheme://user:pass@host` in `line` with `***`.
-fn redact_userinfo(line: &str) -> String {
+pub(crate) fn redact_userinfo(line: &str) -> String {
     let mut out = String::with_capacity(line.len());
     let mut rest = line;
     while let Some(i) = rest.find("://") {

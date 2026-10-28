@@ -90,7 +90,7 @@ if ui.button("Salvar").clicked() {
 **Chamada 4 — o binário do processo de visão:**
 
 ```rust
-fn main() -> ExitCode { intel_siam::sensors::run_vision(std::env::args_os().skip(1)) }
+fn main() -> ExitCode { intel_siam::sensors::run_vision(std::env::args_os().skip(1), Onnx::load) }
 ```
 
 ## Shape
@@ -103,7 +103,7 @@ são o mesmo código, com o mesmo `serde`, compilados na mesma build. Para o res
 
 ```
 src/sensors/
-  mod.rs        facade: Sensors, run_vision, vision_child, pub use types::*
+  mod.rs        facade: Sensors, run_vision, vision_child, Network, pub use types::*
   types.rs      domínio + modelo de leitura + UserCommand + Interest (com serde, invariantes nos construtores)
   wire.rs       privado: Command/Report, enquadramento, PROTOCOL, serialização da RtspUrl
   client.rs     privado: Sensors (lado do app)
@@ -114,12 +114,13 @@ src/sensors/
     pixels.rs   puro: recorte com máscara, assinatura 48×48, letterbox, redução
     feeds.rs    um feed por (fonte, stream): ffmpeg via Supervisor, ou snapshot HTTP
     store.rs    SQLite + arquivos
-    infer.rs    registro de modelos, download, ort, embedding, treino da regressão logística
+    infer.rs    registro de modelos, download, embedding pelo `Network`, treino da regressão logística
 ```
 
-O pacote ganha `src/lib.rs` (os módulos compartilhados) e um segundo binário, `intel-siam-vision`. O binário da UI
-nunca referencia `sensors::vision`, então o linker deixa `ort`, `rusqlite` e `image` de fora dele. Isso preserva o
-argumento do ADR 0001 de que o runtime ONNX não pesa no binário da UI.
+O pacote ganha `src/lib.rs` (os módulos compartilhados) e um segundo binário, `intel-siam-vision`, que implementa
+`sensors::Network` com `ort`. A lib nunca nomeia o `ort`, então o binário da UI não linka o runtime ONNX, e o
+`rusqlite` e o `image`, que a UI não chama, saem no `-dead_strip`. Isso preserva o argumento do ADR 0001 de que o
+runtime ONNX não pesa no binário da UI (medido em "Implementation reconciliation").
 
 ### Protocolo: estado desejado desce, modelo de leitura sobe
 
@@ -393,7 +394,82 @@ cliente `ureq`).
 
 ## Implementation reconciliation
 
-*Vazio até a implementação começar.*
+**Núcleo puro (`types`, `wire`, `vision/logic`, `vision/pixels`, `vision/infer` sem I/O).** Diferenças em relação ao
+esboço:
+
+- `Region` é uma struct com construtores; a forma (`RegionShape`) é pública para leitura, mas só vira `Region` por
+  eles. No esboço, `Region` era um enum público, e qualquer código podia montar um polígono de dois pontos sem passar
+  pela validação. A forma canônica segue `imaging.normalise_roi`: retângulo que cobre o quadro vira `Whole`, polígono
+  que é retângulo vira `Rect`. Polígono com mais de 32 pontos é recusado, e não truncado como na origem.
+- Os ids (`SensorId`, `FrameId`, `ImageId`, `SampleId`, `HistoryId`) têm o campo `pub(in crate::sensors)`: cliente e
+  visão constroem, a UI não.
+- Os limites e padrões que definem invariantes (`INTERVAL_LIMITS_S`, `DEBOUNCE_LIMITS`, `MAX_STATES`,
+  `MAX_POLYGON_POINTS`…) ficam em `types.rs`; os do motor (burst, sonda, revisão, `NEUTRAL_FILL`) em `logic.rs`. O
+  nome tem até 64 caracteres, como na origem (o esboço dizia 60).
+- `StateSet::next_key` ficou de fora: "menor chave livre" contradiz "chave nunca reaproveitada". A regra sai junto
+  com o formulário da UI.
+- `SensorStatus` declara `Failed` antes de `Untrained` e `Live`, para que a ordem de declaração seja a precedência.
+  `FeedFact` tem `Waiting` no lugar de `NoUrl` e `Starting`, que davam o mesmo status.
+- `RowCost` ganhou `pending_review`: como em `cleanup_history`, item à espera de revisão vive o dobro da idade e é
+  o último cortado por tamanho.
+- O fio não tem `MAX_PAYLOAD`: o tamanho do payload sai do cabeçalho (`Message::payload_len`) e precisa bater com o
+  que chegou, com cada lado da imagem em `1..=MAX_WIRE_EDGE`. `HEARTBEAT` entra com o processo de visão.
+- `logic::changed` decide o limiar de 4 %; `change_score` é interno.
+- `Head::predict` recebe o `StateSet` e devolve todos os estados, com 0 para os que não têm amostras
+  (`Head.predict(all_keys)` da origem). O `Head` ainda não guarda backbone nem região: isso entra com o `store`.
+  O `fit` reproduz `classifier.fit` da origem até ~1e-15 nos dois conjuntos de teste (2 e 3 estados).
+- `pixels` usa um só reamostrador, o filtro triangular do BILINEAR do PIL, também no `letterbox`, que na origem é
+  BICUBIC. Amostras e checagens passam pelo mesmo caminho, então a diferença não atravessa nenhuma fronteira.
+  `fit_rgba` recebe o lado maior (`MAX_WIRE_EDGE`), não um par.
+
+**Processo de visão (`vision/{mod,engine,store,feeds,infer}`, binário `intel-siam-vision`).** Diferenças em
+relação ao esboço e ao texto acima:
+
+- **O ONNX Runtime mora no binário, não na lib.** `sensors` expõe `trait Network` (roda um tensor NCHW e devolve
+  a última dimensão e os valores da primeira saída) e `type LoadNetwork`; `run_vision(args, load)` recebe o
+  carregador, e `src/bin/intel-siam-vision.rs` implementa os dois com `ort`. A chamada 4 vira
+  `run_vision(std::env::args_os().skip(1), Onnx::load)`. Motivo medido: com `ort` usado dentro da lib, o binário
+  da UI carregava os objetos do `ort` (as CGUs da lib que a UI usa também tinham código do `infer`), e os
+  inicializadores estáticos C++ do `libonnxruntime.a` sobreviviam ao `-dead_strip`: 811 símbolos `onnxruntime`,
+  `CoreML.framework` e `libc++` no `otool -L`, +0,9 MB. ThinLTO não resolveu (700 símbolos) e quebrou o link do
+  binário de visão (`___isPlatformVersionAtLeast`). Com o `Network`, a lib nunca nomeia o `ort`: o binário da UI
+  tem 0 símbolos `onnxruntime`/`sqlite3` e não linka CoreML nem libc++.
+- `build.rs` passa `-Wl,-dead_strip_dylibs` aos binários no macOS: cada um fica só com as dylibs que usa. O
+  binário de visão ainda linka AppKit e afins, porque compartilha CGUs com `app`/`ui` e as referências a classes
+  Objective-C nunca são removidas pelo linker. Risco aceito por ora; resolver pede tirar `app`/`ui` da lib.
+- **Modelo sob demanda de verdade.** O download começa quando algum sensor tem amostras para treinar ou um head
+  para checar, não quando um sensor existe. Sensor sem amostras fica `Untrained` e não baixa 24 MB. Sem head
+  válido (backbone e região atuais) não há checagem: o valor fica `None`, em vez de checagens que só dariam
+  `Unknown`.
+- `procs` ganhou `ChildKey::UrlDecoder(UrlKey, StreamKind)` (o `UrlKey` é um prefixo do SHA-256 da URL, então
+  nem a chave nem o nome do log carregam a senha), `take_frame(&ChildKey)` e `input_geometry(&ChildKey)`, que
+  o logger preenche com a primeira linha `Stream #…: Video: …, WxH` (`frames::parse_input_geometry`).
+  `plan::ffmpeg_args(input: &str, kind, Rate)` serve aos dois processos; `Rate::Sampled(2)` põe `fps=2` no
+  filtro. `ExitReason::label` saiu do `ui` para o `status`, porque o `SourceDown` também precisa do texto.
+- O fio não tem mais `Frame<M>`: `read_frame` devolve `(mensagem, payload)`.
+- **Store.** Amostra em `img/s/<sensor>/<sha256>.jpg` (por sensor, para apagar um sensor nunca apagar o arquivo
+  de outro que ensinou o mesmo frame); histórico em `img/h/<sensor>/<id>.jpg`. `sample` e `history` são
+  `AUTOINCREMENT` e o histórico grava o arquivo antes da linha usando o próximo id de `sqlite_sequence`: ids
+  nunca se repetem, então um `ImageId` derivado do id da linha nunca aponta para outra imagem. Não há arquivos
+  de miniatura: a miniatura (≤ 160 px) sai do frame gravado quando é enviada pela primeira vez. Embeddings em
+  BLOB `f32` LE; o head em JSON (`Head` ganhou serde), com backbone e hash da região em colunas.
+- **`ImageId`.** Prévia conta a partir de 1; imagens gravadas usam o id da linha com a espécie nos dois bits
+  altos (miniatura de amostra, miniatura de histórico, frame aberto), então a mesma imagem tem o mesmo id em
+  qualquer `FocusView` e sobe uma vez só.
+- **Feeds.** Snapshot busca uma vez ao aparecer, para o status sair de `WaitingSource` sem esperar checagem, e
+  guarda a imagem no tamanho nativo (a região é normalizada). Falha espera 5 s para tentar de novo.
+- **Engine.** O anel de `Teach` guarda os frames da prévia (`FRAME_RING = 5`, origem `frame_cache_size`),
+  porque é o frame que o usuário vê. A sonda compara com a assinatura da última checagem cheia (como na
+  origem); sem essa base, a sonda vira checagem cheia sem burst. `Configure` que muda a região ou os estados
+  agenda retreino. `Infer` espera a worker terminar o job ao ser descartado: os destrutores estáticos do ONNX
+  Runtime rodam no `exit` e falhavam uma inferência em voo.
+- **Teste do processo.** É um teste de unidade da lib (`vision/process_tests.rs`), não um `tests/`: o fio é
+  privado, e só de dentro de `sensors` dá para falar o codec. Como o cargo não constrói binários para testes de
+  unidade, o teste roda `cargo build --bin intel-siam-vision` e tira do ambiente as variáveis que o cargo dá ao
+  teste (`OUT_DIR`, `CARGO_PKG_*`…); com elas, scripts de build que as observam reconstruíam metade da árvore a
+  cada alternância entre `cargo test` e o build interno.
+- A linha `Stream #0:0: Video: …, WxH` foi observada com o ffmpeg 9.0.2 numa entrada `lavfi` (704x480); de um DVR
+  real continua [H] (pergunta 3 abaixo).
 
 ## Open questions and risks
 

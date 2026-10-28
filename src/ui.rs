@@ -8,7 +8,7 @@ use crate::frames::{StreamKey, StreamKind};
 use crate::layout;
 use crate::model::{CameraId, Intent, Layout, MAX_TILES, ViewMode};
 use crate::plan::{Tools, TunnelBackend, Unavailable};
-use crate::procs::Supervisor;
+use crate::procs::{ChildKey, Supervisor};
 use crate::status::{ExitReason, TileStatus, tile_status};
 
 /// Greens sampled from the top and bottom of the app icon's tiles.
@@ -93,7 +93,7 @@ fn upload_frames(ctx: &egui::Context, scene: &Scene, state: &mut UiState) {
     }
     state.textures.retain(|key, _| wanted.contains(key));
     for key in wanted {
-        let Some(image) = scene.procs.take_frame(&key) else { continue };
+        let Some(image) = scene.procs.take_frame(&ChildKey::Decoder(key.clone())) else { continue };
         match state.textures.get_mut(&key) {
             Some(texture) => texture.set(image, TextureOptions::LINEAR),
             None => {
@@ -194,12 +194,12 @@ fn status_message(status: &TileStatus) -> Option<String> {
         TileStatus::TunnelUnavailable(why) => unavailable_label(why),
         TileStatus::FfmpegMissing => "ffmpeg não encontrado".into(),
         TileStatus::TunnelStarting => "Abrindo túnel…".into(),
-        TileStatus::TunnelDown { reason, retry_in } => format!("Túnel caiu: {}{}", reason_label(reason), retry_suffix(retry_in)),
+        TileStatus::TunnelDown { reason, retry_in } => format!("Túnel caiu: {}{}", reason.label(), retry_suffix(retry_in)),
         TileStatus::StreamStarting => "Conectando…".into(),
         TileStatus::StreamDown { reason: ExitReason::AuthRejected, .. } => {
             "O DVR recusou a senha (401).\nNão será tentado de novo nesta sessão.".into()
         }
-        TileStatus::StreamDown { reason, retry_in } => format!("Sem vídeo: {}{}", reason_label(reason), retry_suffix(retry_in)),
+        TileStatus::StreamDown { reason, retry_in } => format!("Sem vídeo: {}{}", reason.label(), retry_suffix(retry_in)),
     })
 }
 
@@ -209,30 +209,6 @@ fn unavailable_label(why: &Unavailable) -> String {
         Unavailable::LibMissing(_) => "libt2u.so não encontrada (defina INTEL_SIAM_LIBT2U)".into(),
         Unavailable::MissingEnv(name) => format!("Defina a variável de ambiente {name}"),
         Unavailable::InstallFailed(_) => "Falha ao instalar o helper do túnel".into(),
-    }
-}
-
-fn reason_label(reason: &ExitReason) -> String {
-    match reason {
-        ExitReason::SpawnFailed(kind) => format!("não iniciou ({kind})"),
-        ExitReason::AuthRejected => "senha recusada".into(),
-        ExitReason::Unreachable => "conexão recusada".into(),
-        ExitReason::TimedOut => "tempo esgotado".into(),
-        ExitReason::Stalled => "sem frames".into(),
-        ExitReason::StreamEnded => "stream encerrado".into(),
-        ExitReason::TunnelLost(status) => match status {
-            -1 => "porta não encontrada".into(),
-            -2 => "falha de conexão".into(),
-            -3 => "conexão interrompida".into(),
-            -4 => "DVR offline".into(),
-            -5 => "erro de autenticação".into(),
-            -10 => "porta indisponível".into(),
-            -11 => "tempo esgotado".into(),
-            other => format!("status {other}"),
-        },
-        ExitReason::Crashed(signal) => format!("encerrado pelo sinal {signal}"),
-        ExitReason::Other(line) if line.is_empty() => "erro desconhecido".into(),
-        ExitReason::Other(line) => line.clone(),
     }
 }
 

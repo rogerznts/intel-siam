@@ -8,6 +8,9 @@ fn main() {
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }
+    // Every binary of the package gets every dependency's link requests: ONNX Runtime's CoreML and
+    // libc++ for the UI, eframe's AppKit for the vision process. Each keeps only the ones it uses.
+    println!("cargo:rustc-link-arg-bins=-Wl,-dead_strip_dylibs");
     // libt2u.so is x86_64-only, so the helper is always x86_64, whatever the app's own arch.
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap()).join("t2u_tunnel");
     let status = Command::new("cc")

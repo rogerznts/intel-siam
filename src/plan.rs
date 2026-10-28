@@ -11,7 +11,7 @@ use crate::procs::{ChildIo, ChildKey, ChildSpec, LocalPort};
 
 const RTSP_PORT: u16 = 554;
 const TUNNEL_STALL: Duration = Duration::from_secs(30);
-const DECODER_STALL: Duration = Duration::from_secs(15);
+pub const DECODER_STALL: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TunnelBackend {
@@ -46,6 +46,21 @@ impl fmt::Debug for RtspUrl {
     }
 }
 
+impl RtspUrl {
+    pub(crate) fn expose(&self) -> &str {
+        &self.0
+    }
+
+    /// The URL as the vision process receives it from the app: only the local tunnel's form.
+    pub(crate) fn from_wire(url: String) -> Option<Self> {
+        let rest = url.strip_prefix("rtsp://")?;
+        let authority = rest.split('/').next()?;
+        let port = authority.rsplit('@').next()?.strip_prefix("127.0.0.1:")?;
+        port.parse::<u16>().ok().filter(|p| *p != 0)?;
+        (rest.len() > authority.len()).then_some(Self(url))
+    }
+}
+
 pub fn rtsp_url(port: LocalPort, creds: &DvrCreds, cam: &CameraId, kind: StreamKind) -> RtspUrl {
     RtspUrl(format!(
         "rtsp://{}:{}@127.0.0.1:{}/cam/realmonitor?channel={}&subtype={}",
@@ -57,17 +72,30 @@ pub fn rtsp_url(port: LocalPort, creds: &DvrCreds, cam: &CameraId, kind: StreamK
     ))
 }
 
-pub fn ffmpeg_args(url: &RtspUrl, kind: StreamKind) -> Vec<OsString> {
+/// How many frames a decoder delivers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rate {
+    /// Every frame the source sends: the grid.
+    Native,
+    /// This many per second: sensors pay the decode, not the scale, the conversion and the pipe.
+    Sampled(u32),
+}
+
+/// `input` is a tunnel's `RtspUrl` or a camera URL typed in by the user.
+pub fn ffmpeg_args(input: &str, kind: StreamKind, rate: Rate) -> Vec<OsString> {
     let [w, h] = kind.size();
     // A plain stretch, not scale+pad: the 704x480 substream is anamorphic 16:9 with no SAR flag, so
     // keeping its pixel aspect would squeeze the picture into 4:3.
-    let vf = format!("scale={w}:{h},format=rgba");
+    let vf = match rate {
+        Rate::Native => format!("scale={w}:{h},format=rgba"),
+        Rate::Sampled(fps) => format!("fps={fps},scale={w}:{h},format=rgba"),
+    };
     [
         "-nostdin", "-hide_banner", "-nostats", "-loglevel", "info",
         // The tunnel forwards one TCP port, so RTP has to be interleaved on the RTSP connection.
         "-rtsp_transport", "tcp", "-timeout", "5000000",
         "-fflags", "nobuffer", "-flags", "low_delay",
-        "-i", &url.0,
+        "-i", input,
         "-an", "-vf", &vf, "-fps_mode", "passthrough",
         "-f", "rawvideo", "-pix_fmt", "rgba", "pipe:1",
     ]
@@ -120,7 +148,7 @@ pub fn desired_children(
                 ChildKey::Decoder(StreamKey { camera: cam.clone(), kind }),
                 ChildSpec {
                     program: ffmpeg.clone(),
-                    args: ffmpeg_args(&url, kind),
+                    args: ffmpeg_args(url.expose(), kind, Rate::Native),
                     io: ChildIo::Frames(kind),
                     stall_after: DECODER_STALL,
                 },
@@ -170,7 +198,7 @@ mod tests {
         set.keys()
             .filter_map(|k| match k {
                 ChildKey::Decoder(s) => Some((s.camera.channel.rtsp_channel(), s.kind)),
-                ChildKey::Tunnel(_) => None,
+                ChildKey::Tunnel(_) | ChildKey::UrlDecoder(..) => None,
             })
             .collect()
     }

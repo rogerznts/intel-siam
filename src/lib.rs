@@ -5,5 +5,6 @@ mod layout;
 pub mod model;
 pub mod plan;
 pub mod procs;
+pub mod sensors;
 pub mod status;
 mod ui;

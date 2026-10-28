@@ -28,6 +28,31 @@ impl ExitReason {
     pub fn is_terminal(&self) -> bool {
         matches!(self, Self::AuthRejected)
     }
+
+    /// What the user is told, in pt-BR.
+    pub fn label(&self) -> String {
+        match self {
+            Self::SpawnFailed(kind) => format!("não iniciou ({kind})"),
+            Self::AuthRejected => "senha recusada".into(),
+            Self::Unreachable => "conexão recusada".into(),
+            Self::TimedOut => "tempo esgotado".into(),
+            Self::Stalled => "sem frames".into(),
+            Self::StreamEnded => "stream encerrado".into(),
+            Self::TunnelLost(status) => match status {
+                -1 => "porta não encontrada".into(),
+                -2 => "falha de conexão".into(),
+                -3 => "conexão interrompida".into(),
+                -4 => "DVR offline".into(),
+                -5 => "erro de autenticação".into(),
+                -10 => "porta indisponível".into(),
+                -11 => "tempo esgotado".into(),
+                other => format!("status {other}"),
+            },
+            Self::Crashed(signal) => format!("encerrado pelo sinal {signal}"),
+            Self::Other(line) if line.is_empty() => "erro desconhecido".into(),
+            Self::Other(line) => line.clone(),
+        }
+    }
 }
 
 /// Classifies a child exit from its status and the tail of its stderr log.
