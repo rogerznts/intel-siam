@@ -407,12 +407,12 @@ impl Store {
         Ok(item)
     }
 
-    pub fn samples(&self, id: SensorId) -> Result<Vec<StoredSample>> {
-        let mut stmt = self.conn.prepare("SELECT id, label, created_at, sha256 FROM sample WHERE sensor = ? ORDER BY id DESC")?;
-        let rows = stmt.query_map([key(id)], |r| {
+    pub fn samples(&self, id: SensorId, before: Option<SampleId>, limit: usize) -> Result<(Vec<StoredSample>, Option<SampleId>)> {
+        let mut stmt = self.conn.prepare("SELECT id, label, created_at, sha256 FROM sample WHERE sensor = ? AND id < ? ORDER BY id DESC LIMIT ?")?;
+        let rows = stmt.query_map(params![key(id), before.map_or(i64::MAX, |s| s.0), limit as i64 + 1], |r| {
             Ok((r.get::<_, i64>(0)?, r.get::<_, Option<u8>>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
         })?;
-        rows.map(|row| {
+        let mut rows = rows.map(|row| {
             let (sample, label, at, sha) = row?;
             Ok(StoredSample {
                 id: SampleId(sample),
@@ -421,7 +421,10 @@ impl Store {
                 image: self.sample_path(id, &sha),
             })
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+        let older = (rows.len() > limit).then(|| rows[limit - 1].id);
+        rows.truncate(limit);
+        Ok((rows, older))
     }
 
     /// Items waiting for review, newest first.
@@ -695,7 +698,7 @@ mod tests {
         assert_eq!(store.add_sample(id, b"frame a", label(2)).unwrap(), a, "same image, same sample");
         store.add_sample(id, b"frame b", label(2)).unwrap();
         assert_eq!(store.counts(id).unwrap().0, [(label(2), 2)].into());
-        let path = store.samples(id).unwrap().into_iter().find(|s| s.id == a).unwrap().image;
+        let path = store.samples(id, None, 100).unwrap().0.into_iter().find(|s| s.id == a).unwrap().image;
         assert!(path.is_file());
         assert!(store.relabel(id, a, None).unwrap());
         assert!(!path.exists());

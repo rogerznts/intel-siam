@@ -38,6 +38,7 @@ const PREVIEW_EVERY: Duration = Duration::from_millis(500);
 const MODEL_RETRY: Duration = Duration::from_secs(60);
 const HISTORY_PAGE: usize = 50;
 const REVIEW_PAGE: usize = 100;
+const SAMPLE_PAGE: usize = 100;
 const THUMB_EDGE: usize = 160;
 const SAMPLE_QUALITY: u8 = 90;
 const HISTORY_QUALITY: u8 = 80;
@@ -171,6 +172,10 @@ impl Engine {
         }
         for (id, s) in &mut sensors {
             (s.samples, s.review_pending) = store.counts(*id)?;
+            // Rebuild from durable samples if the previous process exited before training finished.
+            if !s.samples.is_empty() || s.head.is_some() {
+                s.retrain_at = Some(Instant::now());
+            }
         }
         let now = Instant::now();
         let engine = Self {
@@ -596,9 +601,9 @@ impl Engine {
         };
         let feed = s.feed();
         let frame = self.feeds.frame(&feed, now, PREVIEW_EVERY).or_else(|| self.feeds.latest(&feed).cloned())?;
-        let next = frame.at + PREVIEW_EVERY;
+        let next = (frame.at + PREVIEW_EVERY > now).then_some(frame.at + PREVIEW_EVERY);
         if self.preview.as_ref().is_some_and(|p| p.sensor == s.rec.id && p.seq == frame.seq) {
-            return Some(next);
+            return next;
         }
         let image = pixels::fit_rgba(&frame.image, MAX_WIRE_EDGE as usize);
         let [width, height] = frame.image.size.map(|n| n as u32);
@@ -614,7 +619,7 @@ impl Engine {
         }
         self.preview = Some(Shown { sensor: s.rec.id, preview, image, seq: frame.seq });
         self.focus_dirty = true;
-        Some(next)
+        next
     }
 
     /// Feeds for sensors that are active, focused or asked to check now; `Wants` for their DVR
@@ -741,15 +746,17 @@ impl Engine {
         };
         let detail = match self.interest.tab {
             Tab::Live => Ok(Detail::Live),
-            Tab::Samples => self.store.samples(id).map(|rows| {
-                Detail::Samples(
-                    rows.into_iter()
+            Tab::Samples => self.store.samples(id, self.interest.samples_before, SAMPLE_PAGE).map(|(rows, older)| {
+                Detail::Samples {
+                    rows: rows.into_iter()
                         .filter_map(|row| {
                             let thumb = ImageId(SAMPLE_THUMB | row.id.0 as u64);
                             load(thumb, &row.image, THUMB_EDGE).then_some(SampleItem { id: row.id, label: row.label, thumb, at: row.at })
                         })
                         .collect(),
-                )
+                    before: self.interest.samples_before,
+                    older,
+                }
             }),
             Tab::Review => self
                 .store
@@ -816,3 +823,7 @@ fn entry(s: &Sensor, status: SensorStatus) -> SensorEntry {
 fn roll() -> f32 {
     (getrandom::u32().unwrap_or(0) >> 8) as f32 / (1u32 << 24) as f32
 }
+
+#[cfg(test)]
+#[path = "engine_tests.rs"]
+mod tests;

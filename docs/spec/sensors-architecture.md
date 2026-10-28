@@ -126,8 +126,8 @@ runtime ONNX não pesa no binário da UI (medido em "Implementation reconciliati
 
 Transporte: stdin e stdout do filho, com stderr indo para o log redigido, como em todo filho. Um codec nos dois
 sentidos: `u32 header_len | JSON | u32 payload_len | bytes`. Só `Report::Image` tem payload, em RGBA8 cru, então o
-app não precisa de decodificador de imagem. Os limites são checados na leitura. Uma violação derruba o link, e o
-supervisor faz o resto.
+app não precisa de decodificador de imagem. O cabeçalho tem teto de 1 MiB na leitura e na escrita. A escrita
+recusa um cabeçalho maior antes de tocar no pipe. Uma violação na leitura derruba o link.
 
 | Sentido | Mensagem | Natureza |
 |---|---|---|
@@ -141,10 +141,16 @@ supervisor faz o resto.
 | visão → app | `System(SystemStatus)` | modelos, uso de disco, retenção; também é o heartbeat (5 s) |
 
 **Por que não há consultas.** O painel não pede "me dá a página 2 do histórico" e espera a resposta. Ele declara
-`Interest { sensor, tab, history_before, open }`, e o processo de visão empurra o `FocusView` correspondente sempre
+`Interest { sensor, tab, history_before, samples_before, open }`, e o processo de visão empurra o `FocusView` correspondente sempre
 que algo nele muda: frame novo da prévia, amostra nova, item revisado. Esse é o mesmo idioma do `reconcile`. Não
 existe id de requisição, resposta atrasada de outra aba nem reenvio. Um `Interest` repetido não envia nada (o cliente
 compara com `link.sent`).
+
+Amostras usam páginas de até 100 linhas, ordenadas por id decrescente. `samples_before` seleciona ids menores que
+o cursor. `Detail::Samples { rows, before, older }` confirma o cursor recebido e entrega o próximo, ou `None`.
+O cursor vem das linhas consultadas, não das miniaturas legíveis, então arquivos danificados não bloqueiam a navegação.
+O painel mantém os cursores anteriores para voltar uma página. Os campos de cada `SampleItem` são numéricos ou
+temporais de tamanho limitado, mantendo o cabeçalho muito abaixo de 1 MiB mesmo com uma biblioteca sem limite de amostras.
 
 **Imagens sem protocolo de cache.** `FocusView::images()` devolve o conjunto de `ImageId` que a visão referencia. O
 app guarda exatamente esse conjunto. O processo de visão envia só o que não estava no `FocusView` anterior. Os dois
@@ -160,7 +166,7 @@ Como tudo o que desce é declarativo ou idempotente, nenhum dos lados precisa de
 é o que vivia só na memória: valor publicado, debounce, anel de frames. Na volta, o primeiro resultado é publicado na
 hora, como na origem, e um `Teach` com `FrameId` antigo vira o aviso `FrameExpired`.
 
-**Versão.** `PROTOCOL = 1`. Uma versão diferente é `ExitReason::Incompatible`, terminal como o 401: o supervisor não
+**Versão.** `PROTOCOL = 2`, com paginação de amostras. Uma versão diferente é `ExitReason::Incompatible`, terminal como o 401: o supervisor não
 reinicia até o app reiniciar. Os dois binários saem da mesma build, então isso só acontece quando um binário é
 trocado com o app aberto.
 
@@ -207,14 +213,19 @@ feeds waker ──Wake────┘
   processo de visão posta `Input::Wake`. A amostragem é de 2 fps (`Rate::Sampled`): o decode H.264 é inevitável,
   mas a escala, a conversão para RGBA e a cópia no pipe não são pagas a 25 fps. Um feed por (fonte, stream) é
   compartilhado pelos sensores dessa fonte. O engine é o único leitor de cada `FrameSlot`.
-- **Snapshot HTTP.** Uma thread de fetch busca a imagem quando uma checagem pede. `Feeds::frame_for_check` esconde a
-  diferença entre stream contínuo e snapshot.
+- **Snapshot HTTP.** Uma thread busca a imagem ao aparecer a fonte e quando uma checagem ou prévia pede.
+  `Feeds::frame` esconde a diferença entre stream contínuo e snapshot. `poll` retenta falhas após 5 s,
+  mesmo sem sensor treinado ou painel aberto, com no máximo uma busca em voo por fonte.
+  Usuário e senha recebem percent-decoding separado antes de montar Basic Auth. A URL da requisição não contém userinfo.
 - **Fila de inferência.** Uma worker (`infer`) roda `Embed` e `Train` em ordem. Cada sensor tem no máximo uma
   checagem em voo; uma checagem que vence com outra em voo é pulada, não enfileirada.
 - **Treino.** `Teach`, `Resolve` e `Relabel` marcam `retrain_at = now + 1 s`, e cliques seguidos viram um treino só.
   A amostra é endereçada pelo SHA-256 da imagem (`UNIQUE(sensor, sha256)`), então um clique duplo grava uma linha
   só. O job leva os embeddings em cache e os caminhos das amostras sem cache. A worker calcula o que falta, faz o fit
   e devolve o head e os vetores novos. O engine grava os dois.
+  Ao carregar o banco, sensores com amostras rotuladas ou head existente ganham treino imediato. Essa reconstrução
+  reaproveita embeddings persistidos e cobre encerramento antes do treino, rótulos alterados, exclusão de todas as
+  amostras e mudança de região. Não há revisão persistida adicional nem migração de esquema.
 - **Criação.** Um sensor nasce com a região igual ao quadro inteiro e ganha a região desenhada no editor depois;
   não existe decoder temporário para um sensor que ainda não existe.
 - **Ausência não apaga.** Dados de um sensor só somem por `UserCommand::Delete` explícito; nenhum `Desired` ou
@@ -276,7 +287,7 @@ copiadas literalmente, com o nome original ao lado.
 |---|---|
 | `Sensors`: `new`, `poll`, `view`, `queue`, `sync` | threads de leitura e escrita, enquadramento, verificação de versão, adoção de filho reiniciado, reenvio do estado desejado, réplica, cache de imagens e GC, montagem das URLs RTSP |
 | `SensorsView` (dados) + `on_camera`, `image` | origem de cada campo (banco, memória, modelo), derivação de status |
-| `UserCommand` (8), `Interest` (4 campos) | SQLite, arquivos, treino, coalescência, embeddings em cache, retenção |
+| `UserCommand` (8), `Interest` (5 campos) | SQLite, arquivos, treino, coalescência, embeddings em cache, retenção |
 | `run_vision`, `vision_child` | o processo de visão inteiro e o formato do argv, que mora num lugar só |
 
 O app não conhece nenhum tipo de transporte. `Command`, `Report`, `Desired`, `Frame` e `RtspUrl` serializada ficam
@@ -463,11 +474,25 @@ relação ao esboço e ao texto acima:
   origem); sem essa base, a sonda vira checagem cheia sem burst. `Configure` que muda a região ou os estados
   agenda retreino. `Infer` espera a worker terminar o job ao ser descartado: os destrutores estáticos do ONNX
   Runtime rodam no `exit` e falhavam uma inferência em voo.
+- **Correções da revisão.** `redact_userinfo` aceita apóstrofo dentro da autoridade antes de ocultar o userinfo,
+  tanto no `SourceView` quanto no stderr. A prévia nunca fornece prazo vencido ao laço. Com frame antigo,
+  mantém a imagem exibida e espera o feed avisar ou o próximo prazo de outro trabalho.
+- **Paginação de amostras.** O limite de 100 linhas é aplicado no SQL antes de carregar imagens. O cursor continua
+  disponível mesmo quando a página perde miniaturas ilegíveis. O leitor e o escritor compartilham o teto de cabeçalho.
+  A versão 2 exige atualizar os dois executáveis juntos.
 - **Teste do processo.** É um teste de unidade da lib (`vision/process_tests.rs`), não um `tests/`: o fio é
   privado, e só de dentro de `sensors` dá para falar o codec. Como o cargo não constrói binários para testes de
   unidade, o teste roda `cargo build --bin intel-siam-vision` e tira do ambiente as variáveis que o cargo dá ao
   teste (`OUT_DIR`, `CARGO_PKG_*`…); com elas, scripts de build que as observam reconstruíam metade da árvore a
   cada alternância entre `cargo test` e o build interno.
+- **Evidência da correção, 2026-10-28.** Os testes reproduziram antes da correção a senha exposta no stderr,
+  treino perdido, prazo vencido, retentativa ausente, Basic Auth sem decoding e cabeçalho de amostras rejeitado.
+  Após as correções, `cargo test` passou com 104 testes e `cargo clippy --all-targets` terminou sem avisos.
+  `engine_tests.rs` percorre 12.000 amostras pelo codec, sem duplicação ou perda, e avança após uma página
+  inteira com imagens ilegíveis. `process_tests.rs` navega 205 amostras em páginas de 100, 100 e 5 pelo stdin/stdout
+  do executável real e retorna à primeira página. Os testes HTTP usam somente um servidor em loopback.
+  Um smoke separado do executável debug recebeu `Hello` 2, criou uma fonte RTSP pausada com apóstrofo na senha,
+  conferiu a URL redigida, abriu Amostras, excluiu o sensor e encerrou com código 0 ao fechar stdin, sem rede externa.
 - A linha `Stream #0:0: Video: …, WxH` foi observada com o ffmpeg 9.0.2 numa entrada `lavfi` (704x480); de um DVR
   real continua [H] (pergunta 3 abaixo).
 
@@ -486,8 +511,9 @@ relação ao esboço e ao texto acima:
   padrão explícito, e o README pede `cargo build --release` antes para construir também o companheiro.
 - O formulário cria as chaves 1–9 uma vez. Não há remoção/adição de estados depois de criar, portanto
   nenhuma chave apagada é reaproveitada. A região e a pausa são alteradas por `Configure`.
-- Os logs dos decoders de visão ficam em `logs/vision`, separados dos decoders da grade. Paginação
-  oferece a página seguinte mais antiga e retorno à mais recente, sem uma pilha de cursores na UI.
+- Os logs dos decoders de visão ficam em `logs/vision`, separados dos decoders da grade. O histórico oferece
+  a página seguinte mais antiga e retorno à mais recente. Amostras também permitem voltar à página anterior,
+  com uma pilha de cursores privada do painel e confirmação de `before` para não desenhar uma resposta de outra página.
 
 ## Open questions and risks
 

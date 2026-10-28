@@ -498,7 +498,7 @@ pub(crate) fn redact_userinfo(line: &str) -> String {
     while let Some(i) = rest.find("://") {
         let (head, tail) = rest.split_at(i + 3);
         out.push_str(head);
-        let authority_end = tail.find(|c: char| c == '/' || c == '\'' || c == '"' || c.is_whitespace()).unwrap_or(tail.len());
+        let authority_end = tail.find(|c: char| matches!(c, '/' | '?' | '#' | '"') || c.is_whitespace()).unwrap_or(tail.len());
         match tail[..authority_end].rfind('@') {
             Some(at) => {
                 out.push_str("***");
@@ -509,6 +509,15 @@ pub(crate) fn redact_userinfo(line: &str) -> String {
     }
     out.push_str(rest);
     out
+}
+
+#[cfg(test)]
+mod redaction_regression_tests {
+    #[test]
+    fn credentials_with_apostrophes_are_hidden_in_stderr() {
+        let line = "[rtsp] Failed opening 'rtsp://admin:pa'ss@camera.local/live': 401";
+        assert_eq!(super::redact_userinfo(line), "[rtsp] Failed opening 'rtsp://***@camera.local/live': 401");
+    }
 }
 
 fn read_tail(path: &Path) -> String {

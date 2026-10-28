@@ -40,17 +40,93 @@ publicar novas imagens das câmeras do usuário.
 
 ![Histórico das checagens com valores, confiança e miniaturas](../images/sensors-history.png)
 
-## Limites do smoke
+## Complemento de verificação da interface
 
-A região permaneceu como o quadro inteiro. Duas tentativas de arrastar um retângulo pelo `orca computer`
-retornaram `synthetic_input` sem mudança visual. Uma tentativa de inserir um ponto do polígono retornou
-`window_not_focused`, com a mensagem `current: no focused window`. A tentativa de restaurar a janela e a
-ativação por AppleScript não tornaram a interação por coordenadas verificável. Portanto, o desenho de
-retângulo, o desenho de polígono e os atalhos de teclado não foram comprovados nesta sessão.
+A rodada complementar usou o executável release existente, com `.env`, e o mesmo servidor HTTP.
+Ela não repetiu a classificação, as abas e os testes automatizados já aprovados acima.
+Não houve alteração de código nesta rodada.
 
-A seleção de modo Polígono funcionou pela acessibilidade. A construção e a validação das regiões têm
-cobertura nos testes de domínio, mas esses testes não substituem o gesto na janela.
+### Entrada nativa do macOS
 
-O smoke comprovou o valor no painel. A fonte URL avulsa não pertence a um tile, por definição.
-O selo de sensor sobre um tile de DVR, a correção de uma revisão pendente e a edição de retenção
-não foram exercitados manualmente. A renderização do selo usa a mesma réplica e o mesmo rótulo do painel.
+O guia retornado por `orca skills get computer-use --json` distingue entrega de entrada e efeito observado.
+`synthetic_input` significa entrada enviada sem comprovação automática, não um erro do editor.
+Para `window_not_focused`, o guia recomenda uma tentativa com `--restore-window` e depois foco nativo.
+As coordenadas do Orca são locais à janela e precisam considerar `screenshot.scale`.
+
+A janela iniciou em outro monitor, com posição `{-5996, 6}`. O arrasto pelo Orca não mudou a região.
+AppleScript, selecionando o processo pelo PID, trouxe a janela para `{50, 60}`, com tamanho `{1400, 850}`.
+Mesmo nessa posição, o arrasto pelo Orca não produziu o retângulo esperado.
+
+O caminho alternativo usou eventos reais de mouse do CoreGraphics, publicados em `.cghidEventTap`.
+O arrasto enviou `mouseMoved`, `leftMouseDown`, vinte eventos `leftMouseDragged` e `leftMouseUp`.
+Os cliques do polígono enviaram `leftMouseDown` e `leftMouseUp`.
+AppleScript com `System Events` enviou as teclas. Capturas e releitura do banco comprovaram os efeitos.
+O driver Swift temporário foi removido ao final.
+
+### Regiões e atalhos
+
+O sensor temporário **Region Verify Temp** usou a fonte URL do smoke.
+O arrasto de tela `{1080, 350}` até `{1370, 510}` produziu o retângulo verde dentro da prévia.
+Após **Salvar região**, uma consulta somente leitura em `sensors.db` retornou a região persistida:
+
+```json
+{"Rect":{"min":[0.16397229,0.3248332],"max":[0.83371824,0.8519374]}}
+```
+
+![Retângulo desenhado dentro da prévia do sensor temporário](../images/sensors-region-rectangle.png)
+
+No modo **Polígono**, os cliques de tela `{1050, 340}`, `{1280, 320}`, `{1380, 500}` e `{1100, 510}`
+habilitaram **Fechar**. O botão fechou o contorno verde e voltou a ficar desabilitado.
+Após **Salvar região**, a consulta retornou quatro vértices, sem substituir o polígono pelo quadro inteiro:
+
+```json
+{"Polygon":[[0.09468822,0.1539646],[0.62586606,0.07185014],[0.85681295,0.8108802],[0.21016166,0.8519374]]}
+```
+
+![Polígono de quatro vértices fechado na prévia](../images/sensors-region-polygon.png)
+
+A tecla `1`, sem clicar no botão de ensino, mudou **Aberto (0)** para **Aberto (1)**.
+Após alternar o servidor para a imagem fechada, a tecla `2` mudou **Fechado (0)** para **Fechado (1)**.
+A captura registra uma amostra de cada estado e o valor **Fechado**.
+As teclas de `3` a `9` não foram exercitadas, pois o sensor tinha dois estados.
+
+![Uma amostra por estado após ensino pelas teclas 1 e 2](../images/sensors-keyboard.png)
+
+### Retenção
+
+A ação de acessibilidade `increment` no controle de dias não mudou o valor observado.
+O duplo clique nativo abriu o editor numérico. `Cmd+A`, digitação e `Return` alteraram ambos os limites.
+A interface mostrou **8 dias** e **2049 MB**. A tabela `setting` confirmou
+`max_age.secs = 691200` e `max_bytes = 2148532224`.
+Os limites foram aumentados para evitar expiração de dados durante a prova.
+
+![Retenção alterada para 8 dias e 2049 MB](../images/sensors-retention.png)
+
+Os mesmos controles restauraram **7 dias** e **2048 MB**.
+A consulta final confirmou `max_age.secs = 604800` e `max_bytes = 2147483648`.
+
+### Selo no tile de DVR
+
+Havia câmeras reais disponíveis na grade. O sensor temporário **DVR Verify Temp**, vinculado ao **Canal1**,
+mostrou **DVR Verify Temp: aguardando fonte** sobre o tile correspondente.
+Depois de **Pausar**, tanto o painel quanto o selo passaram para **DVR Verify Temp: pausado**.
+As imagens abaixo contêm somente os rótulos, sem publicar o vídeo da câmera.
+
+![Selo no tile enquanto o sensor aguarda a fonte](../images/sensors-tile-waiting.png)
+
+![O mesmo selo após pausar o sensor](../images/sensors-tile-paused.png)
+
+Essa prova cobre o selo e a atualização do status no tile, não a mudança de um valor classificado nesse tile.
+A classificação com duas situações continua comprovada pelo smoke da fonte URL.
+A correção de uma revisão pendente não foi exercitada nesta rodada.
+
+### Limpeza e alcance
+
+Os dois sensores temporários foram removidos pelos botões **Apagar** e **Confirmar exclusão**.
+A lista voltou a ficar vazia. A consulta final retornou zero linhas em `sensor`, `sample` e `history`.
+Nenhum sensor do usuário foi removido. A retenção original foi restaurada e os dois processos de smoke foram encerrados.
+As capturas de regiões, atalhos e retenção foram recortadas para excluir a grade de câmeras.
+
+Não foi encontrado defeito do aplicativo nos caminhos exercitados.
+Build, testes e clippy não foram repetidos, pois esta rodada alterou somente o relatório e as evidências.
+As aprovações da primeira seção pertencem à rodada anterior, não validam alterações concorrentes posteriores.

@@ -15,6 +15,8 @@ pub struct SensorsPanel {
     selected: Option<SensorId>,
     tab: Tab,
     before: Option<HistoryId>,
+    samples_before: Option<SampleId>,
+    sample_pages: Vec<Option<SampleId>>,
     opened: Option<HistoryId>,
     create: Option<NewSensor>,
     region: Option<Region>,
@@ -44,7 +46,7 @@ impl Default for NewSensor {
 
 impl SensorsPanel {
     pub fn interest(&self) -> Interest {
-        if self.open { Interest { sensor: self.selected, tab: self.tab, history_before: self.before, open: self.opened } }
+        if self.open { Interest { sensor: self.selected, tab: self.tab, history_before: self.before, samples_before: self.samples_before, open: self.opened } }
         else { Interest::default() }
     }
 
@@ -52,6 +54,8 @@ impl SensorsPanel {
         self.selected = Some(id);
         self.tab = Tab::Live;
         self.before = None;
+        self.samples_before = None;
+        self.sample_pages.clear();
         self.opened = None;
         self.region = None;
         self.polygon.clear();
@@ -201,13 +205,13 @@ fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &
     }
     ui.horizontal(|ui| {
         for (tab, label) in [(Tab::Live, "Ao vivo"), (Tab::Samples, "Amostras"), (Tab::Review, "Revisão"), (Tab::History, "Histórico")] {
-            if ui.selectable_value(&mut panel.tab, tab, label).changed() { panel.opened = None; panel.before = None; }
+            if ui.selectable_value(&mut panel.tab, tab, label).changed() { panel.opened = None; panel.before = None; panel.samples_before = None; panel.sample_pages.clear(); }
         }
     });
     let Some(focus) = scene.sensors.focus.as_ref().filter(|f| f.sensor == entry.id) else { ui.spinner(); return };
     match (&focus.detail, panel.tab) {
         (Detail::Live, Tab::Live) => live(ui, panel, entry, focus, actions),
-        (Detail::Samples(samples), Tab::Samples) => {
+        (Detail::Samples { rows: samples, before, older }, Tab::Samples) if *before == panel.samples_before => {
             if samples.is_empty() { ui.label("Nenhuma amostra. Ensine na aba Ao vivo."); }
             let KindSettings::States(states) = &entry.settings.kind;
             for sample in samples {
@@ -226,6 +230,15 @@ fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &
                     });
                 });
             }
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!panel.sample_pages.is_empty(), egui::Button::new("Amostras mais recentes")).clicked() {
+                    panel.samples_before = panel.sample_pages.pop().flatten();
+                }
+                if ui.add_enabled(older.is_some(), egui::Button::new("Amostras mais antigas")).clicked() {
+                    panel.sample_pages.push(panel.samples_before);
+                    panel.samples_before = *older;
+                }
+            });
         }
         (Detail::Review(rows), Tab::Review) | (Detail::History { rows, .. }, Tab::History) => {
             if rows.is_empty() { ui.label("Nenhum registro."); }

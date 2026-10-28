@@ -102,6 +102,10 @@ impl Feeds {
             seq: 0,
         }
     }
+    #[cfg(test)]
+    pub(super) fn seed_frame(&mut self, id: FeedId, frame: Frame) {
+        self.latest.insert(id, frame);
+    }
 
     /// Converges to `want`: decoders through `Supervisor::reconcile`, so a changed URL restarts
     /// exactly its decoder. A snapshot feed fetches once when it appears, so its status is known.
@@ -164,11 +168,22 @@ impl Feeds {
                 Err(reason) => snapshot.failure = Some((reason, now + SNAPSHOT_RETRY)),
             }
         }
-        for (_, retry_at) in self.snapshots.values().filter_map(|s| s.failure.as_ref()) {
-            let wait = retry_at.saturating_duration_since(now);
-            if !wait.is_zero() {
-                again = Some(again.map_or(wait, |a| a.min(wait)));
+        let mut due = Vec::new();
+        for (id, snapshot) in &self.snapshots {
+            if snapshot.fetching {
+                continue;
             }
+            if let Some((_, retry_at)) = &snapshot.failure {
+                if *retry_at <= now {
+                    due.push(id.clone());
+                } else {
+                    let wait = retry_at.duration_since(now);
+                    again = Some(again.map_or(wait, |a| a.min(wait)));
+                }
+            }
+        }
+        for id in due {
+            self.fetch(&id, now);
         }
         again
     }
@@ -180,7 +195,7 @@ impl Feeds {
     /// The newest frame if it is at most `max_age` old. Otherwise a snapshot feed starts a fetch,
     /// and the engine is woken when it lands.
     pub fn frame(&mut self, id: &FeedId, now: Instant, max_age: Duration) -> Option<Frame> {
-        if let Some(frame) = self.latest.get(id).filter(|f| now.duration_since(f.at) <= max_age) {
+        if let Some(frame) = self.latest.get(id).filter(|f| now.duration_since(f.at) < max_age) {
             return Some(frame.clone());
         }
         self.fetch(id, now);
@@ -228,10 +243,80 @@ impl Feeds {
 
 fn fetch_snapshot(url: &SecretUrl) -> Result<ColorImage, String> {
     let agent = ureq::Agent::config_builder().timeout_global(Some(SNAPSHOT_TIMEOUT)).build().new_agent();
-    let bytes = agent
-        .get(url.expose())
+    let raw = url.expose();
+    let authority_start = raw.find("://").expect("SecretUrl has a scheme") + 3;
+    let authority_end = raw[authority_start..].find(['/', '?', '#']).map_or(raw.len(), |end| authority_start + end);
+    let request = if let Some(at) = raw[authority_start..authority_end].rfind('@') {
+        use base64::Engine as _;
+        let at = authority_start + at;
+        let (user, pass) = raw[authority_start..at].split_once(':').unwrap_or((&raw[authority_start..at], ""));
+        let mut credentials: Vec<u8> = percent_encoding::percent_decode_str(user).collect();
+        credentials.push(b':');
+        credentials.extend(percent_encoding::percent_decode_str(pass));
+        let clean = format!("{}{}", &raw[..authority_start], &raw[at + 1..]);
+        let auth = base64::engine::general_purpose::STANDARD.encode(credentials);
+        agent.get(&clean).header("Authorization", format!("Basic {auth}"))
+    } else {
+        agent.get(raw)
+    };
+    let bytes = request
         .call()
         .and_then(|mut response| response.body_mut().with_config().limit(MAX_SNAPSHOT_BYTES).read_to_vec())
         .map_err(|e| e.to_string())?;
     pixels::decode(&bytes).map_err(|e| format!("imagem inválida: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use base64::Engine as _;
+    use tiny_http::{Response, Server};
+
+    fn jpeg() -> Vec<u8> {
+        pixels::encode_jpeg(&ColorImage::filled([2, 2], egui::Color32::BLACK), 90).unwrap()
+    }
+
+    #[test]
+    fn regression_snapshot_auth_decodes_userinfo_before_sending() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let serving = thread::spawn(move || {
+            let request = server.recv_timeout(Duration::from_secs(3)).unwrap().expect("snapshot request");
+            let auth = request.headers().iter().find(|h| h.field.equiv("Authorization")).unwrap().value.as_str();
+            assert_eq!(auth, format!("Basic {}", base64::engine::general_purpose::STANDARD.encode(b"admin:p@ss:%")));
+            assert_eq!(request.url(), "/snapshot");
+            request.respond(Response::from_data(jpeg())).unwrap();
+        });
+        let url = SecretUrl::try_from(format!("http://ad%6Din:p%40ss%3A%25@{addr}/snapshot")).unwrap();
+        assert_eq!(fetch_snapshot(&url).unwrap().size, [2, 2]);
+        serving.join().unwrap();
+    }
+
+    #[test]
+    fn regression_poll_retries_failed_snapshot_without_frame_demand() {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let addr = server.server_addr().to_ip().unwrap();
+        let serving = thread::spawn(move || {
+            for response in [Response::from_data(Vec::new()).with_status_code(503), Response::from_data(jpeg())] {
+                server.recv_timeout(Duration::from_secs(3)).unwrap().expect("snapshot fetch or retry").respond(response).unwrap();
+            }
+        });
+        let (tx, wake) = mpsc::channel();
+        let mut feeds = Feeds::new("/nonexistent/ffmpeg".into(), std::env::temp_dir(), Arc::new(move || { let _ = tx.send(()); }));
+        let url = SecretUrl::try_from(format!("http://{addr}/snapshot")).unwrap();
+        let id = FeedId::Url(UrlKey::of(url.expose()), StreamKind::Sub);
+        let now = Instant::now();
+        feeds.reconcile([(id.clone(), FeedSource::Snapshot(&url))], now);
+        wake.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(feeds.poll(now), Some(SNAPSHOT_RETRY));
+        assert!(matches!(feeds.phase(&id, now), FeedFact::Down { .. }));
+        let due = now + SNAPSHOT_RETRY;
+        feeds.poll(due);
+        feeds.poll(due);
+        wake.recv_timeout(Duration::from_secs(3)).expect("poll starts a retry when due");
+        feeds.poll(due);
+        assert!(matches!(feeds.phase(&id, due), FeedFact::Up));
+        assert_eq!(feeds.latest(&id).unwrap().image.size, [2, 2]);
+        serving.join().unwrap();
+    }
 }

@@ -653,6 +653,8 @@ pub struct Interest {
     pub tab: Tab,
     /// History page: rows strictly older than this; `None` is the newest page.
     pub history_before: Option<HistoryId>,
+    /// Sample page: rows strictly older than this; `None` is the newest page.
+    pub samples_before: Option<SampleId>,
     /// One item opened full size.
     pub open: Option<HistoryId>,
 }
@@ -683,7 +685,7 @@ impl FocusView {
     pub fn images(&self) -> BTreeSet<ImageId> {
         let thumbs: Vec<ImageId> = match &self.detail {
             Detail::Live => Vec::new(),
-            Detail::Samples(items) => items.iter().map(|s| s.thumb).collect(),
+            Detail::Samples { rows, .. } => rows.iter().map(|s| s.thumb).collect(),
             Detail::Review(rows) | Detail::History { rows, .. } => rows.iter().filter_map(|r| r.thumb).collect(),
         };
         let preview = self.preview.as_ref().map(|p| p.image);
@@ -704,7 +706,7 @@ pub struct Preview {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Detail {
     Live,
-    Samples(Vec<SampleItem>),
+    Samples { rows: Vec<SampleItem>, before: Option<SampleId>, older: Option<SampleId> },
     Review(Vec<HistoryItem>),
     History { rows: Vec<HistoryItem>, older: bool },
 }
@@ -849,6 +851,11 @@ mod tests {
         assert!(StateSet::try_from(vec![]).is_err());
     }
 
+    #[test]
+    fn apostrophe_credentials_never_reach_the_source_view() {
+        let url = SecretUrl::try_from("rtsp://admin:pa'ss@camera.local/live".to_owned()).unwrap();
+        assert_eq!(url.display(), "rtsp://***@camera.local/live");
+    }
     #[test]
     fn secret_url_is_redacted_everywhere_debug_reaches() {
         let url = SecretUrl::try_from("rtsp://admin:hunter2@10.0.0.5:554/stream".to_owned()).unwrap();

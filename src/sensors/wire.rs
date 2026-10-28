@@ -18,7 +18,7 @@ use super::types::{FocusView, ImageId, Interest, SensorEntry, SensorId, SystemSt
 use crate::frames::StreamKey;
 use crate::plan::RtspUrl;
 
-pub(super) const PROTOCOL: u32 = 1;
+pub(super) const PROTOCOL: u32 = 2;
 /// No image on the wire is larger than this on its longer side.
 pub(super) const MAX_WIRE_EDGE: u32 = 960;
 /// The vision process sends `System` at least this often, so a silent child counts as stalled.
@@ -85,6 +85,9 @@ impl Message for Report {
 
 pub(super) fn write_frame<M: Message>(w: &mut impl Write, msg: &M, payload: &[u8]) -> io::Result<()> {
     let header = serde_json::to_vec(msg)?;
+    if header.len() > MAX_HEADER as usize {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "header over the limit"));
+    }
     for part in [&header[..], payload] {
         let len =
             u32::try_from(part.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "frame too large"))?;
@@ -285,6 +288,15 @@ mod tests {
             )]))
             .is_ok()
         );
+    }
+
+    #[test]
+    fn regression_writer_rejects_oversized_headers_before_writing() {
+        let mut sensor = entry();
+        sensor.status = SensorStatus::Failed("x".repeat(MAX_HEADER as usize));
+        let mut bytes = Vec::new();
+        assert_eq!(write_frame(&mut bytes, &Report::Sensor(sensor), &[]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert!(bytes.is_empty(), "a rejected header must not corrupt the stream");
     }
 
     #[test]

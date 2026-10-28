@@ -101,6 +101,13 @@ impl Infer {
     }
 }
 
+#[cfg(test)]
+pub(super) fn test_channels() -> (Infer, Receiver<Job>, Receiver<()>) {
+    let (jobs, job_rx) = mpsc::channel();
+    let (fetch, fetch_rx) = mpsc::channel();
+    (Infer { jobs, fetch, worker: None }, job_rx, fetch_rx)
+}
+
 /// The worker finishes its job before the process exits: ONNX Runtime's static destructors run at
 /// exit and fail an inference still in flight.
 impl Drop for Infer {

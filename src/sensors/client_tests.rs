@@ -54,7 +54,7 @@ fn restart_keeps_wants_and_resends_interest_to_the_real_process() {
     supervisor.reconcile(desired, Instant::now());
     drive(&mut client, &mut supervisor, |s| s.view().link == LinkState::Ready);
     client.sync(Some(&devices), &ports, interest);
-    drive(&mut client, &mut supervisor, |s| s.view().focus.as_ref().is_some_and(|f| f.sensor == id && matches!(f.detail, Detail::Samples(_))));
+    drive(&mut client, &mut supervisor, |s| s.view().focus.as_ref().is_some_and(|f| f.sensor == id && matches!(f.detail, Detail::Samples { .. })));
     assert!(client.view().wanted_feeds.contains(&key));
     drive(&mut client, &mut supervisor, |s| matches!(s.view().sensors[&id].status, SensorStatus::SourceDown { .. }));
     supervisor.shutdown(Duration::ZERO);

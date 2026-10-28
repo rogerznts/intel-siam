@@ -159,7 +159,7 @@ fn a_sensor_created_over_the_wire_survives_a_restart() {
     vision.send(Command::Desired(Desired { feeds: Default::default(), interest }));
     let focused = vision.until("the focus on it", |r| matches!(r, Report::Focus(Some(_))));
     let Some(Report::Focus(Some(view))) = focused.last() else { unreachable!() };
-    assert_eq!((view.sensor, &view.detail), (id, &Detail::Samples(Vec::new())));
+    assert_eq!((view.sensor, &view.detail), (id, &Detail::Samples { rows: Vec::new(), before: None, older: None }));
     vision.stop();
 
     let vision = Vision::start(&binary, &dir);
@@ -169,6 +169,45 @@ fn a_sensor_created_over_the_wire_survives_a_restart() {
     assert_eq!(sensor.settings, settings());
     assert_eq!(snapshot.iter().filter(|r| matches!(r, Report::Sensor(_))).count(), 1, "created once");
     assert!(snapshot.iter().any(|r| matches!(r, Report::Wants(w) if w.contains(&stream))));
+    vision.stop();
+
+    let mut store = super::store::Store::open(&dir.join("data")).unwrap();
+    let jpeg = super::pixels::encode_jpeg(&egui::ColorImage::filled([2, 2], egui::Color32::BLACK), 90).unwrap();
+    for index in 0u32..205 {
+        let mut bytes = jpeg.clone();
+        bytes.extend(index.to_le_bytes());
+        store.add_sample(id, &bytes, 1.try_into().unwrap()).unwrap();
+    }
+    drop(store);
+    rusqlite::Connection::open(dir.join("data/sensors.db")).unwrap().execute("UPDATE sample SET label = NULL", []).unwrap();
+    let mut vision = Vision::start(&binary, &dir);
+    vision.until("startup before pagination", |r| matches!(r, Report::Focus(_)));
+    let mut before = None;
+    let mut seen = std::collections::BTreeSet::new();
+    let mut pages = Vec::new();
+    loop {
+        vision.send(Command::Desired(Desired { feeds: Default::default(), interest: Interest {
+            sensor: Some(id), tab: Tab::Samples, samples_before: before, ..Interest::default()
+        } }));
+        let reports = vision.until("sample page", |r| matches!(r, Report::Focus(Some(v)) if matches!(v.detail, Detail::Samples { .. })));
+        let Report::Focus(Some(view)) = reports.last().unwrap() else { unreachable!() };
+        let Detail::Samples { rows, before: received, older } = &view.detail else { unreachable!() };
+        assert_eq!(*received, before);
+        assert!(view.images().iter().all(|id| reports.iter().any(|r| matches!(r, Report::Image { id: sent, .. } if sent == id))));
+        for row in rows { assert!(seen.insert(row.id)); }
+        pages.push(rows.len());
+        before = *older;
+        if before.is_none() { break; }
+    }
+    assert_eq!(pages, [100, 100, 5]);
+    assert_eq!(seen.len(), 205);
+    vision.send(Command::Desired(Desired { feeds: Default::default(), interest: Interest {
+        sensor: Some(id), tab: Tab::Samples, ..Interest::default()
+    } }));
+    let returned = vision.until("newest page again", |r| matches!(r, Report::Focus(Some(v)) if matches!(v.detail, Detail::Samples { before: None, .. })));
+    let Report::Focus(Some(view)) = returned.last().unwrap() else { unreachable!() };
+    let Detail::Samples { rows, .. } = &view.detail else { unreachable!() };
+    assert_eq!(rows.len(), 100);
     vision.stop();
     let _ = fs::remove_dir_all(&dir);
 }
