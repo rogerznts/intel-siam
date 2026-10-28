@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use eframe::egui;
@@ -36,7 +37,7 @@ impl ViewerApp {
             layout,
             view: ViewMode::Grid,
             account: AccountHandle::start(storage.join("secrets.json"), ctx.clone()),
-            procs: Supervisor::new(tools.logs.clone(), ctx),
+            procs: Supervisor::new(tools.logs.clone(), Arc::new(move || ctx.request_repaint())),
             tools,
         }
     }
@@ -46,7 +47,9 @@ impl eframe::App for ViewerApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let now = Instant::now();
         self.account.poll();
-        self.procs.poll(now);
+        if let Some(after) = self.procs.poll(now) {
+            ui.ctx().request_repaint_after(after);
+        }
         let scene = Scene {
             layout: &self.layout,
             view: &self.view,

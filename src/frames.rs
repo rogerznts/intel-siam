@@ -2,7 +2,7 @@ use std::io::{self, Read};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use eframe::egui::{self, Color32, ColorImage};
+use eframe::egui::{Color32, ColorImage};
 
 use crate::model::CameraId;
 
@@ -71,7 +71,7 @@ const POOL: usize = 4;
 /// Reads fixed-size RGBA frames until EOF. Images are recycled once egui has dropped its reference,
 /// so steady state allocates nothing. Video is opaque, so the RGBA bytes are valid premultiplied
 /// `Color32` as they come.
-pub fn pump_frames(mut stdout: impl Read, kind: StreamKind, slot: &FrameSlot, ctx: &egui::Context) -> io::Result<()> {
+pub fn pump_frames(mut stdout: impl Read, kind: StreamKind, slot: &FrameSlot, wake: &dyn Fn()) -> io::Result<()> {
     let size = kind.size();
     let mut pool: Vec<Arc<ColorImage>> = Vec::with_capacity(POOL);
     loop {
@@ -89,7 +89,7 @@ pub fn pump_frames(mut stdout: impl Read, kind: StreamKind, slot: &FrameSlot, ct
             pool.push(Arc::clone(&image));
         }
         slot.publish(image);
-        ctx.request_repaint();
+        wake();
     }
 }
 
@@ -105,7 +105,7 @@ mod tests {
         bytes.extend(vec![20u8; w * h * 4]);
         bytes.extend(vec![30u8; w * h * 2]);
         let slot = FrameSlot::default();
-        pump_frames(bytes.as_slice(), kind, &slot, &egui::Context::default()).unwrap();
+        pump_frames(bytes.as_slice(), kind, &slot, &|| {}).unwrap();
         assert_eq!(slot.frames(), 2);
         let frame = slot.take().unwrap();
         assert_eq!(frame.size, [w, h]);

@@ -8,7 +8,7 @@ use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use eframe::egui;
+use eframe::egui::ColorImage;
 
 use crate::frames::{FrameSlot, StreamKey, StreamKind, pump_frames};
 use crate::model::DvrSerial;
@@ -138,6 +138,9 @@ struct Stopping {
     deadline: Instant,
 }
 
+/// Called whenever supervisor state may have changed off the polling thread, so the owner polls again.
+pub type Waker = Arc<dyn Fn() + Send + Sync>;
+
 pub struct Supervisor {
     running: BTreeMap<ChildKey, Running>,
     down: BTreeMap<ChildKey, ChildPhase>,
@@ -145,15 +148,16 @@ pub struct Supervisor {
     events_tx: mpsc::Sender<Event>,
     events_rx: mpsc::Receiver<Event>,
     logs: PathBuf,
-    ctx: egui::Context,
+    wake: Waker,
 }
 
 const STOP_GRACE: Duration = Duration::from_secs(1);
+const BUSY_POLL: Duration = Duration::from_millis(250);
 
 impl Supervisor {
-    pub fn new(logs: PathBuf, ctx: egui::Context) -> Self {
+    pub fn new(logs: PathBuf, wake: Waker) -> Self {
         let (events_tx, events_rx) = mpsc::channel();
-        Self { running: BTreeMap::new(), down: BTreeMap::new(), stopping: Vec::new(), events_tx, events_rx, logs, ctx }
+        Self { running: BTreeMap::new(), down: BTreeMap::new(), stopping: Vec::new(), events_tx, events_rx, logs, wake }
     }
 
     /// Converges the running set to `desired`: stops keys that are no longer desired or whose spec
@@ -197,25 +201,25 @@ impl Supervisor {
                 let slot = match spec.io {
                     ChildIo::Frames(kind) => {
                         let slot = Arc::new(FrameSlot::default());
-                        let (s, ctx) = (Arc::clone(&slot), self.ctx.clone());
+                        let (s, wake) = (Arc::clone(&slot), Arc::clone(&self.wake));
                         thread::spawn(move || {
-                            let _ = pump_frames(stdout, kind, &s, &ctx);
-                            ctx.request_repaint();
+                            let _ = pump_frames(stdout, kind, &s, &*wake);
+                            wake();
                         });
                         Some(slot)
                     }
                     ChildIo::TunnelLines => {
-                        let (tx, ctx, key, pid) = (self.events_tx.clone(), self.ctx.clone(), key.clone(), child.id());
+                        let (tx, wake, key, pid) = (self.events_tx.clone(), Arc::clone(&self.wake), key.clone(), child.id());
                         thread::spawn(move || {
                             for line in BufReader::new(stdout).lines().map_while(Result::ok) {
                                 if let Some(line) = parse_tunnel_line(&line) {
                                     if tx.send(Event { key: key.clone(), pid, line }).is_err() {
                                         break;
                                     }
-                                    ctx.request_repaint();
+                                    wake();
                                 }
                             }
-                            ctx.request_repaint();
+                            wake();
                         });
                         None
                     }
@@ -274,8 +278,9 @@ impl Supervisor {
         self.stopping.push(Stopping { child: r.child, deadline: now + STOP_GRACE });
     }
 
-    /// Reaps exits, applies tunnel lines and frame progress, and kills children that stalled.
-    pub fn poll(&mut self, now: Instant) {
+    /// Reaps exits, applies tunnel lines and frame progress, and kills children that stalled. Returns how
+    /// soon to poll again while a child is starting, stopping or waiting out a backoff.
+    pub fn poll(&mut self, now: Instant) -> Option<Duration> {
         while let Ok(ev) = self.events_rx.try_recv() {
             let Some(r) = self.running.get_mut(&ev.key).filter(|r| r.child.id() == ev.pid) else { continue };
             match ev.line {
@@ -347,9 +352,7 @@ impl Supervisor {
         let busy = !self.stopping.is_empty()
             || self.running.values().any(|r| !matches!(r.phase, ChildPhase::Up { .. }))
             || self.down.values().any(|p| matches!(p, ChildPhase::Down { retry_at: Some(_), .. }));
-        if busy {
-            self.ctx.request_repaint_after(Duration::from_millis(250));
-        }
+        busy.then_some(BUSY_POLL)
     }
 
     pub fn phase(&self, key: &ChildKey) -> Option<&ChildPhase> {
@@ -366,7 +369,7 @@ impl Supervisor {
             .collect()
     }
 
-    pub fn take_frame(&self, key: &StreamKey) -> Option<Arc<egui::ColorImage>> {
+    pub fn take_frame(&self, key: &StreamKey) -> Option<Arc<ColorImage>> {
         self.running.get(&ChildKey::Decoder(key.clone()))?.slot.as_ref()?.take()
     }
 
@@ -505,7 +508,7 @@ mod tests {
     fn supervisor() -> (Supervisor, PathBuf) {
         let dir = std::env::temp_dir().join(format!("intel-siam-procs-{}-{:?}", std::process::id(), thread::current().id()));
         let _ = fs::remove_dir_all(&dir);
-        (Supervisor::new(dir.clone(), egui::Context::default()), dir)
+        (Supervisor::new(dir.clone(), Arc::new(|| {})), dir)
     }
 
     /// Polls until `done` or a 5 s wall-clock budget, returning the `now` that was last polled.

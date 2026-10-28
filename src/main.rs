@@ -1,16 +1,7 @@
-mod app;
-mod cloud;
-mod frames;
-mod layout;
-mod model;
-mod plan;
-mod procs;
-mod status;
-mod ui;
-
 use std::path::Path;
 
 use eframe::egui;
+use intel_siam::app;
 
 /// Apps opened from Finder or the Dock get no shell environment, so the `INTEL_SIAM_*` settings also
 /// come from `config.env` in the data dir. Variables already set in the environment win.

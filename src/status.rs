@@ -148,8 +148,8 @@ mod tests {
         use super::super::*;
         use crate::cloud::{Dvr, DvrCreds, Secret};
         use crate::model::{ChannelIndex, DvrSerial};
-        use eframe::egui;
         use std::collections::BTreeMap;
+        use std::sync::Arc;
 
         fn cam(channel: u8) -> CameraId {
             CameraId { dvr: DvrSerial::new("ABC0000000001"), channel: ChannelIndex::new(channel) }
@@ -170,7 +170,7 @@ mod tests {
         }
 
         fn status(account: &Account, tools: &Tools) -> TileStatus {
-            let procs = Supervisor::new("/tmp".into(), egui::Context::default());
+            let procs = Supervisor::new("/tmp".into(), Arc::new(|| {}));
             tile_status(&cam(0), StreamKind::Sub, account, tools, &procs, Instant::now())
         }
 
@@ -184,7 +184,7 @@ mod tests {
         #[test]
         fn saved_camera_absent_from_the_account_is_missing() {
             let t = tools(TunnelBackend::Helper { program: "/x".into(), libt2u: "/y".into() });
-            let procs = Supervisor::new("/tmp".into(), egui::Context::default());
+            let procs = Supervisor::new("/tmp".into(), Arc::new(|| {}));
             let got = tile_status(&cam(5), StreamKind::Sub, &ready(), &t, &procs, Instant::now());
             assert_eq!(got, TileStatus::CameraMissing);
         }
