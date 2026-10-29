@@ -20,6 +20,7 @@ use super::feeds::{FeedId, FeedSource, Feeds};
 use super::infer::{
     BACKBONE, DetectRequest, Done, FacesIndexed, Indexed, Infer, Job, Model, ModelEvent, ReadRequest, ReadText, Trained,
 };
+use super::notify::Poster;
 use super::logic::{
     self, CheckKind, Debouncer, FaceBurst, FeedFact, GeometryVerdict, ObjectTrack, REVIEW, Schedule, Signature, StatusFacts,
 };
@@ -58,7 +59,6 @@ const SAMPLE_PAGE: usize = 100;
 const THUMB_EDGE: usize = 160;
 const FACE_EDGE: usize = 96;
 const SAMPLE_QUALITY: u8 = 90;
-const HISTORY_QUALITY: u8 = 80;
 
 /// Stored images get ids from their row, tagged by kind in the top bits, so the same image keeps
 /// its id across views and is sent once. Previews count up from 1 and never reach the tags.
@@ -77,6 +77,7 @@ pub struct Engine {
     store: Store,
     feeds: Feeds,
     infer: Infer,
+    poster: Poster,
     out: Sender<Out>,
     sensors: BTreeMap<SensorId, Sensor>,
     /// From the app's last `Desired`. Memory only, never logged.
@@ -270,7 +271,7 @@ impl Sensor {
 
 impl Engine {
     /// Loads every sensor and sends `Hello`; the first `tick` sends the rest of the snapshot.
-    pub fn new(store: Store, feeds: Feeds, infer: Infer, out: Sender<Out>) -> Result<Self, StoreError> {
+    pub fn new(store: Store, feeds: Feeds, infer: Infer, poster: Poster, out: Sender<Out>) -> Result<Self, StoreError> {
         let mut sensors: BTreeMap<SensorId, Sensor> =
             store.sensors()?.into_iter().map(|rec| (rec.id, Sensor::new(rec))).collect();
         for (id, head) in store.heads()? {
@@ -312,6 +313,7 @@ impl Engine {
             store,
             feeds,
             infer,
+            poster,
             out,
             sensors,
             dvr_urls: BTreeMap::new(),
@@ -368,6 +370,11 @@ impl Engine {
             Input::Infer(Done::Detected { sensor, found }) => self.detected(sensor, found, now),
             Input::Infer(Done::FacesIndexed { recogniser, outcome }) => self.faces_indexed(recogniser, outcome, now),
             Input::Infer(Done::Read { sensor, read }) => self.read_done(sensor, read),
+            Input::Notice { sensor, kind } => {
+                if let Some(s) = self.sensors.get_mut(&sensor) {
+                    s.note(kind);
+                }
+            }
             Input::Model(ModelEvent { model, state }) => {
                 if matches!(state, ModelState::Failed(_)) {
                     self.model_retry.insert(model, now + MODEL_RETRY);
@@ -1003,15 +1010,38 @@ impl Engine {
     /// One history row with the checked frame; a new view when the panel shows this sensor.
     fn record(&mut self, id: SensorId, frame: &ColorImage, row: NewHistory<'_>) {
         let review = row.review.is_some();
-        let recorded = jpeg(&Rgb::from(frame), HISTORY_QUALITY).and_then(|jpeg| self.store.record(id, &NewHistory { jpeg: &jpeg, ..row }));
+        let (at, confidence, changed, value) = (row.at, row.confidence, row.changed, row.value.clone());
+        let Some(notify) = self.sensors.get(&id).map(|s| s.rec.settings.notify.clone()) else { return };
+        let encoded = jpeg(&Rgb::from(frame), u8::from(notify.image.quality));
+        let recorded = match &encoded {
+            Ok(jpeg) => self.store.record(id, &NewHistory { jpeg, ..row }).map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
         let Some(s) = self.sensors.get_mut(&id) else { return };
         match recorded {
             Ok(_) => {
                 s.counts.pending += u32::from(review);
                 self.focus_dirty |= self.interest.sensor == Some(id);
                 self.system_dirty = true;
+                if changed
+                    && notify.fires(confidence)
+                    && let Ok(jpeg) = encoded
+                {
+                    let job = super::notify::Job {
+                        sensor: id,
+                        name: s.rec.settings.name.clone(),
+                        at,
+                        confidence,
+                        value,
+                        changed,
+                        jpeg,
+                        webhook: notify.webhook,
+                        image: notify.image,
+                    };
+                    self.poster.send(job);
+                }
             }
-            Err(e) => s.note(NoticeKind::Store(e.to_string())),
+            Err(e) => s.note(NoticeKind::Store(e)),
         }
     }
 

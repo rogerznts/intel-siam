@@ -16,7 +16,7 @@ impl Fixture {
         let feeds = Feeds::new("/nonexistent/ffmpeg".into(), self.dir.join("logs"), Arc::new(|| {}));
         let (infer, jobs, fetch) = super::super::infer::test_channels();
         let (out, rx) = mpsc::channel();
-        (Engine::new(self.store(), feeds, infer, out).unwrap(), rx, jobs, fetch)
+        (Engine::new(self.store(), feeds, infer, super::super::notify::Poster::detached(), out).unwrap(), rx, jobs, fetch)
     }
 }
 impl Drop for Fixture { fn drop(&mut self) { let _ = fs::remove_dir_all(&self.dir); } }
@@ -26,6 +26,42 @@ fn record() -> SensorRecord {
         id: SensorId(1), source: SourceSpec::Dvr(CameraId { dvr: DvrSerial::new("CAM"), channel: ChannelIndex::new(0) }),
         stream: StreamKind::Sub, settings: crate::sensors::types::Settings::new_states("Sensor".to_owned().try_into().unwrap(), states.to_vec().try_into().unwrap()), geometry: None,
     }
+}
+
+/// An engine whose notify worker is a channel the test watches.
+fn notify_engine(f: &Fixture) -> (Engine, mpsc::Receiver<super::super::notify::Job>, Receiver<Job>, Receiver<Model>) {
+    let feeds = Feeds::new("/nonexistent/ffmpeg".into(), f.dir.join("logs"), Arc::new(|| {}));
+    let (infer, jobs, fetch) = super::super::infer::test_channels();
+    let (poster, notified) = super::super::notify::Poster::watched();
+    let (out, _) = mpsc::channel();
+    (Engine::new(f.store(), feeds, infer, poster, out).unwrap(), notified, jobs, fetch)
+}
+
+#[test]
+fn a_detection_past_the_notify_threshold_is_handed_to_the_notify_worker() {
+    let f = Fixture::new();
+    f.store().create(&objects_record()).unwrap();
+    let (mut engine, notified, jobs, _fetch) = notify_engine(&f);
+    let now = Instant::now();
+    seed(&mut engine, now, 1);
+    engine.tick(now);
+    engine.handle(Input::Model(ModelEvent { model: Model::Detector(Detector::DfineS), state: ModelState::Ready }));
+    checked(&mut engine, &jobs, now);
+    let two = vec![box_at([0.1, 0.5, 0.3, 0.9], Verdict::Detector), box_at([0.5, 0.5, 0.7, 0.9], Verdict::Detector)];
+    engine.handle(Input::Infer(Done::Detected { sensor: CARS, found: Ok(two) }));
+    engine.tick(now);
+    let job = notified.try_recv().expect("a detection over the default threshold");
+    assert_eq!(job.sensor, CARS);
+    assert!((job.confidence - 0.9).abs() < 1e-6);
+    assert_eq!(job.value, SensorValue::Objects(vec![(ObjectKey::Class(car()), 2)]));
+    assert!(job.changed);
+    assert!(!job.jpeg.is_empty(), "the bytes that went to the history are the ones to send");
+
+    engine.sensors.get_mut(&CARS).unwrap().rec.settings.notify.threshold = 0.95.try_into().unwrap();
+    checked(&mut engine, &jobs, now + Duration::from_secs(1));
+    engine.handle(Input::Infer(Done::Detected { sensor: CARS, found: Ok(vec![box_at([0.1, 0.5, 0.3, 0.9], Verdict::Detector)]) }));
+    engine.tick(now + Duration::from_secs(1));
+    assert!(notified.try_recv().is_err(), "below the threshold the engine stays quiet");
 }
 
 #[test]
@@ -486,11 +522,32 @@ fn meter_now(engine: &Engine) -> (Option<String>, Option<ReadOutcome>) {
 }
 
 fn meter_engine(f: &Fixture) -> (Engine, Receiver<Job>, Receiver<Model>) {
-    let (mut engine, _, jobs, fetch) = f.engine();
+    let (engine, _, jobs, fetch) = notify_meter_engine(f);
+    (engine, jobs, fetch)
+}
+
+fn notify_meter_engine(f: &Fixture) -> (Engine, mpsc::Receiver<super::super::notify::Job>, Receiver<Job>, Receiver<Model>) {
+    let feeds = Feeds::new("/nonexistent/ffmpeg".into(), f.dir.join("logs"), Arc::new(|| {}));
+    let (infer, jobs, fetch) = super::super::infer::test_channels();
+    let (poster, notified) = super::super::notify::Poster::watched();
+    let (out, _) = mpsc::channel();
+    let mut engine = Engine::new(f.store(), feeds, infer, poster, out).unwrap();
     engine.tick(Instant::now());
     assert_eq!(fetch.try_iter().collect::<Vec<_>>(), [Model::WheelReader(WheelModel::V2)], "the counter's own wheel reader, nothing else");
     engine.handle(Input::Model(ModelEvent { model: Model::WheelReader(WheelModel::V2), state: ModelState::Ready }));
-    (engine, jobs, fetch)
+    (engine, notified, jobs, fetch)
+}
+
+#[test]
+fn a_rejected_reading_waits_in_review_and_is_not_notified() {
+    let f = Fixture::new();
+    f.store().create(&meter_record()).unwrap();
+    let (mut engine, notified, jobs, _) = notify_meter_engine(&f);
+    read_meter(&mut engine, &jobs, 1, "0629550", 0.95);
+    assert!(notified.try_recv().is_ok(), "a published value is a detection");
+    read_meter(&mut engine, &jobs, 2, "0629540", 0.95);
+    assert_eq!(meter_now(&engine).1, Some(ReadOutcome::Rejected(ReadProblem::WentDown)));
+    assert!(notified.try_recv().is_err(), "a reading waiting for review is not a detection, however confident it was");
 }
 
 #[test]

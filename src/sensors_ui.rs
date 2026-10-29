@@ -54,8 +54,21 @@ pub struct SensorsPanel {
     forget_confirm: Option<PersonId>,
     /// A reading sensor's settings being edited, saved with one `Configure`.
     reading_draft: Option<(SensorId, ReadingSettings)>,
+    /// The webhook and the image copy being edited, saved with one `Configure`.
+    notify_draft: Option<NotifyDraft>,
     /// What the display really showed, typed per rejected reading.
     corrections: HashMap<HistoryId, String>,
+}
+
+/// The notify settings being edited. The URL and the folder are typed as text and only enter
+/// `notify` once they parse, so a half-typed path never overwrites a working one.
+struct NotifyDraft {
+    id: SensorId,
+    notify: Notify,
+    webhook_on: bool,
+    export_on: bool,
+    url: String,
+    folder: String,
 }
 
 /// A box chosen on the preview, to teach what it is.
@@ -118,6 +131,7 @@ impl SensorsPanel {
         self.delete_confirm = false;
         self.error = None;
         self.reading_draft = None;
+        self.notify_draft = None;
         self.corrections.clear();
     }
 }
@@ -363,6 +377,7 @@ fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &
         KindSettings::Reading(reading) => reading_settings(ui, panel, entry, reading, actions),
         KindSettings::States(_) => {}
     }
+    notify_settings(ui, panel, entry, actions);
     let tabs: &[(Tab, &str)] = match entry.settings.kind {
         KindSettings::States(_) => &[(Tab::Live, "Ao vivo"), (Tab::Samples, "Amostras"), (Tab::Review, "Revisão"), (Tab::History, "Histórico")],
         KindSettings::Objects(_) => &[(Tab::Live, "Ao vivo"), (Tab::Samples, "Ensinados"), (Tab::Review, "Revisão"), (Tab::History, "Histórico")],
@@ -650,6 +665,112 @@ fn reading_settings(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorE
             if ui.add_enabled(changed, egui::Button::new("Desfazer")).clicked() { *draft = reading.clone(); }
         });
     });
+}
+
+/// The webhook, the image copy and the one confidence threshold both wait for.
+fn notify_settings(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, actions: &mut Actions) {
+    egui::CollapsingHeader::new("Notificações: webhook, imagem e limiar").id_salt(("notify", entry.id)).show(ui, |ui| {
+        if panel.notify_draft.as_ref().is_none_or(|d| d.id != entry.id) {
+            let notify = entry.settings.notify.clone();
+            let folder = notify.image.export.as_ref().map(|f| f.as_str().to_owned()).unwrap_or_default();
+            let webhook_on = notify.webhook.is_some();
+            let export_on = notify.image.export.is_some();
+            panel.notify_draft = Some(NotifyDraft { id: entry.id, notify, webhook_on, export_on, url: String::new(), folder });
+        }
+        let draft = panel.notify_draft.as_mut().expect("set above");
+        notify_editor(ui, draft);
+        let changed = draft.notify != entry.settings.notify;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(changed, egui::Button::new("Salvar notificações")).clicked() {
+                let mut settings = entry.settings.clone();
+                settings.notify = draft.notify.clone();
+                actions.sensors.push(UserCommand::Configure { id: entry.id, settings });
+            }
+            if ui.add_enabled(changed, egui::Button::new("Desfazer")).clicked() {
+                let notify = entry.settings.notify.clone();
+                draft.folder = notify.image.export.as_ref().map(|f| f.as_str().to_owned()).unwrap_or_default();
+                draft.webhook_on = notify.webhook.is_some();
+                draft.export_on = notify.image.export.is_some();
+                draft.notify = notify;
+                draft.url.clear();
+            }
+        });
+    });
+}
+
+fn notify_editor(ui: &mut egui::Ui, draft: &mut NotifyDraft) {
+    let mut percent = f32::from(draft.notify.threshold) * 100.0;
+    if ui.add(egui::DragValue::new(&mut percent).range(0.0..=100.0).speed(1.0).max_decimals(0).suffix("%")).changed()
+        && let Ok(unit) = Unit::try_from((percent / 100.0).clamp(0.0, 1.0))
+    {
+        draft.notify.threshold = unit;
+    }
+    ui.weak("O aviso e a imagem só saem a partir desta confiança.");
+
+    if ui.checkbox(&mut draft.webhook_on, "Avisar um webhook a cada detecção").changed() && !draft.webhook_on {
+        draft.notify.webhook = None;
+        draft.url.clear();
+    }
+    if draft.webhook_on {
+        ui.add(egui::TextEdit::singleline(&mut draft.url).hint_text(if draft.notify.webhook.is_some() { "URL atual mantida — digite para trocar" } else { "https://..." }));
+        let typed = draft.url.trim().to_owned();
+        let parsed = (typed.starts_with("http://") || typed.starts_with("https://"))
+            .then(|| SecretUrl::try_from(typed.clone()))
+            .and_then(Result::ok);
+        match parsed {
+            Some(url) => {
+                let payload = draft.notify.webhook.as_ref().map_or(Payload::None, |w| w.payload);
+                draft.notify.webhook = Some(Webhook { url, payload });
+            }
+            None if !typed.is_empty() => {
+                ui.weak("Só um endereço http:// ou https:// vale aqui.");
+            }
+            None => {}
+        }
+        if let Some(webhook) = &mut draft.notify.webhook {
+            egui::ComboBox::from_id_salt("payload").selected_text(payload_name(webhook.payload)).show_ui(ui, |ui| {
+                for choice in [Payload::None, Payload::Multipart, Payload::Base64] {
+                    ui.selectable_value(&mut webhook.payload, choice, payload_name(choice));
+                }
+            });
+        }
+    }
+
+    if ui.checkbox(&mut draft.export_on, "Salvar uma cópia da imagem numa pasta").changed() && !draft.export_on {
+        draft.notify.image.export = None;
+        draft.folder.clear();
+    }
+    if draft.export_on {
+        ui.add(egui::TextEdit::singleline(&mut draft.folder).hint_text("Pasta, por exemplo /Users/voce/Imagens/portao"));
+        if ui.button("Escolher pasta…").clicked() {
+            let start = draft.folder.trim();
+            let mut dialog = rfd::FileDialog::new();
+            if !start.is_empty() {
+                dialog = dialog.set_directory(start);
+            }
+            if let Some(picked) = dialog.pick_folder() {
+                draft.folder = picked.to_string_lossy().into_owned();
+            }
+        }
+        if let Ok(folder) = ExportFolder::try_from(draft.folder.trim().to_owned()) {
+            draft.notify.image.export = Some(folder);
+        }
+    }
+
+    let mut quality = u8::from(draft.notify.image.quality);
+    if ui.add(egui::Slider::new(&mut quality, QUALITY_LIMITS.0..=QUALITY_LIMITS.1).text("Qualidade do JPEG no histórico")).changed()
+        && let Ok(q) = Quality::try_from(quality)
+    {
+        draft.notify.image.quality = q;
+    }
+}
+
+fn payload_name(payload: Payload) -> &'static str {
+    match payload {
+        Payload::None => "Só os dados (JSON)",
+        Payload::Multipart => "Dados e imagem (multipart)",
+        Payload::Base64 => "Dados e imagem em base64",
+    }
 }
 
 fn mode_name(mode: &ReadingMode) -> &'static str {
@@ -1207,6 +1328,8 @@ fn notice_label(notice: &NoticeKind) -> String {
         NoticeKind::PeopleFull => format!("Já existem {MAX_PEOPLE} pessoas."),
         NoticeKind::FacesFull => format!("Essa pessoa já tem {MAX_FACES_PER_PERSON} rostos ensinados."),
         NoticeKind::NameTaken => "Já existe uma pessoa com esse nome.".into(),
+        NoticeKind::Webhook(error) => format!("Falha ao avisar o webhook: {error}"),
+        NoticeKind::Export(error) => format!("Falha ao salvar a imagem: {error}"),
         NoticeKind::Store(error) => format!("Falha ao gravar: {error}"),
     }
 }

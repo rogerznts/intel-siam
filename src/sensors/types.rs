@@ -46,7 +46,11 @@ pub const RATE_WINDOW_LIMITS_MIN: (u32, u32) = (1, 1440); // READING_LIMITS["rat
 pub const DEFAULT_RATE_WINDOW_MIN: u32 = 15; // READING_DEFAULTS["rate_window_min"]
 /// The most digits a value keeps; a longer read is no number.
 pub const MAX_NUMBER_DIGITS: usize = 18;
+pub const NOTIFY_DEFAULT_THRESHOLD: f32 = 0.80;
+pub const QUALITY_LIMITS: (u8, u8) = (60, 95);
+pub const HISTORY_QUALITY_DEFAULT: u8 = 80;
 const MAX_URL_BYTES: usize = 2048;
+const MAX_PATH_BYTES: usize = 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InvalidInput(pub &'static str);
@@ -351,6 +355,10 @@ pub struct Settings {
     pub triggers: Triggers,
     pub paused: bool,
     pub kind: KindSettings,
+    /// Sent and saved at the moment of a detection, above `notify.threshold`. Absent in settings
+    /// saved before it existed, which read as `Notify::default()`.
+    #[serde(default)]
+    pub notify: Notify,
 }
 
 impl Settings {
@@ -367,6 +375,7 @@ impl Settings {
                 threshold: Unit(DEFAULT_THRESHOLD),
                 debounce: Debounce(DEFAULT_DEBOUNCE),
             }),
+            notify: Notify::default(),
         }
     }
 
@@ -388,6 +397,7 @@ impl Settings {
                 labels: OwnLabels(Vec::new()),
                 faces: FaceSettings::default(),
             }),
+            notify: Notify::default(),
         }
     }
 
@@ -400,7 +410,118 @@ impl Settings {
             triggers: Triggers { regular: true, change_detection: false },
             paused: false,
             kind: KindSettings::Reading(reading),
+            notify: Notify::default(),
         }
+    }
+}
+
+/// What a detection sets off besides the history row: the webhook, the copy of the image, and the
+/// quality of the JPEG kept. One threshold gates both, independent of the kind's own threshold.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Notify {
+    /// `None` means no POST.
+    pub webhook: Option<Webhook>,
+    pub image: ImageSettings,
+    /// The confidence a detection needs to notify, in `0.0..=1.0`.
+    pub threshold: Unit,
+}
+
+impl Default for Notify {
+    fn default() -> Self {
+        Self {
+            webhook: None,
+            image: ImageSettings::default(),
+            threshold: Unit(NOTIFY_DEFAULT_THRESHOLD),
+        }
+    }
+}
+
+impl Notify {
+    /// Whether a detection at this confidence is sent and copied.
+    pub fn fires(&self, confidence: f32) -> bool {
+        confidence >= f32::from(self.threshold)
+    }
+}
+
+/// A POST to a URL the user owns, with the image attached or not.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Webhook {
+    pub url: SecretUrl,
+    #[serde(default)]
+    pub payload: Payload,
+}
+
+/// How the image travels in the POST. `None` sends the detection as JSON alone.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Payload {
+    #[default]
+    None,
+    /// `multipart/form-data` with the JPEG as a file part.
+    Multipart,
+    /// The JPEG base64-encoded inside the JSON body.
+    Base64,
+}
+
+/// Where the copy of each detection's image goes, and how good the kept JPEG is.
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ImageSettings {
+    /// `None` keeps no copy outside the history.
+    pub export: Option<ExportFolder>,
+    /// Applies to the history row and to the copy alike: one encode, two destinations.
+    pub quality: Quality,
+}
+
+/// A folder the user typed, that receives one `<sensor>-<time>.jpg` per detection.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct ExportFolder(String);
+
+impl TryFrom<String> for ExportFolder {
+    type Error = InvalidInput;
+    fn try_from(path: String) -> Result<Self, InvalidInput> {
+        if path.is_empty() || path.len() > MAX_PATH_BYTES || path.chars().any(char::is_control) {
+            return Err(InvalidInput("pasta inválida"));
+        }
+        Ok(Self(path))
+    }
+}
+
+impl From<ExportFolder> for String {
+    fn from(folder: ExportFolder) -> Self {
+        folder.0
+    }
+}
+
+impl ExportFolder {
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The JPEG quality kept for one sensor, within `QUALITY_LIMITS`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u8", into = "u8")]
+pub struct Quality(u8);
+
+impl Default for Quality {
+    fn default() -> Self {
+        Self(HISTORY_QUALITY_DEFAULT)
+    }
+}
+
+impl TryFrom<u8> for Quality {
+    type Error = InvalidInput;
+    fn try_from(quality: u8) -> Result<Self, InvalidInput> {
+        let (lo, hi) = QUALITY_LIMITS;
+        if (lo..=hi).contains(&quality) { Ok(Self(quality)) } else { Err(InvalidInput("qualidade fora de 60 a 95")) }
+    }
+}
+
+impl From<Quality> for u8 {
+    fn from(quality: Quality) -> Self {
+        quality.0
     }
 }
 
@@ -1637,6 +1758,10 @@ pub enum NoticeKind {
     FacesFull,
     /// Another person has that name, ignoring case.
     NameTaken,
+    /// The webhook the user configured could not be reached or answered with an error.
+    Webhook(String),
+    /// The folder the user chose for the images could not be written.
+    Export(String),
     Store(String),
 }
 
@@ -2043,6 +2168,48 @@ mod tests {
         assert_eq!(serde_json::from_str::<Name>(r#"" Portão ""#).unwrap().as_str(), "Portão");
         assert!(serde_json::from_str::<SecretUrl>(r#""ftp://cam/x""#).is_err());
         assert!(serde_json::from_str::<SecretUrl>(r#""rtsp://user:pw@/x""#).is_err());
+    }
+
+    fn states_settings() -> Settings {
+        Settings::new_states(Name("Portão".into()), StateSet(vec![StateDef { key: StateKey(1), name: Name("Aberto".into()) }]))
+    }
+
+    #[test]
+    fn a_settings_line_written_before_notify_still_reads() {
+        let mut line = serde_json::to_value(states_settings()).unwrap();
+        line.as_object_mut().unwrap().remove("notify");
+        let old: Settings = serde_json::from_value(line).unwrap();
+        assert_eq!(old.notify, Notify::default());
+        assert!(!old.notify.fires(0.79));
+        assert!(old.notify.fires(NOTIFY_DEFAULT_THRESHOLD));
+        assert_eq!(old.notify.image.quality, Quality(HISTORY_QUALITY_DEFAULT));
+    }
+
+    #[test]
+    fn notify_round_trips_through_a_settings_line() {
+        let mut settings = states_settings();
+        settings.notify = Notify {
+            webhook: Some(Webhook {
+                url: SecretUrl::try_from("https://casa.local/hook".to_owned()).unwrap(),
+                payload: Payload::Multipart,
+            }),
+            image: ImageSettings { export: Some(ExportFolder::try_from("/tmp/portao".to_owned()).unwrap()), quality: Quality(95) },
+            threshold: Unit(0.5),
+        };
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&settings).unwrap()).unwrap();
+        assert_eq!(back, settings);
+    }
+
+    #[test]
+    fn notify_settings_validate_on_the_way_in() {
+        assert!(serde_json::from_str::<Quality>("59").is_err());
+        assert!(serde_json::from_str::<Quality>("96").is_err());
+        assert_eq!(serde_json::from_str::<Quality>("60").unwrap(), Quality(60));
+        assert_eq!(serde_json::from_str::<Quality>("95").unwrap(), Quality(95));
+        assert!(serde_json::from_str::<ExportFolder>(r#""\u0000/etc""#).is_err());
+        assert!(serde_json::from_str::<ExportFolder>(r#""""#).is_err());
+        assert!(serde_json::from_str::<Payload>(r#""Telegram""#).is_err());
+        assert_eq!(serde_json::from_str::<Payload>(r#""Multipart""#).unwrap(), Payload::Multipart);
     }
 
     #[test]

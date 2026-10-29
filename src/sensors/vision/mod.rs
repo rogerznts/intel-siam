@@ -15,6 +15,7 @@ mod faces;
 mod feeds;
 mod infer;
 mod logic;
+mod notify;
 mod pixels;
 #[cfg(test)]
 pub(super) mod process_tests;
@@ -48,6 +49,8 @@ enum Input {
     Wake,
     Infer(infer::Done),
     Model(infer::ModelEvent),
+    /// A worker outside the engine failed at something the user asked for.
+    Notice { sensor: super::SensorId, kind: super::NoticeKind },
 }
 
 /// Paths only; DVR URLs arrive later over stdin.
@@ -103,6 +106,7 @@ pub(super) fn run(args: impl Iterator<Item = OsString>, load: LoadNetwork) -> Ex
     read_commands(tx.clone());
     let out = write_reports(protocol, tx.clone());
     let infer = infer::spawn(args.data.join("models"), tx.clone(), load);
+    let poster = notify::spawn(tx.clone());
     let feeds = Feeds::new(
         args.ffmpeg,
         args.logs,
@@ -110,7 +114,7 @@ pub(super) fn run(args: impl Iterator<Item = OsString>, load: LoadNetwork) -> Ex
             let _ = tx.send(Input::Wake);
         }),
     );
-    match Engine::new(store, feeds, infer, out) {
+    match Engine::new(store, feeds, infer, poster, out) {
         Ok(engine) => {
             engine.run(rx);
             ExitCode::SUCCESS
