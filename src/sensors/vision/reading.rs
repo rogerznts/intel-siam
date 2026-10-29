@@ -39,9 +39,10 @@ pub fn implausible(value: f64, last: Option<f64>, mode: &ReadingMode, limit: Opt
 /// turning. A wheel between two digits is read as the one or the other; once the higher one was
 /// published, every right reading until the counter gets there is one step lower. Such a reading
 /// keeps the value without counting as rejected.
-pub fn settling(value: f64, last: f64, settings: &ReadingSettings) -> bool {
-    let step = 10f64.powi(-i32::from(settings.decimals()));
-    settings.is_counter() && ((last - value) - step).abs() < step / 1000.0
+pub fn settling(value: Number, last: Number, settings: &ReadingSettings) -> bool {
+    let decimals = settings.decimals();
+    let at = |n: Number| n.scaled.checked_mul(10i64.checked_pow(u32::from(decimals.checked_sub(n.decimals)?))?);
+    settings.is_counter() && at(last).zip(at(value)).is_some_and(|(last, value)| last.checked_sub(value) == Some(1))
 }
 
 /// Whether a reading is accepted, settling or rejected and why: nothing read, another number of
@@ -63,9 +64,8 @@ pub fn verdict(
     if score < f32::from(threshold) {
         return ReadOutcome::Rejected(ReadProblem::Unsure);
     }
-    let last = last.map(Number::get);
-    match implausible(value.get(), last, &settings.mode, limit) {
-        Some(ReadProblem::WentDown) if last.is_some_and(|last| settling(value.get(), last, settings)) => ReadOutcome::Settling,
+    match implausible(value.get(), last.map(Number::get), &settings.mode, limit) {
+        Some(ReadProblem::WentDown) if last.is_some_and(|last| settling(value, last, settings)) => ReadOutcome::Settling,
         Some(problem) => ReadOutcome::Rejected(problem),
         None => ReadOutcome::Accepted,
     }
@@ -145,11 +145,14 @@ mod tests {
     #[test]
     fn settling_last_wheel() {
         let water = counter(3);
-        assert!(settling(629.078, 629.079, &water), "one step of the last digit below: the last wheel turning");
-        assert!(!settling(629.077, 629.079, &water), "two steps: a real went down");
-        assert!(!settling(629.079, 629.079, &water) && !settling(629.08, 629.079, &water));
-        assert!(settling(12344.0, 12345.0, &counter(0)));
-        assert!(!settling(5.5, 5.6, &value(0.0, 1)));
+        let n = |scaled: i64, decimals: u8| Number { scaled, decimals };
+        assert!(settling(n(629_078, 3), n(629_079, 3), &water), "one step of the last digit below: the last wheel turning");
+        assert!(!settling(n(629_077, 3), n(629_079, 3), &water), "two steps: a real went down");
+        assert!(!settling(n(629_079, 3), n(629_079, 3), &water) && !settling(n(629_080, 3), n(629_079, 3), &water));
+        assert!(settling(n(12_344, 0), n(12_345, 0), &counter(0)));
+        assert!(settling(n(1_234_499, 2), n(12_345, 0), &counter(2)), "a typed value with fewer decimals compares at the counter's");
+        assert!(settling(n(9_999_999_999_999_989, 1), n(9_999_999_999_999_990, 1), &counter(1)), "exact at 19 digits");
+        assert!(!settling(n(55, 1), n(56, 1), &value(0.0, 1)));
     }
 
     #[test]
