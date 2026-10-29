@@ -180,3 +180,59 @@ com contagem) compila e foi exercitado só pelo protocolo acima.
 
 Nenhum sensor do usuário foi criado ou removido. O banco do usuário foi migrado para a versão 2 ao abrir o app,
 sem sensores. Os dados do smoke ficaram só em `/tmp/smoke-objects`.
+
+# Verificação de Pessoas nos sensores de Objetos
+
+## Compilação e testes
+
+`cargo build --all-targets --release` terminou sem erro, `cargo test` passou com 154 testes e
+`cargo clippy --all-targets` terminou sem avisos, em 2026-10-28. Os testes novos cobrem a decisão
+match/ask/unknown e a média dos rostos mais próximos (`faces.rs`), o filtro de qualidade com cortado, pequeno,
+inseguro, virado e desfocado, o desconhecido só com rosto visto com clareza, o nome que precisa de duas checagens
+ou de similaridade segura, o burst à procura de rosto (portado de `test_triggers.py`), as perguntas sobre rostos,
+a pessoa nomeada num sensor e reconhecida e vista por outro (`engine_tests.rs`) e apagar a pessoa com os rostos,
+embeddings e arquivos (`store.rs`).
+
+## Smoke do processo de visão com modelos reais
+
+`/tmp/smoke-people/driver.py` fala o protocolo 4 com `target/release/intel-siam-vision`, com um servidor de
+snapshot HTTP em loopback que serve as fotos da origem. A de 2018 (480×640) foi reduzida para 450×600 e completada
+com preto até 480×600, como as outras, para não cair em `GeometryChanged`. Saída (`run3.log`, sem as linhas de
+progresso):
+
+```text
+[   0.0s] Hello {'Hello': {'protocol': 4}}
+[   6.3s] faces off: models dir ['cd8a49a9…7238'] keys {'person': 1}
+[  10.8s] YuNet 232589 bytes, sha256 8f2383e4…2fa4 matches
+[  10.8s] SFace 38696353 bytes, sha256 0ba9fbfa…4e79 matches
+[  10.8s] naming Williams on frame 16 box [0.0325, 0.1914, 0.9187, 0.9921]
+[  12.0s] server now serves face_williams_2018.jpg
+[  18.0s] 2018: person face=yes problem=None state={"Match": {"person": 5150, "sure": true, "kept": false}} sim=0.634 age=0 {'person': 1, 'Williams': 1}
+[  18.0s] server now serves an empty 480x600 scene
+[  26.0s] empty: {}
+[  26.0s] server now serves face_wilmore.jpg
+[  31.1s] wilmore: person face=yes problem=None state="Unknown" sim=0.016 unknown=2 age=0 {'person': 1, 'Pessoa desconhecida': 1}
+[  31.1s] Williams off: True
+[  31.1s] face files left []
+[  31.1s] exit code 0
+```
+
+- Com rostos desligados, três checagens contaram a pessoa e a pasta de modelos só tinha o D-FINE S, copiado do
+  smoke de Objetos. YuNet e SFace foram baixados só depois do `Configure` que ligou os rostos, com o SHA-256
+  conferido acima.
+- Williams foi nomeada no quadro de 2006 e reconhecida na foto de 2018 com similaridade 0,634 (o limiar de match do
+  SFace é 0,5; o de "certo", 0,6). Wilmore teve 0,016 com Williams e virou "pessoa desconhecida" na segunda
+  checagem.
+- A cena vazia entre Williams e Wilmore é necessária: sem ela, a caixa de Wilmore ficava no mesmo lugar da de
+  Williams e herdava `named`, e uma caixa que já teve nome nunca vira desconhecida (regra da origem). No primeiro
+  smoke isso aconteceu: 87 checagens "Unknown" sem publicar a pessoa desconhecida.
+- A aba Pessoas devolveu o rosto ensinado com o sensor de origem; `ForgetPerson` apagou a pessoa e o arquivo do
+  rosto, e o processo terminou com código 0 ao fechar o stdin.
+
+## Smoke na interface real: não feito
+
+A tela do Mac estava bloqueada (`CGSSessionScreenIsLocked` = true no `ioreg`), e não tentei desbloquear. A chave
+de rostos no sensor, a seção Pessoas (lista, renomear, apagar, mover e excluir rostos, onde e quando foi vista),
+nomear tocando numa pessoa em Ensinar caixas, as perguntas "É <pessoa>?"/"Quem é?" na revisão e o selo com os nomes
+compilam e foram exercitados só pelo protocolo acima. Nenhum sensor ou pessoa do usuário foi criado; os dados do
+smoke ficaram só em `/tmp/smoke-people`.

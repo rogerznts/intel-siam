@@ -268,7 +268,7 @@ mod tests {
     }
 
     fn det(key: &str, score: f32, area: [f32; 4]) -> Found {
-        Found { class: class(key), score, area, verdict: Verdict::Detector }
+        Found { class: class(key), score, area, verdict: Verdict::Detector, face: None }
     }
 
     fn at(key: &str, score: f32) -> Found {

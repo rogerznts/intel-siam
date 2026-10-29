@@ -1,12 +1,13 @@
 //! Models and the CPU-heavy work, off the engine thread: the model registry, its download,
-//! embedding a region with the backbone, training the per-sensor head, and finding objects with a
-//! detector. The networks themselves run through the `Network` the binary supplies.
+//! embedding a region with the backbone, training the per-sensor head, finding objects with a
+//! detector, and finding, aligning and embedding faces. The networks themselves run through the
+//! `Network` the binary supplies.
 //!
 //! The head is multinomial logistic regression on backbone embeddings (origin `classifier.py`):
 //! scikit-learn's `LogisticRegression(C, class_weight="balanced")`, L2 on the weights, not the
 //! intercept; one weight vector for two states, a softmax for more. The problem is convex, so any
 //! solver that reaches its optimum gives the same head. `fit`, `Head::predict`, `embedding` and
-//! `postprocess` are pure.
+//! `postprocess` are pure; so is everything in `faces`.
 //!
 //! One worker thread runs `Job`s in order; one fetch thread downloads models.
 
@@ -24,13 +25,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::Input;
+use super::faces::{self, FACES, Face, FaceIndex, Identity, MIN_FACE_PX};
 use super::logic::{self, CONTEXT_MARGIN, Detection, ObjectFilter};
 use super::pixels::{self, Rgb};
-use super::store::{TaughtSample, TrainRow, hex};
+use super::store::{FaceSample, TaughtSample, TrainRow, hex};
 use super::teach::{self, TEACH, TaughtIndex, TaughtRow};
 use crate::sensors::types::{
-    ClassSet, Detector, Found, LabelId, MinSize, ModelState, ObjectClass, Region, SampleId, SensorId, StateKey,
-    StateSet, Unit,
+    ClassSet, Detector, FaceId, FaceProblem, Found, LabelId, MinSize, ModelState, ObjectClass, Recogniser, Region,
+    SampleId, SensorId, StateKey, StateSet, Unit,
 };
 use crate::sensors::{LoadNetwork, Network, Output};
 
@@ -91,11 +93,48 @@ const DFINE_L: ModelSpec = detector(
     125_348_332,
 );
 
+/// The face detector (origin `faces.json`, `detectors`): a 640 square, BGR, `0..=255`.
+const YUNET: ModelSpec = ModelSpec {
+    id: "yunet-2023mar",
+    name: "YuNet (acha rostos)",
+    url: "https://huggingface.co/opencv/face_detection_yunet/resolve/3cc26e7f1014a5ee5d74a42acee58bafc9d0a310/face_detection_yunet_2023mar.onnx",
+    sha256: "8f2383e4dd3cfbb4553ea8718107fc0423210dc964f9f4280604804ed2552fa4",
+    size: 232_589,
+    input: 640,
+    mean: [0.0; 3],
+    std: [1.0 / 255.0; 3],
+};
+
+/// The recognisers (origin `faces.json`, `recognisers`): an aligned 112 square, RGB, fed as
+/// `(pixel - mean) / std` in `0..=255`, written here after scaling to `0.0..=1.0`.
+const SFACE: ModelSpec = ModelSpec {
+    id: Recogniser::Sface.id(),
+    name: Recogniser::Sface.name(),
+    url: "https://huggingface.co/opencv/face_recognition_sface/resolve/3d7082438a6e4551e840c9b2bb60b71e8da4b524/face_recognition_sface_2021dec.onnx",
+    sha256: "0ba9fbfa01b5270c96627c4ef784da859931e02f04419c829e83484087c34e79",
+    size: 38_696_353,
+    input: faces::ALIGNED,
+    mean: [0.0; 3],
+    std: [1.0 / 255.0; 3],
+};
+const AURAFACE: ModelSpec = ModelSpec {
+    id: Recogniser::AuraFace.id(),
+    name: Recogniser::AuraFace.name(),
+    url: "https://huggingface.co/fal/AuraFace-v1/resolve/af6d057c9b0ec4071d4c49c80e3539258798b609/glintr100.onnx",
+    sha256: "a7933ea5330113b01c9b60351d8f4c33003f145d8470ac5f0e52ee2effe25c60",
+    size: 260_694_151,
+    input: faces::ALIGNED,
+    mean: [0.5; 3],
+    std: [0.5; 3],
+};
+
 /// Every model the vision process may need. New models are new variants and constants here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Model {
     Backbone,
     Detector(Detector),
+    FaceDetector,
+    Recogniser(Recogniser),
 }
 
 impl Model {
@@ -106,6 +145,9 @@ impl Model {
             Self::Detector(Detector::DfineS) => &DFINE_S,
             Self::Detector(Detector::DfineM) => &DFINE_M,
             Self::Detector(Detector::DfineL) => &DFINE_L,
+            Self::FaceDetector => &YUNET,
+            Self::Recogniser(Recogniser::Sface) => &SFACE,
+            Self::Recogniser(Recogniser::AuraFace) => &AURAFACE,
         }
     }
 }
@@ -122,8 +164,11 @@ pub enum Job {
     Train { sensor: SensorId, region: Region, rows: Vec<TrainRow> },
     /// Embeds the taught boxes without a cached vector, then builds the index to compare with.
     Index { sensor: SensorId, rows: Vec<TaughtSample>, parents: Vec<(LabelId, ObjectClass)> },
-    /// One check of an object sensor: detect in the region, then compare with the taught boxes.
+    /// One check of an object sensor: detect in the region, compare with the taught boxes, then
+    /// look for the faces of the person boxes.
     Detect { sensor: SensorId, frame: Arc<ColorImage>, request: DetectRequest },
+    /// Embeds the taught faces without a cached vector, then builds the people's index.
+    IndexFaces { recogniser: Recogniser, rows: Vec<FaceSample> },
 }
 
 /// What a check of an object sensor needs from its settings.
@@ -133,13 +178,11 @@ pub struct DetectRequest {
     pub classes: ClassSet,
     pub threshold: Unit,
     pub min_size: MinSize,
-    pub taught: Option<Compare>,
-}
-
-/// The taught boxes to compare with, and the last check's boxes (an object that stayed keeps its
-/// answer).
-pub struct Compare {
-    pub index: Arc<TaughtIndex>,
+    /// The taught boxes to compare with.
+    pub taught: Option<Arc<TaughtIndex>>,
+    /// The people's faces, while the sensor recognises faces and their models are ready.
+    pub faces: Option<Arc<FaceIndex>>,
+    /// The last check's boxes: an object that stayed keeps its answer, a person their name.
     pub previous: Vec<Found>,
 }
 
@@ -149,6 +192,7 @@ pub enum Done {
     Trained { sensor: SensorId, region: u64, outcome: Result<Trained, String> },
     Indexed { sensor: SensorId, outcome: Result<Indexed, String> },
     Detected { sensor: SensorId, found: Result<Vec<Found>, String> },
+    FacesIndexed { recogniser: Recogniser, outcome: Result<FacesIndexed, String> },
 }
 
 pub struct Trained {
@@ -162,6 +206,11 @@ pub struct Indexed {
     /// `None`: no taught box means anything now.
     pub index: Option<TaughtIndex>,
     pub fresh: Vec<(SampleId, Vec<f32>)>,
+}
+
+pub struct FacesIndexed {
+    pub index: FaceIndex,
+    pub fresh: Vec<(FaceId, Vec<f32>)>,
 }
 
 /// A model's download or verification moved on.
@@ -212,7 +261,7 @@ pub fn spawn(dir: PathBuf, engine: Sender<Input>, load: LoadNetwork) -> Infer {
     let (fetch, fetch_rx) = mpsc::channel();
     let worker = {
         let (dir, engine) = (dir.clone(), engine.clone());
-        thread::spawn(move || work(Networks { dir, load, backbone: None, detector: None }, job_rx, &engine))
+        thread::spawn(move || work(Networks { dir, load, backbone: None, detector: None, faces: None, recogniser: None }, job_rx, &engine))
     };
     thread::spawn(move || fetch_models(&dir, fetch_rx, &engine));
     Infer { jobs, fetch, worker: Some(worker) }
@@ -224,6 +273,8 @@ struct Networks {
     load: LoadNetwork,
     backbone: Option<Box<dyn Network>>,
     detector: Option<(Detector, Box<dyn Network>)>,
+    faces: Option<Box<dyn Network>>,
+    recogniser: Option<(Recogniser, Box<dyn Network>)>,
 }
 
 impl Networks {
@@ -241,6 +292,22 @@ impl Networks {
             self.detector = Some((which, self.open(Model::Detector(which))?));
         }
         Ok(self.detector.as_mut().map(|(_, n)| n.as_mut()).expect("just loaded"))
+    }
+
+    fn face_detector(&mut self) -> Result<&mut dyn Network, String> {
+        if self.faces.is_none() {
+            self.faces = Some(self.open(Model::FaceDetector)?);
+        }
+        Ok(self.faces.as_deref_mut().expect("just loaded"))
+    }
+
+    /// Another recogniser than the loaded one replaces it.
+    fn recogniser(&mut self, which: Recogniser) -> Result<&mut dyn Network, String> {
+        if self.recogniser.as_ref().is_none_or(|(r, _)| *r != which) {
+            self.recogniser = None;
+            self.recogniser = Some((which, self.open(Model::Recogniser(which))?));
+        }
+        Ok(self.recogniser.as_mut().map(|(_, n)| n.as_mut()).expect("just loaded"))
     }
 
     fn open(&self, model: Model) -> Result<Box<dyn Network>, String> {
@@ -264,6 +331,9 @@ fn work(mut networks: Networks, jobs: Receiver<Job>, engine: &Sender<Input>) {
             }
             Job::Detect { sensor, frame, request } => {
                 Done::Detected { sensor, found: detect(&mut networks, &frame, &request) }
+            }
+            Job::IndexFaces { recogniser, rows } => {
+                Done::FacesIndexed { recogniser, outcome: index_faces(&mut networks, recogniser, rows) }
             }
         };
         if engine.send(Input::Infer(done)).is_err() {
@@ -322,12 +392,38 @@ fn index(network: &mut dyn Network, rows: Vec<TaughtSample>, parents: Vec<(Label
     Ok(Indexed { index: teach::build(taught, parents.into_iter().collect()), fresh })
 }
 
+/// The taught faces aligned on their five points and embedded one at a time; a face whose crop is
+/// unreadable is left out. Nobody taught: the recogniser is not even loaded.
+fn index_faces(networks: &mut Networks, recogniser: Recogniser, rows: Vec<FaceSample>) -> Result<FacesIndexed, String> {
+    let (mut taught, mut fresh) = (Vec::new(), Vec::new());
+    for row in rows {
+        let vector = match row.cached {
+            Some(vector) => vector,
+            None => {
+                let crop = match read_image(&row.image) {
+                    Ok(crop) => crop,
+                    Err(e) => {
+                        eprintln!("face {} skipped: {e}", row.face.0);
+                        continue;
+                    }
+                };
+                let vector = embed_face(networks.recogniser(recogniser)?, recogniser, &faces::align(&crop, &row.marks))?;
+                fresh.push((row.face, vector.clone()));
+                vector
+            }
+        };
+        taught.push((row.person, vector));
+    }
+    Ok(FacesIndexed { index: FaceIndex::new(recogniser, taught), fresh })
+}
+
 /// One check of an object sensor (origin `_run_objects` up to the tracks): the detector sees the
-/// region with a margin around it, the boxes that count are kept, then compared with the taught
-/// ones. Once a box the detector missed was taught, its unsure boxes are looked at too.
+/// region with a margin around it, the boxes that count are kept, compared with the taught ones,
+/// and the person boxes are searched for faces. Once a box the detector missed was taught, its
+/// unsure boxes are looked at too.
 fn detect(networks: &mut Networks, frame: &ColorImage, request: &DetectRequest) -> Result<Vec<Found>, String> {
     let analysed = logic::region_box(&request.region, CONTEXT_MARGIN);
-    let rescue = request.taught.as_ref().is_some_and(|t| t.index.rescue);
+    let rescue = request.taught.as_ref().is_some_and(|t| t.rescue);
     let threshold = f32::from(request.threshold);
     let floor = if rescue { threshold.min(TEACH.rescue_floor) } else { threshold };
     let spec = Model::Detector(request.detector).spec();
@@ -335,20 +431,129 @@ fn detect(networks: &mut Networks, frame: &ColorImage, request: &DetectRequest) 
     let outputs = networks.detector(request.detector)?.run(input, [1, 3, spec.input, spec.input]).map_err(|e| format!("detector: {e}"))?;
     let raw = postprocess(&outputs, floor)?;
     let filter = ObjectFilter { region: &request.region, classes: &request.classes, min_size: request.min_size };
-    let found = logic::filter_detections(&raw, analysed, &filter, rescue);
-    let Some(compare) = &request.taught else { return Ok(found) };
-    let (found, candidates): (Vec<Found>, Vec<Found>) = if rescue {
-        let (sure, unsure): (Vec<Found>, Vec<Found>) = found.into_iter().partition(|f| f.score >= threshold);
-        (sure.into_iter().filter(|f| request.classes.contains(f.class)).collect(), unsure)
-    } else {
-        (found, Vec::new())
-    };
-    let (checked, rescued) = teach::plan(&found, &candidates, &compare.index);
-    let backbone = networks.backbone()?;
-    let mut vector = |area: [f32; 4]| embed(backbone, &pixels::crop_box(frame, teach::crop_area(area)));
-    let checked = checked.into_iter().map(|i| Ok((i, vector(found[i].area)?))).collect::<Result<Vec<_>, String>>()?;
-    let rescued = rescued.into_iter().map(|c| Ok((c, vector(c.area)?))).collect::<Result<Vec<_>, String>>()?;
-    Ok(teach::apply(&found, &checked, &rescued, &compare.index, &request.classes, &compare.previous))
+    let mut found = logic::filter_detections(&raw, analysed, &filter, rescue);
+    if let Some(index) = &request.taught {
+        let (sure, candidates): (Vec<Found>, Vec<Found>) = if rescue {
+            let (sure, unsure): (Vec<Found>, Vec<Found>) = found.into_iter().partition(|f| f.score >= threshold);
+            (sure.into_iter().filter(|f| request.classes.contains(f.class)).collect(), unsure)
+        } else {
+            (found, Vec::new())
+        };
+        let (checked, rescued) = teach::plan(&sure, &candidates, index);
+        let backbone = networks.backbone()?;
+        let mut vector = |area: [f32; 4]| embed(backbone, &pixels::crop_box(frame, teach::crop_area(area)));
+        let checked = checked.into_iter().map(|i| Ok((i, vector(sure[i].area)?))).collect::<Result<Vec<_>, String>>()?;
+        let rescued = rescued.into_iter().map(|c| Ok((c, vector(c.area)?))).collect::<Result<Vec<_>, String>>()?;
+        found = teach::apply(&sure, &checked, &rescued, index, &request.classes, &request.previous);
+    }
+    match &request.faces {
+        Some(index) => look_for_faces(networks, frame, found, index, &request.previous),
+        None => Ok(found),
+    }
+}
+
+/// The faces of the person boxes, and who they are (origin `apply_faces`): a face is looked for
+/// in the upper part of a box, checked, aligned, embedded and compared with the people's faces.
+/// One face counts for one box.
+fn look_for_faces(networks: &mut Networks, frame: &ColorImage, mut found: Vec<Found>, index: &FaceIndex, previous: &[Found]) -> Result<Vec<Found>, String> {
+    let searched = faces::plan_search(&mut found, previous);
+    if searched.is_empty() {
+        return Ok(found);
+    }
+    let size = frame.size;
+    let regions: Vec<[usize; 4]> = searched.iter().map(|i| faces::head_region(found[*i].area, size)).collect();
+    let crops: Vec<Rgb> = regions.iter().map(|r| pixels::crop_pixels(frame, *r)).collect();
+    let seen = find_faces(networks.face_detector()?, &crops)?;
+    let mut taken: Vec<[f32; 4]> = Vec::new();
+    let mut usable: Vec<(usize, Face, Rgb)> = Vec::new();
+    for ((i, region), face) in searched.iter().zip(&regions).zip(seen) {
+        let face = face
+            .map(|f| f.moved(region[0] as f32, region[1] as f32, 1.0))
+            .filter(|f| taken.iter().all(|t| teach::box_iou(f.area, *t) <= 0.5));
+        let problem = match &face {
+            None => Some(FaceProblem::Missing),
+            Some(face) => {
+                taken.push(face.area);
+                let aligned = faces::align(frame, face);
+                let problem = faces::problem(face, &aligned, MIN_FACE_PX, size);
+                if problem.is_none() {
+                    usable.push((*i, *face, aligned));
+                }
+                problem
+            }
+        };
+        found[*i].face = Some(faces::looked(face.as_ref(), problem, size));
+    }
+    let sims = faces::similarities(index.recogniser);
+    let taught = !index.is_empty();
+    for (i, face, aligned) in usable {
+        let identity = if taught {
+            faces::identify(index, &embed_face(networks.recogniser(index.recogniser)?, index.recogniser, &aligned)?)
+        } else {
+            Identity::NOBODY
+        };
+        let before = faces::same_box(previous, found[i].area).and_then(|b| b.face);
+        let look = found[i].face.as_mut().expect("looked at above");
+        faces::name_face(look, before.as_ref(), identity, &sims, faces::clearly_seen(&face, MIN_FACE_PX), taught);
+    }
+    for i in searched {
+        let before = faces::same_box(previous, found[i].area).and_then(|b| b.face);
+        if let Some(look) = found[i].face.as_mut().filter(|l| l.problem.is_some()) {
+            faces::keep_name(look, before.as_ref());
+        }
+    }
+    Ok(found)
+}
+
+/// The best face in each region (`None`: none), in that region's pixels: up to four regions per
+/// run, each scaled into a quarter of YuNet's square (origin `FaceDetector.detect`; YuNet finds
+/// faces of about 10 to 300 pixels).
+fn find_faces(network: &mut dyn Network, regions: &[Rgb]) -> Result<Vec<Option<Face>>, String> {
+    let side = YUNET.input;
+    let cell = side / 2;
+    let plane = side * side;
+    let mut best = Vec::with_capacity(regions.len());
+    for group in regions.chunks(4) {
+        let mut canvas = vec![0.0f32; 3 * plane];
+        let mut placed = Vec::with_capacity(group.len());
+        for (i, region) in group.iter().enumerate() {
+            let [w, h] = region.size;
+            let scale = cell as f32 / w.max(h) as f32;
+            let size = [w, h].map(|n| ((n as f32 * scale).round() as usize).clamp(1, cell));
+            let small = pixels::scaled(region, size);
+            let (ox, oy) = ((i % 2) * cell, (i / 2) * cell);
+            for (y, row) in small.pixels.chunks_exact(size[0] * 3).enumerate() {
+                for (x, rgb) in row.as_chunks::<3>().0.iter().enumerate() {
+                    for c in 0..3 {
+                        canvas[(2 - c) * plane + (oy + y) * side + ox + x] = f32::from(rgb[c]);
+                    }
+                }
+            }
+            placed.push((ox as f32, oy as f32, size.map(|n| n as f32), scale));
+        }
+        let outputs = network.run(canvas, [1, 3, side, side]).map_err(|e| format!("detector de rostos: {e}"))?;
+        let found = faces::decode_yunet(&outputs, side, FACES.detect_score)?;
+        for (ox, oy, [w, h], scale) in placed {
+            let inside = |f: &&Face| {
+                let (cx, cy) = ((f.area[0] + f.area[2]) / 2.0, (f.area[1] + f.area[3]) / 2.0);
+                (ox..ox + w).contains(&cx) && (oy..oy + h).contains(&cy)
+            };
+            let face = found.iter().filter(inside).max_by(|a, b| a.score.total_cmp(&b.score));
+            best.push(face.map(|f| f.moved(-ox / scale, -oy / scale, 1.0 / scale)));
+        }
+    }
+    Ok(best)
+}
+
+/// An aligned face's embedding, L2-normalised, with its light evened out first (origin
+/// `Recogniser.embed`, one face at a time).
+fn embed_face(network: &mut dyn Network, recogniser: Recogniser, aligned: &Rgb) -> Result<Vec<f32>, String> {
+    let side = faces::ALIGNED;
+    let input = tensor(&faces::even_light(aligned), Model::Recogniser(recogniser).spec());
+    let outputs = network.run(input, [1, 3, side, side]).map_err(|e| format!("reconhecedor de rostos: {e}"))?;
+    let out = outputs.first().filter(|o| !o.values.is_empty()).ok_or("o reconhecedor não devolveu saída")?;
+    let norm = out.values.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-8);
+    Ok(out.values.iter().map(|v| v / norm).collect())
 }
 
 /// Normalised with the model's mean and deviation, channels first.

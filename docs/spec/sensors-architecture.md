@@ -553,6 +553,45 @@ origem:
   `docs/spec/sensors-ui-verification.md`. As fotos da origem têm tamanhos diferentes (640×421 e 640×424); trocar
   uma pela outra na mesma URL vira `GeometryChanged`, como deve, então o smoke usou o gato redimensionado.
 
+**Pessoas dentro dos sensores de Objetos, 2026-10-28.** Entrou como variantes e uma migração aditiva:
+`FaceSettings` em `ObjectsSettings` (`#[serde(default)]`, desligado), `ObjectKey::Person`/`Stranger`,
+`Found.face: Option<FaceLook>`, `ReviewReason::Face`, `Tab::People` com `Detail::People`,
+`UserCommand::{NameFace, RenamePerson, ForgetPerson, RelabelFace, SetRecogniser}`, `Job::IndexFaces`,
+`Model::{FaceDetector, Recogniser}` com URL, SHA-256 e tamanho de `faces.json`, migração 3 (`person`, `face`,
+`face_embedding`) e `<data>/img/f/<sha256>.jpg`. `PROTOCOL = 4`. Diferenças em relação ao texto acima e à origem:
+
+- **Pessoas no `SystemStatus`, rostos no `FocusView`.** Nome, quantidade de rostos, onde a pessoa está agora e
+  onde/quando foi vista por último vão no `SystemStatus.people` (no máximo 10), porque o selo do tile precisa dos
+  nomes a cada frame. As miniaturas dos rostos vêm pelo `Interest { tab: People }`, e `FocusView.sensor` virou
+  `Option` (`None` para as pessoas).
+- **Nomear não roda modelo de novo.** A checagem guarda o rosto de cada caixa de pessoa (`FaceLook`, com os cinco
+  pontos normalizados); `NameFace` recorta o rosto do quadro guardado (anel de `FRAME_RING` quadros checados) ou do
+  quadro da revisão (`FaceQuestion.face`). A origem roda o YuNet de novo na caixa. Só um rosto procurado naquele
+  quadro (`age == 0`) e sem problema é ensinado.
+- **Uma checagem de Objetos continua um job só**: detector, caixas ensinadas e rostos (`look_for_faces`) no worker;
+  `faces.rs` é puro (região da cabeça, decodificação do YuNet, alinhamento, filtro de qualidade, `even_light`,
+  `identify`, `decide`, `name_face`, `keep_name`, `plan_search`). O burst à procura de rosto e as perguntas sobre
+  rostos ficam em `logic.rs` (`steer_face_burst` em `Schedule.face_burst`, `face_questions`).
+- **Limiares como constantes** (`FACES`, `MIN_FACE_PX` = 30, similaridades por reconhecedor). Sem ajuste global ou
+  por sensor, como decidido no grill. A escolha SFace/AuraFace é global, como o detector.
+- **Alinhamento** pela solução complexa de mínimos quadrados, que é o Umeyama sem reflexão em 2D; amostragem
+  bilinear com centros de pixel em `+0,5`, como o `transform(AFFINE)` do PIL. `even_light` reproduz o
+  `ImageOps.equalize` do canal Y em ponto flutuante.
+- **O índice de pessoas é um só**, construído quando o reconhecedor fica pronto e reconstruído `RETRAIN_DELAY`
+  depois de ensinar, mover, apagar ou trocar de modelo. Enquanto ele não existe, as checagens seguem sem rostos.
+  Sem ninguém ensinado, o reconhecedor nem é carregado. Falha ao embedar conta como falha do modelo de rosto, com
+  a mesma retentativa.
+- **`Identity` não guarda o rosto mais próximo**: nada o consumia.
+- **Não portado nesta unidade**: fotos enviadas do celular, rosto suspeito e pessoas parecidas, estatística
+  "rosto utilizável em 9 de 40", quadro do histórico para rosto desconhecido sem pergunta (`_record_face`),
+  ensinar rosto a partir do histórico aberto (só prévia e revisão), "visto por último" restaurado do histórico no
+  início (as aparições valem só para o processo atual), exportação (não existe exportação no app), liberar o
+  modelo de rosto da memória quando todos desligam.
+- **Evidência, 2026-10-28.** `cargo build --all-targets --release`, `cargo test` (154 testes) e
+  `cargo clippy --all-targets` sem avisos. Smoke do executável de visão real com YuNet e SFace baixados em
+  `docs/spec/sensors-ui-verification.md`. As fotos da origem têm alturas diferentes (600 e 640 px); a de 2018 foi
+  reduzida e completada com preto para 480×600, para não cair em `GeometryChanged`.
+
 ## Open questions and risks
 
 Resolvidas na síntese (padrão conservador; reverta se discordar):

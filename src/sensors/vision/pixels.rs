@@ -32,13 +32,66 @@ impl From<&ColorImage> for Rgb {
 pub fn crop_box(frame: &ColorImage, area: [f32; 4]) -> Rgb {
     let [fw, fh] = frame.size;
     let [x1, y1, x2, y2] = area;
-    let x0 = ((x1 * fw as f32) as usize).min(fw - 1);
-    let y0 = ((y1 * fh as f32) as usize).min(fh - 1);
-    let x_end = ((x2 * fw as f32) as usize).clamp(x0 + 1, fw);
-    let y_end = ((y2 * fh as f32) as usize).clamp(y0 + 1, fh);
+    crop_pixels(frame, [(x1 * fw as f32) as usize, (y1 * fh as f32) as usize, (x2 * fw as f32) as usize, (y2 * fh as f32) as usize])
+}
+
+/// The pixels `[x1, y1, x2, y2)` of `frame`, clamped to it, at least one pixel each way.
+pub fn crop_pixels(frame: &ColorImage, [x1, y1, x2, y2]: [usize; 4]) -> Rgb {
+    let [fw, fh] = frame.size;
+    let (x0, y0) = (x1.min(fw - 1), y1.min(fh - 1));
+    let (x_end, y_end) = (x2.clamp(x0 + 1, fw), y2.clamp(y0 + 1, fh));
     let size = [x_end - x0, y_end - y0];
     let pixels = (y0..y_end).flat_map(|y| frame.pixels[y * fw + x0..y * fw + x_end].iter().flat_map(|c| [c.r(), c.g(), c.b()])).collect();
     Rgb { size, pixels }
+}
+
+/// Resized to exactly `size`, stretched if the aspect differs.
+pub fn scaled(img: &Rgb, size: [usize; 2]) -> Rgb {
+    Rgb { size, pixels: resize(&img.pixels, 3, img.size, size) }
+}
+
+/// A `side` square sampled from `frame` through the affine map `to` (frame → square), bilinear,
+/// black outside the frame (PIL's `transform(AFFINE, BILINEAR)`, pixel centres at `+ 0.5`).
+pub fn warp(frame: &ColorImage, to: [[f32; 3]; 2], side: usize) -> Rgb {
+    let [[a, b, tx], [c, d, ty]] = to;
+    let det = a * d - b * c;
+    let inv = [[d / det, -b / det], [-c / det, a / det]];
+    let [fw, fh] = frame.size;
+    let mut pixels = Vec::with_capacity(side * side * 3);
+    for y in 0..side {
+        for x in 0..side {
+            let (ox, oy) = (x as f32 + 0.5 - tx, y as f32 + 0.5 - ty);
+            let (sx, sy) = (inv[0][0] * ox + inv[0][1] * oy, inv[1][0] * ox + inv[1][1] * oy);
+            if !(0.0..fw as f32).contains(&sx) || !(0.0..fh as f32).contains(&sy) {
+                pixels.extend([0, 0, 0]);
+                continue;
+            }
+            let (fx, fy) = (sx - 0.5, sy - 0.5);
+            let (x0, y0) = (fx.floor(), fy.floor());
+            let (dx, dy) = (fx - x0, fy - y0);
+            let clamp = |v: f32, n: usize| (v.max(0.0) as usize).min(n - 1);
+            let (xa, xb, ya, yb) = (clamp(x0, fw), clamp(x0 + 1.0, fw), clamp(y0, fh), clamp(y0 + 1.0, fh));
+            let at = |px: usize, py: usize| frame.pixels[py * fw + px];
+            let [p00, p10, p01, p11] = [at(xa, ya), at(xb, ya), at(xa, yb), at(xb, yb)];
+            for channel in 0..3 {
+                let v = |p: Color32| f32::from(p.to_array()[channel]);
+                let top = v(p00) * (1.0 - dx) + v(p10) * dx;
+                let bottom = v(p01) * (1.0 - dx) + v(p11) * dx;
+                pixels.push((top * (1.0 - dy) + bottom * dy).round().clamp(0.0, 255.0) as u8);
+            }
+        }
+    }
+    Rgb { size: [side, side], pixels }
+}
+
+/// ITU-R 601 luma, as PIL's "L".
+pub fn grey(img: &Rgb) -> Vec<u8> {
+    img.pixels
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|&[r, g, b]| ((r as u32 * 19595 + g as u32 * 38470 + b as u32 * 7471 + 0x8000) >> 16) as u8)
+        .collect()
 }
 
 /// Resized to a `side` square, stretched, not letterboxed: how the detectors were trained
@@ -97,14 +150,7 @@ fn polygon_spans(corners: &[[f32; 2]], cy: f32, x0: usize, width: usize) -> Vec<
 /// `0.0..=1.0` (`imaging.region_signature`).
 pub fn signature(frame: &ColorImage, region: &Region) -> Signature {
     let rgb = crop(frame, region);
-    let grey: Vec<u8> = rgb
-        .pixels
-        .as_chunks::<3>()
-        .0
-        .iter()
-        .map(|&[r, g, b]| ((r as u32 * 19595 + g as u32 * 38470 + b as u32 * 7471 + 0x8000) >> 16) as u8)
-        .collect();
-    let small = resize(&grey, 1, rgb.size, [SIGNATURE_SIZE, SIGNATURE_SIZE]);
+    let small = resize(&grey(&rgb), 1, rgb.size, [SIGNATURE_SIZE, SIGNATURE_SIZE]);
     Signature(Box::new(std::array::from_fn(|i| small[i] as f32 / 255.0)))
 }
 

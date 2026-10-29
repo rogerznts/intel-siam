@@ -6,6 +6,8 @@
 //! <data>/img/s/<sensor>/<sha256>.jpg     sample: the whole frame as taught (a state sensor) or the
 //!                                       crop of a taught box (an object sensor), never pruned
 //! <data>/img/h/<sensor>/<id>.jpg         history: the whole frame as checked, pruned by retention
+//! <data>/img/f/<sha256>.jpg              a taught face with a margin, shared by every sensor; kept
+//!                                       when its sensor is deleted, gone with its person
 //! ```
 //!
 //! A file is written before its row is committed, so a crash leaves at most an orphan file, which
@@ -23,12 +25,13 @@ use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use super::faces::Face;
 use super::infer::Head;
 use super::logic::{RowCost, retention_plan};
 use crate::frames::StreamKind;
 use crate::sensors::types::{
-    BoxLabel, Detector, Found, Geometry, HistoryId, LabelId, ObjectClass, ObjectEvent, Retention, ReviewReason,
-    SampleId, SampleLabel, SensorId, SensorValue, Settings, SourceSpec, StateKey, StorageUsage,
+    BoxLabel, Detector, FaceId, Found, Geometry, HistoryId, LabelId, Name, ObjectClass, ObjectEvent, PersonId, Recogniser,
+    Retention, ReviewReason, SampleId, SampleLabel, SensorId, SensorValue, Settings, SourceSpec, StateKey, StorageUsage,
 };
 
 /// Each entry upgrades the schema by one version; `user_version` counts the entries applied.
@@ -85,6 +88,31 @@ const MIGRATIONS: &[&str] = &[
     ALTER TABLE sample ADD COLUMN taught TEXT;
     ALTER TABLE history ADD COLUMN events TEXT;
     ALTER TABLE history ADD COLUMN found TEXT;
+",
+    // People: named once, shared by every sensor. A face keeps the sensor it was taught on until
+    // that sensor is deleted; its embeddings are per face model.
+    "
+    CREATE TABLE person (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE TABLE face (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        person INTEGER NOT NULL REFERENCES person(id) ON DELETE CASCADE,
+        sensor INTEGER REFERENCES sensor(id) ON DELETE SET NULL,
+        sha256 TEXT NOT NULL UNIQUE,
+        marks TEXT NOT NULL,
+        bytes INTEGER NOT NULL,
+        created_at INTEGER NOT NULL
+    ) STRICT;
+    CREATE INDEX face_by_person ON face (person);
+    CREATE TABLE face_embedding (
+        face INTEGER NOT NULL REFERENCES face(id) ON DELETE CASCADE,
+        model TEXT NOT NULL,
+        vector BLOB NOT NULL,
+        PRIMARY KEY (face, model)
+    ) STRICT;
 ",
 ];
 
@@ -200,6 +228,31 @@ pub struct Counts {
     pub states: BTreeMap<StateKey, u32>,
     pub taught: u32,
     pub pending: u32,
+}
+
+pub struct StoredPerson {
+    pub id: PersonId,
+    pub name: Name,
+    pub faces: u32,
+}
+
+pub struct StoredFace {
+    pub id: FaceId,
+    pub person: PersonId,
+    /// `None` once the sensor it was taught on is deleted.
+    pub sensor: Option<SensorId>,
+    pub at: SystemTime,
+    pub image: PathBuf,
+}
+
+/// A taught face for the people's index: its cached embedding, or its crop and where the face is
+/// in it, to align and embed.
+pub struct FaceSample {
+    pub face: FaceId,
+    pub person: PersonId,
+    pub marks: Face,
+    pub cached: Option<Vec<f32>>,
+    pub image: PathBuf,
 }
 
 pub struct Store {
@@ -568,6 +621,137 @@ impl Store {
         self.set_setting("detector", &detector)
     }
 
+    pub fn recogniser(&self) -> Result<Recogniser> {
+        self.setting("recogniser").map(Option::unwrap_or_default)
+    }
+
+    pub fn set_recogniser(&mut self, recogniser: Recogniser) -> Result<()> {
+        self.set_setting("recogniser", &recogniser)
+    }
+
+    /// Everyone named, oldest first, with how many faces each has.
+    pub fn people(&self) -> Result<Vec<StoredPerson>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.id, p.name, (SELECT COUNT(*) FROM face f WHERE f.person = p.id) FROM person p ORDER BY p.created_at, p.id",
+        )?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, u32>(2)?)))?;
+        rows.map(|row| {
+            let (id, name, faces) = row?;
+            let name = Name::try_from(name).map_err(|e| StoreError(format!("dado inválido no banco: {e}")))?;
+            Ok(StoredPerson { id: PersonId(id as u64), name, faces })
+        })
+        .collect()
+    }
+
+    /// Naming the same person again changes nothing.
+    pub fn add_person(&mut self, id: PersonId, name: &Name) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR IGNORE INTO person (id, name, created_at) VALUES (?, ?, ?)",
+            params![person_key(id), name.as_str(), millis(SystemTime::now())],
+        )?;
+        Ok(())
+    }
+
+    pub fn rename_person(&mut self, id: PersonId, name: &Name) -> Result<bool> {
+        Ok(self.conn.execute("UPDATE person SET name = ? WHERE id = ?", params![name.as_str(), person_key(id)])? == 1)
+    }
+
+    /// The person with every face taught for them and its embeddings (by cascade), then the files.
+    pub fn forget_person(&mut self, id: PersonId) -> Result<bool> {
+        let shas: Vec<String> = {
+            let mut stmt = self.conn.prepare("SELECT sha256 FROM face WHERE person = ?")?;
+            stmt.query_map([person_key(id)], |r| r.get(0))?.collect::<Result<_, _>>()?
+        };
+        let gone = self.conn.execute("DELETE FROM person WHERE id = ?", [person_key(id)])? == 1;
+        for sha in shas {
+            remove_file(&self.face_path(&sha))?;
+        }
+        Ok(gone)
+    }
+
+    /// A face of `person` taught on `sensor`: `jpeg` is its crop and `face` where it is in it. The
+    /// same crop again moves it to `person`.
+    pub fn add_face(&mut self, person: PersonId, sensor: SensorId, jpeg: &[u8], face: &Face) -> Result<FaceId> {
+        let sha = hex(&Sha256::digest(jpeg));
+        let path = self.face_path(&sha);
+        if !path.is_file() {
+            write_atomic(&path, jpeg)?;
+        }
+        let id = self.conn.query_row(
+            "INSERT INTO face (person, sensor, sha256, marks, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (sha256) DO UPDATE SET person = excluded.person RETURNING id",
+            params![person_key(person), key(sensor), sha, json(face)?, jpeg.len() as i64, millis(SystemTime::now())],
+            |r| r.get(0),
+        )?;
+        Ok(FaceId(id))
+    }
+
+    /// Moves a face to `person`; `None` deletes it with its file and embeddings. `false` when
+    /// there is no such face.
+    pub fn relabel_face(&mut self, face: FaceId, person: Option<PersonId>) -> Result<bool> {
+        let Some(person) = person else {
+            let sha: Option<String> =
+                self.conn.query_row("DELETE FROM face WHERE id = ? RETURNING sha256", [face.0], |r| r.get(0)).optional()?;
+            let Some(sha) = sha else { return Ok(false) };
+            remove_file(&self.face_path(&sha))?;
+            return Ok(true);
+        };
+        Ok(self.conn.execute("UPDATE face SET person = ? WHERE id = ?", params![person_key(person), face.0])? == 1)
+    }
+
+    /// Every taught face, newest first.
+    pub fn faces(&self) -> Result<Vec<StoredFace>> {
+        let mut stmt = self.conn.prepare("SELECT id, person, sensor, created_at, sha256 FROM face ORDER BY id DESC")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, Option<i64>>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?))
+        })?;
+        rows.map(|row| {
+            let (face, person, sensor, at, sha) = row?;
+            Ok(StoredFace { id: FaceId(face), person: PersonId(person as u64), sensor: sensor.map(sensor_id), at: time(at), image: self.face_path(&sha) })
+        })
+        .collect()
+    }
+
+    /// Every taught face, oldest first, with its embedding by `model` when cached, else its crop.
+    pub fn face_set(&self, model: &str) -> Result<Vec<FaceSample>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT f.id, f.person, f.marks, f.sha256, e.vector FROM face f
+             LEFT JOIN face_embedding e ON e.face = f.id AND e.model = ? ORDER BY f.id",
+        )?;
+        let rows = stmt.query_map([model], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, Option<Vec<u8>>>(4)?))
+        })?;
+        rows.map(|row| {
+            let (face, person, marks, sha, vector) = row?;
+            Ok(FaceSample {
+                face: FaceId(face),
+                person: PersonId(person as u64),
+                marks: serde_json::from_str(&marks)?,
+                cached: vector.map(floats),
+                image: self.face_path(&sha),
+            })
+        })
+        .collect()
+    }
+
+    /// Caches face embeddings by `model`; a face deleted meanwhile drops its vector.
+    pub fn put_face_embeddings(&mut self, model: &str, fresh: &[(FaceId, Vec<f32>)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        {
+            let mut insert = tx.prepare("INSERT OR REPLACE INTO face_embedding (face, model, vector) VALUES (?, ?, ?)")?;
+            for (face, vector) in fresh {
+                let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+                if let Err(e) = insert.execute(params![face.0, model, bytes])
+                    && !matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::ConstraintViolation))
+                {
+                    return Err(e.into());
+                }
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
     fn setting<T: for<'de> Deserialize<'de>>(&self, name: &str) -> Result<Option<T>> {
         let value: Option<String> =
             self.conn.query_row("SELECT value FROM setting WHERE key = ?", [name], |r| r.get(0)).optional()?;
@@ -653,6 +837,10 @@ impl Store {
         self.dir.join("img").join("h").join(folder(id)).join(format!("{}.jpg", item.0))
     }
 
+    fn face_path(&self, sha: &str) -> PathBuf {
+        self.dir.join("img").join("f").join(format!("{sha}.jpg"))
+    }
+
     /// Removes files no row references: left by a crash between a file and its row, or by a
     /// sensor deleted while its files could not be removed.
     fn sweep(&self) -> Result<()> {
@@ -682,6 +870,16 @@ impl Store {
                         remove_file(&file)?;
                     }
                 }
+            }
+        }
+        let mut faces = BTreeSet::new();
+        let mut stmt = self.conn.prepare("SELECT sha256 FROM face")?;
+        for sha in stmt.query_map([], |r| r.get::<_, String>(0))? {
+            faces.insert(self.face_path(&sha?));
+        }
+        for file in entries(&self.dir.join("img").join("f"))? {
+            if !faces.contains(&file) {
+                remove_file(&file)?;
             }
         }
         Ok(())
@@ -760,6 +958,10 @@ fn key(id: SensorId) -> i64 {
 
 fn sensor_id(key: i64) -> SensorId {
     SensorId(key as u64)
+}
+
+fn person_key(id: PersonId) -> i64 {
+    id.0 as i64
 }
 
 fn state_key(label: u8) -> Result<StateKey> {
@@ -907,7 +1109,7 @@ mod tests {
         store.create(&record(5)).unwrap();
         let car = ObjectClass::by_key("car").unwrap();
         let value = SensorValue::Objects(vec![(ObjectKey::Class(car), 2)]);
-        let found = [Found { class: car, score: 0.9, area: [0.1, 0.1, 0.5, 0.5], verdict: crate::sensors::types::Verdict::Detector }];
+        let found = [Found { class: car, score: 0.9, area: [0.1, 0.1, 0.5, 0.5], verdict: crate::sensors::types::Verdict::Detector, face: None }];
         let events = [ObjectEvent::On(ObjectKey::Class(car))];
         let row = NewHistory { events: &events, found: &found, ..history(SystemTime::now(), &value, None, b"jpeg") };
         let item = store.record(id, &row).unwrap();
@@ -947,5 +1149,40 @@ mod tests {
         Store::open(&dir).unwrap();
         assert!(!orphan.exists());
         assert!(!stray.exists());
+    }
+
+    #[test]
+    fn forgetting_a_person_removes_their_faces_embeddings_and_files_but_a_deleted_sensor_does_not() {
+        let dir = temp_dir("people");
+        let mut store = Store::open(&dir).unwrap();
+        store.create(&record(3)).unwrap();
+        let (tom, eva) = (PersonId(u64::MAX - 5), PersonId(6));
+        let name = |n: &str| Name::try_from(n.to_owned()).unwrap();
+        store.add_person(tom, &name("Tom")).unwrap();
+        store.add_person(tom, &name("Outro")).unwrap();
+        store.add_person(eva, &name("Eva")).unwrap();
+        let face = Face { area: [10.0, 10.0, 50.0, 60.0], points: [[20.0, 30.0]; 5], score: 0.9 };
+        let a = store.add_face(tom, SensorId(3), b"face a", &face).unwrap();
+        let b = store.add_face(tom, SensorId(3), b"face b", &face).unwrap();
+        let c = store.add_face(eva, SensorId(3), b"face c", &face).unwrap();
+        store.put_face_embeddings("sface-2021dec/2", &[(a, vec![1.0, 0.0]), (b, vec![0.0, 1.0]), (c, vec![0.6, 0.8])]).unwrap();
+        let people: Vec<(PersonId, String, u32)> = store.people().unwrap().into_iter().map(|p| (p.id, p.name.as_str().to_owned(), p.faces)).collect();
+        assert_eq!(people, [(tom, "Tom".to_owned(), 2), (eva, "Eva".to_owned(), 1)], "naming again changes nothing");
+        let files: Vec<PathBuf> = store.faces().unwrap().into_iter().map(|f| f.image).collect();
+        assert!(files.iter().all(|f| f.is_file()));
+        store.delete(SensorId(3)).unwrap();
+        let faces = store.faces().unwrap();
+        assert_eq!(faces.len(), 3, "faces outlive the sensor they were taught on");
+        assert!(faces.iter().all(|f| f.sensor.is_none()));
+        assert!(store.forget_person(tom).unwrap());
+        let left = store.face_set("sface-2021dec/2").unwrap();
+        assert_eq!(left.iter().map(|f| (f.face, f.person, f.cached.clone())).collect::<Vec<_>>(), [(c, eva, Some(vec![0.6, 0.8]))]);
+        let embeddings: i64 = store.conn.query_row("SELECT COUNT(*) FROM face_embedding", [], |r| r.get(0)).unwrap();
+        assert_eq!(embeddings, 1, "Tom's embeddings went with his faces");
+        assert_eq!(files.iter().filter(|f| f.is_file()).count(), 1, "only Eva's crop is left on disk");
+        assert!(!store.forget_person(tom).unwrap());
+        assert!(store.relabel_face(c, None).unwrap());
+        assert!(store.face_set("sface-2021dec/2").unwrap().is_empty());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

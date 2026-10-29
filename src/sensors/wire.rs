@@ -18,7 +18,7 @@ use super::types::{FocusView, ImageId, Interest, SensorEntry, SensorId, SystemSt
 use crate::frames::StreamKey;
 use crate::plan::RtspUrl;
 
-pub(super) const PROTOCOL: u32 = 3;
+pub(super) const PROTOCOL: u32 = 4;
 /// No image on the wire is larger than this on its longer side.
 pub(super) const MAX_WIRE_EDGE: u32 = 960;
 /// The vision process sends `System` at least this often, so a silent child counts as stalled.
@@ -254,7 +254,7 @@ mod tests {
             objects.labels = vec![OwnLabel { id: ours, name: "Nosso carro".to_owned().try_into().unwrap(), parent: car }].try_into().unwrap();
         }
         let by = TaughtMatch { sample: SampleId(3), label: BoxLabel::Own(ours), similarity: 0.93 };
-        let found = Found { class: car, score: 0.8, area: [0.1, 0.2, 0.5, 0.9], verdict: Verdict::Taught { by, label: Some(ours), was: None, how: MatchHow::Clear } };
+        let found = Found { class: car, score: 0.8, area: [0.1, 0.2, 0.5, 0.9], verdict: Verdict::Taught { by, label: Some(ours), was: None, how: MatchHow::Clear }, face: None };
         let present = vec![(ObjectKey::Class(car), 1), (ObjectKey::Own(ours), 1)];
         let live = ObjectsLive {
             frame: Some(FrameId(4)),

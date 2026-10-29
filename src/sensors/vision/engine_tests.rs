@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use crate::frames::StreamKind;
 use crate::model::{CameraId, ChannelIndex, DvrSerial};
-use crate::sensors::types::{Name, NormPoint, OwnLabel, Region, StateDef};
+use crate::sensors::types::{FaceLook, FaceState, Name, NormPoint, OwnLabel, Region, StateDef};
 
 struct Fixture { dir: PathBuf }
 impl Fixture {
@@ -195,7 +195,7 @@ fn seed(engine: &mut Engine, now: Instant, seq: u64) {
 }
 
 fn box_at(area: [f32; 4], verdict: Verdict) -> Found {
-    Found { class: car(), score: 0.9, area, verdict }
+    Found { class: car(), score: 0.9, area, verdict, face: None }
 }
 
 /// One check of the object sensor, forced: returns its request.
@@ -314,4 +314,131 @@ fn a_taught_own_label_is_indexed_compared_and_asked_about() {
     assert_eq!((counts.taught, counts.pending), (3, 0), "the answer is taught");
     engine.user(UserCommand::Configure { id: CARS, settings: Settings { kind: objects_record().settings.kind, ..settings } }, now);
     assert_eq!(engine.store.counts(CARS).unwrap().taught, 0, "removing the label forgets its boxes");
+}
+
+const DOOR: SensorId = SensorId(3);
+const HALL: SensorId = SensorId(4);
+
+fn people_record(id: SensorId, channel: u8) -> SensorRecord {
+    SensorRecord {
+        id,
+        source: SourceSpec::Dvr(CameraId { dvr: DvrSerial::new("CAM"), channel: ChannelIndex::new(channel) }),
+        stream: StreamKind::Main,
+        settings: Settings::new_objects(format!("Porta {channel}").try_into().unwrap(), vec![ObjectClass::PERSON].try_into().unwrap()),
+        geometry: None,
+    }
+}
+
+fn seed_feed(engine: &mut Engine, id: SensorId, now: Instant, seq: u64) {
+    let feed = engine.sensors[&id].feed();
+    let image = ColorImage::new([64, 48], (0..64 * 48).map(|i| egui::Color32::from_gray((i % 251) as u8)).collect());
+    engine.feeds.seed_frame(feed, super::super::feeds::Frame { image: Arc::new(image), at: now, geometry: None, seq });
+    engine.feeds_dirty = false;
+}
+
+fn check(engine: &mut Engine, jobs: &Receiver<Job>, id: SensorId, now: Instant) -> DetectRequest {
+    engine.sensors.get_mut(&id).unwrap().schedule.force = true;
+    engine.tick(now);
+    jobs.try_iter()
+        .find_map(|job| match job {
+            Job::Detect { sensor, request, .. } if sensor == id => Some(request),
+            _ => None,
+        })
+        .expect("a check of the sensor")
+}
+
+const PERSON_BOX: [f32; 4] = [0.3, 0.1, 0.7, 0.9];
+
+fn person(area: [f32; 4], face: FaceLook) -> Found {
+    Found { class: ObjectClass::PERSON, score: 0.9, area, verdict: Verdict::Detector, face: Some(face) }
+}
+
+fn usable_face() -> FaceLook {
+    let marks = FaceMarks { area: [0.4, 0.2, 0.6, 0.4], points: [[0.45, 0.27], [0.55, 0.27], [0.5, 0.32], [0.46, 0.36], [0.54, 0.36]], score: 0.95 };
+    FaceLook { marks: Some(marks), width_px: 12.8, problem: None, state: FaceState::Open, similarity: 0.0, candidate: None, unknown: 0, named: false, age: 0 }
+}
+
+fn people(engine: &mut Engine) -> Vec<(String, u32, Vec<SensorId>, Option<SensorId>)> {
+    engine.system().people.into_iter().map(|p| (p.name.as_str().to_owned(), p.faces, p.here, p.last_seen.map(|s| s.sensor))).collect()
+}
+
+#[test]
+fn a_person_named_on_one_sensor_is_known_to_every_sensor_and_forgetting_them_removes_their_faces() {
+    let f = Fixture::new();
+    let mut store = f.store();
+    store.create(&people_record(DOOR, 1)).unwrap();
+    store.create(&people_record(HALL, 2)).unwrap();
+    drop(store);
+    let (mut engine, _, jobs, fetch) = f.engine();
+    let now = Instant::now();
+    engine.tick(now);
+    assert_eq!(fetch.try_iter().collect::<Vec<_>>(), [Model::Detector(Detector::DfineS)], "faces are off: no face model is fetched");
+    for id in [DOOR, HALL] {
+        let mut settings = engine.sensors[&id].rec.settings.clone();
+        let KindSettings::Objects(objects) = &mut settings.kind else { unreachable!() };
+        objects.faces.enabled = true;
+        engine.user(UserCommand::Configure { id, settings }, now);
+    }
+    engine.tick(now);
+    let fetched: BTreeSet<Model> = fetch.try_iter().collect();
+    assert_eq!(fetched, [Model::FaceDetector, Model::Recogniser(Recogniser::Sface)].into(), "turned on: YuNet and SFace");
+    for model in [Model::Detector(Detector::DfineS), Model::FaceDetector, Model::Recogniser(Recogniser::Sface)] {
+        engine.handle(Input::Model(ModelEvent { model, state: ModelState::Ready }));
+    }
+    engine.tick(now);
+    let Some(Job::IndexFaces { rows, .. }) = jobs.try_iter().find(|j| matches!(j, Job::IndexFaces { .. })) else { panic!("the people's index is built") };
+    assert!(rows.is_empty(), "nobody taught yet");
+    let nobody = FacesIndexed { index: FaceIndex::new(Recogniser::Sface, Vec::new()), fresh: Vec::new() };
+    engine.handle(Input::Infer(Done::FacesIndexed { recogniser: Recogniser::Sface, outcome: Ok(nobody) }));
+
+    engine.interest = Interest { sensor: Some(DOOR), ..Interest::default() };
+    seed_feed(&mut engine, DOOR, now, 1);
+    assert!(check(&mut engine, &jobs, DOOR, now).faces.is_some(), "the check looks for faces");
+    let turned = FaceLook { problem: Some(FaceProblem::Turned), ..usable_face() };
+    let found = vec![person(PERSON_BOX, usable_face()), person([0.0, 0.1, 0.2, 0.9], turned)];
+    engine.handle(Input::Infer(Done::Detected { sensor: DOOR, found: Ok(found) }));
+    engine.tick(now);
+    let frame = engine.preview.as_ref().map(|p| p.preview.frame).expect("the checked frame is shown");
+    let tom = PersonId(5);
+    let new_tom = PersonPick::New { id: tom, name: "Tom".to_owned().try_into().unwrap() };
+    let turned_away = FaceFrom::Frame { frame, area: [0.0, 0.1, 0.2, 0.9].try_into().unwrap() };
+    engine.user(UserCommand::NameFace { id: DOOR, from: turned_away, person: new_tom.clone() }, now);
+    assert_eq!(engine.sensors[&DOOR].notice.as_ref().map(|n| n.kind.clone()), Some(NoticeKind::NoFace(FaceProblem::Turned)));
+    assert!(people(&mut engine).is_empty(), "a face that cannot be used names nobody");
+    let from = FaceFrom::Frame { frame, area: PERSON_BOX.try_into().unwrap() };
+    engine.user(UserCommand::NameFace { id: DOOR, from, person: new_tom.clone() }, now);
+    engine.user(UserCommand::NameFace { id: DOOR, from, person: new_tom }, now);
+    assert_eq!(people(&mut engine), [("Tom".to_owned(), 1, vec![], Some(DOOR))], "named once, seen there just now");
+
+    engine.tick(now + RETRAIN_DELAY);
+    let Some(Job::IndexFaces { rows, .. }) = jobs.try_iter().find(|j| matches!(j, Job::IndexFaces { .. })) else { panic!("the new face is embedded") };
+    assert_eq!(rows.iter().map(|r| (r.person, r.cached.is_none(), r.image.is_file())).collect::<Vec<_>>(), [(tom, true, true)]);
+    let crop = rows[0].image.clone();
+    let toms = FacesIndexed { index: FaceIndex::new(Recogniser::Sface, vec![(tom, vec![1.0, 0.0])]), fresh: vec![(rows[0].face, vec![1.0, 0.0])] };
+    engine.handle(Input::Infer(Done::FacesIndexed { recogniser: Recogniser::Sface, outcome: Ok(toms) }));
+    let key = faces::embedding_key(Recogniser::Sface);
+    assert_eq!(engine.store.face_set(&key).unwrap()[0].cached, Some(vec![1.0, 0.0]), "the embedding is cached");
+
+    let is_tom = FaceLook { state: FaceState::Match { person: tom, sure: true, kept: false }, named: true, ..usable_face() };
+    seed_feed(&mut engine, HALL, now, 2);
+    check(&mut engine, &jobs, HALL, now + Duration::from_secs(2));
+    engine.handle(Input::Infer(Done::Detected { sensor: HALL, found: Ok(vec![person(PERSON_BOX, is_tom)]) }));
+    engine.tick(now + Duration::from_secs(2));
+    let value = engine.sensors[&HALL].sent.as_ref().and_then(|e| e.value.clone());
+    assert_eq!(value, Some(SensorValue::Objects(vec![(ObjectKey::Class(ObjectClass::PERSON), 1), (ObjectKey::Person(tom), 1)])), "Tom is home, on a sensor that never saw him taught");
+    assert_eq!(people(&mut engine), [("Tom".to_owned(), 1, vec![HALL], Some(HALL))]);
+    assert!(engine.sensors[&DOOR].in_flight.is_some(), "the new index made every sensor that recognises faces check again");
+    engine.handle(Input::Infer(Done::Detected { sensor: DOOR, found: Ok(vec![person(PERSON_BOX, is_tom)]) }));
+    assert_eq!(people(&mut engine), [("Tom".to_owned(), 1, vec![DOOR, HALL], Some(DOOR))], "seen on both; last by the one that saw him last");
+
+    engine.user(UserCommand::ForgetPerson(tom), now + Duration::from_secs(4));
+    assert!(people(&mut engine).is_empty());
+    assert!(engine.store.face_set(&key).unwrap().is_empty(), "his faces and their embeddings are gone");
+    assert!(!crop.exists(), "and the crop with them");
+    engine.tick(now + Duration::from_secs(4));
+    let tracks = match &engine.sensors[&HALL].sent.as_ref().unwrap().live {
+        KindLive::Objects(live) => live.tracks.iter().map(|t| t.key).collect::<Vec<_>>(),
+        KindLive::States(_) => unreachable!(),
+    };
+    assert_eq!(tracks, [ObjectKey::Class(ObjectClass::PERSON), ObjectKey::Stranger], "nobody to report but the unknown person");
 }

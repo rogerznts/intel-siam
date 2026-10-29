@@ -44,7 +44,7 @@ fn restart_keeps_wants_and_resends_interest_to_the_real_process() {
     client.queue(UserCommand::Create { id, source: SourceSpec::Dvr(camera), stream: StreamKind::Sub, settings: Settings::new_states("Portão".to_owned().try_into().unwrap(), states) });
     let interest = Interest { sensor: Some(id), tab: Tab::Samples, ..Interest::default() };
     client.sync(None, &BTreeMap::new(), interest.clone());
-    drive(&mut client, &mut supervisor, |s| s.view().wanted_feeds.contains(&key) && s.view().focus.as_ref().is_some_and(|f| f.sensor == id));
+    drive(&mut client, &mut supervisor, |s| s.view().wanted_feeds.contains(&key) && s.view().focus.as_ref().is_some_and(|f| f.sensor == Some(id)));
     client.sync(Some(&devices), &ports, interest.clone());
     drive(&mut client, &mut supervisor, |s| matches!(s.view().sensors[&id].status, SensorStatus::SourceDown { .. }));
     supervisor.reconcile(BTreeMap::new(), Instant::now());
@@ -54,7 +54,7 @@ fn restart_keeps_wants_and_resends_interest_to_the_real_process() {
     supervisor.reconcile(desired, Instant::now());
     drive(&mut client, &mut supervisor, |s| s.view().link == LinkState::Ready);
     client.sync(Some(&devices), &ports, interest);
-    drive(&mut client, &mut supervisor, |s| s.view().focus.as_ref().is_some_and(|f| f.sensor == id && matches!(f.detail, Detail::Samples { .. })));
+    drive(&mut client, &mut supervisor, |s| s.view().focus.as_ref().is_some_and(|f| f.sensor == Some(id) && matches!(f.detail, Detail::Samples { .. })));
     assert!(client.view().wanted_feeds.contains(&key));
     drive(&mut client, &mut supervisor, |s| matches!(s.view().sensors[&id].status, SensorStatus::SourceDown { .. }));
     supervisor.shutdown(Duration::ZERO);

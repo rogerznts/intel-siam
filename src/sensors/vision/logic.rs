@@ -5,9 +5,11 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use super::faces::FACES;
 use crate::sensors::types::{
-    ClassSet, Debounce, Found, Geometry, HistoryId, Interval, LabelId, MinSize, ModelState, ObjectClass, ObjectKey,
-    Region, RegionShape, Retention, ReviewReason, SensorStatus, SensorValue, StateKey, Triggers, Unit, Verdict,
+    ClassSet, Debounce, FaceState, Found, Geometry, HistoryId, Interval, LabelId, MinSize, ModelState, ObjectClass,
+    ObjectKey, PersonId, Region, RegionShape, Retention, ReviewReason, SensorStatus, SensorValue, StateKey, Triggers,
+    Unit, Verdict,
 };
 
 pub const BURST_INTERVAL: Duration = Duration::from_secs(2); // TRIGGER_DEFAULTS["burst_interval_s"]
@@ -55,6 +57,30 @@ pub struct Schedule {
     pub recheck_at: Option<Instant>,
     /// "Check now": one full check at the next tick, even when paused.
     pub force: bool,
+    pub face_burst: FaceBurst,
+}
+
+/// Checks every `FACES.burst_interval` while someone nobody is named for is there (origin
+/// `FaceBurst`, steered by `steer_face_burst`).
+#[derive(Clone, Debug, Default)]
+pub struct FaceBurst {
+    /// Running until then.
+    pub until: Option<Instant>,
+    /// Checks in a row without a usable face or the person coming closer.
+    idle: u32,
+    /// Checks in a row without a person.
+    absent: u32,
+    /// The tallest person box (share of the frame) and the widest face (pixels) of this burst.
+    best_height: f32,
+    best_face: f32,
+    /// This visit had its burst: none again until the person has gone.
+    spent: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BurstChange {
+    Start,
+    Stop,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,8 +109,12 @@ pub fn next_check(
     let Some(last) = s.last_run else {
         return Some((now, CheckKind::Full));
     };
-    let mut full_at = if s.burst_until.is_some_and(|until| now < until) {
-        Some(last + BURST_INTERVAL)
+    let paces = [
+        s.burst_until.filter(|until| now < *until).map(|_| BURST_INTERVAL),
+        s.face_burst.until.filter(|until| now < *until).map(|_| FACES.burst_interval),
+    ];
+    let mut full_at = if let Some(pace) = paces.into_iter().flatten().min() {
+        Some(last + pace)
     } else if triggers.regular {
         // Counted from the last check, whatever caused it: triggers postpone it.
         Some(last + interval.get())
@@ -108,6 +138,52 @@ pub fn next_check(
 /// A change extends the burst; the caller then runs a full check.
 pub fn start_burst(s: &mut Schedule, now: Instant) {
     s.burst_until = Some(now + BURST_DURATION);
+}
+
+/// After a check of a sensor that recognises faces: start or end looking for a face more often
+/// while a person is there (origin `steer_face_burst`). Someone walking up to a door shows a usable
+/// face for a few seconds only, often between two regular checks; someone sitting on the steps
+/// gets one burst, not one an hour.
+pub fn steer_face_burst(burst: &mut FaceBurst, found: &[Found], now: Instant) -> Option<BurstChange> {
+    let people: Vec<&Found> = found.iter().filter(|f| f.class == ObjectClass::PERSON && !f.filtered()).collect();
+    if people.is_empty() {
+        burst.absent += 1;
+        if burst.absent >= FACES.burst_absent_checks {
+            burst.spent = false;
+            return end_face_burst(burst, false);
+        }
+        return None;
+    }
+    burst.absent = 0;
+    let unnamed: Vec<&Found> = people.iter().copied().filter(|f| f.face.is_none_or(|l| l.person().is_none())).collect();
+    let height = people.iter().map(|f| f.area[3] - f.area[1]).fold(0.0, f32::max);
+    let width = people.iter().map(|f| f.face.map_or(0.0, |l| l.width_px)).fold(0.0, f32::max);
+    let Some(until) = burst.until else {
+        if burst.spent || unnamed.is_empty() {
+            return None;
+        }
+        *burst = FaceBurst { until: Some(now + FACES.burst_max), idle: 0, absent: 0, best_height: height, best_face: width, spent: false };
+        return Some(BurstChange::Start);
+    };
+    if unnamed.is_empty() || now >= until {
+        return end_face_burst(burst, true);
+    }
+    let usable = unnamed.iter().any(|f| f.face.is_some_and(|l| l.usable()));
+    let closer = height > burst.best_height * FACES.burst_progress || width > burst.best_face * FACES.burst_progress;
+    burst.idle = if usable || closer { 0 } else { burst.idle + 1 };
+    burst.best_height = burst.best_height.max(height);
+    burst.best_face = burst.best_face.max(width);
+    if burst.idle >= FACES.burst_idle_checks {
+        return end_face_burst(burst, true);
+    }
+    None
+}
+
+fn end_face_burst(burst: &mut FaceBurst, spent: bool) -> Option<BurstChange> {
+    let running = burst.until.take().is_some();
+    burst.idle = 0;
+    burst.spent |= spent;
+    running.then_some(BurstChange::Stop)
 }
 
 /// A grey thumbnail of the region, values in `0.0..=1.0` (`imaging.region_signature`).
@@ -361,7 +437,7 @@ pub fn filter_detections(found: &[Detection], analysed: [f32; 4], filter: &Objec
             let area = [x1 + bx1 * aw, y1 + by1 * ah, x1 + bx2 * aw, y1 + by2 * ah];
             let big_enough = (area[2] - area[0]) * (area[3] - area[1]) >= least;
             (big_enough && in_region((area[0] + area[2]) / 2.0, area[3], filter.region))
-                .then_some(Found { class: d.class, score: d.score, area, verdict: Verdict::Detector })
+                .then_some(Found { class: d.class, score: d.score, area, verdict: Verdict::Detector, face: None })
         })
         .collect()
 }
@@ -461,6 +537,42 @@ pub fn questions<'a>(
         .collect()
 }
 
+/// The faces to ask about now, each the most similar box of its person (origin `_ask_unsure` about
+/// faces): "É <pessoa>?" for a face that may be them and, with `ask_unknown`, "Quem é?" (`None`)
+/// for a usable face like nobody. A person moves, so each question shows another face to teach:
+/// up to `FACES.ask_burst` per person per review cooldown, at least `FACES.ask_gap` apart. Only
+/// faces looked at in this check are asked about. `asked` holds when each was asked.
+pub fn face_questions<'a>(
+    rules: &ReviewRules,
+    found: &'a [Found],
+    asked: &BTreeMap<Option<PersonId>, Vec<Instant>>,
+    ask_unknown: bool,
+    now: Instant,
+) -> Vec<(Option<PersonId>, &'a Found)> {
+    if !rules.enabled {
+        return Vec::new();
+    }
+    let mut best: BTreeMap<Option<PersonId>, (f32, &Found)> = BTreeMap::new();
+    for f in found.iter().filter(|f| !f.filtered()) {
+        let Some(look) = f.face.filter(|l| l.age == 0 && l.usable()) else { continue };
+        let about = match look.state {
+            FaceState::Ask(person) => Some(person),
+            FaceState::Unknown if ask_unknown => None,
+            _ => continue,
+        };
+        if best.get(&about).is_none_or(|(s, _)| look.similarity > *s) {
+            best.insert(about, (look.similarity, f));
+        }
+    }
+    best.into_iter()
+        .filter(|(about, _)| {
+            let times: Vec<&Instant> = asked.get(about).into_iter().flatten().filter(|at| now.duration_since(**at) < rules.cooldown).collect();
+            times.len() < FACES.ask_burst && times.last().is_none_or(|at| now.duration_since(**at) >= FACES.ask_gap)
+        })
+        .map(|(about, (_, f))| (about, f))
+        .collect()
+}
+
 /// The classes filtered away in this check, and those of them to keep in the history: a class
 /// that starts being filtered, unless it was kept within `FILTERED_RECORD_COOLDOWN` (origin
 /// `_record_filtered`).
@@ -525,6 +637,92 @@ mod tests {
         assert_eq!(next(&schedule(&t, 100), probing, 101), Some((t.at(102), CheckKind::Probe)));
         let probed = Schedule { last_probe: Some(t.at(110)), ..schedule(&t, 100) };
         assert_eq!(next(&probed, probing, 111), Some((t.at(112), CheckKind::Probe)));
+    }
+
+    fn person(height: f32, face: Option<crate::sensors::types::FaceLook>) -> Found {
+        Found { class: ObjectClass::PERSON, score: 0.9, area: [0.4, 0.9 - height, 0.5, 0.9], verdict: Verdict::Detector, face }
+    }
+
+    fn look(problem: Option<crate::sensors::types::FaceProblem>, state: FaceState) -> crate::sensors::types::FaceLook {
+        let marks = problem.ne(&Some(crate::sensors::types::FaceProblem::Missing)).then_some(crate::sensors::types::FaceMarks {
+            area: [0.45, 0.2, 0.5, 0.25],
+            points: [[0.46, 0.21]; 5],
+            score: 0.9,
+        });
+        crate::sensors::types::FaceLook { marks, width_px: if marks.is_some() { 60.0 } else { 0.0 }, problem, state, similarity: 0.4, candidate: None, unknown: 0, named: false, age: 0 }
+    }
+
+    #[test]
+    fn a_face_burst_follows_a_person_walking_up_to_the_door() {
+        use crate::sensors::types::FaceProblem::{Missing, Small, Turned};
+        let t = Clock(Instant::now());
+        let mut s = schedule(&t, 100);
+        let minute: Interval = 60.try_into().unwrap();
+        assert_eq!(steer_face_burst(&mut s.face_burst, &[], t.at(100)), None, "nobody there");
+        let far = [person(0.1, Some(look(Some(Missing), FaceState::Open)))];
+        assert_eq!(steer_face_burst(&mut s.face_burst, &far, t.at(100)), Some(BurstChange::Start), "far away, no face yet");
+        assert_eq!(next_check(&s, REGULAR, minute, false, t.at(100)), Some((t.at(101), CheckKind::Full)), "a check every second");
+        for n in 1..10 {
+            let coming = [person(0.1 * 1.15f32.powi(n), Some(look(Some(Small), FaceState::Open)))];
+            assert_eq!(steer_face_burst(&mut s.face_burst, &coming, t.at(100 + n as u64)), None, "no face yet, but growing");
+        }
+        let kari = PersonId(1);
+        for n in 10..20 {
+            let unsure = [person(0.5, Some(look(None, FaceState::Ask(kari))))];
+            assert_eq!(steer_face_burst(&mut s.face_burst, &unsure, t.at(100 + n)), None, "a face it is not sure of");
+        }
+        let named = [person(0.5, Some(look(None, FaceState::Match { person: kari, sure: true, kept: false })))];
+        assert_eq!(steer_face_burst(&mut s.face_burst, &named, t.at(120)), Some(BurstChange::Stop), "named: done");
+        s.last_run = Some(t.at(120));
+        assert_eq!(next_check(&s, REGULAR, minute, false, t.at(120)), Some((t.at(180), CheckKind::Full)), "the regular interval again");
+        let turned = [person(0.5, Some(look(Some(Turned), FaceState::Open)))];
+        assert_eq!(steer_face_burst(&mut s.face_burst, &turned, t.at(130)), None, "still there: no second burst");
+        for n in 0..FACES.burst_absent_checks {
+            assert_eq!(steer_face_burst(&mut s.face_burst, &[], t.at(140 + u64::from(n))), None);
+        }
+        assert_eq!(steer_face_burst(&mut s.face_burst, &[person(0.2, None)], t.at(150)), Some(BurstChange::Start), "back: a burst of its own");
+    }
+
+    #[test]
+    fn a_face_burst_ends_without_progress_and_after_its_time() {
+        use crate::sensors::types::FaceProblem::Missing;
+        let t = Clock(Instant::now());
+        let back = [person(0.4, Some(look(Some(Missing), FaceState::Open)))];
+        let mut burst = FaceBurst::default();
+        assert_eq!(steer_face_burst(&mut burst, &back, t.at(0)), Some(BurstChange::Start));
+        let stops: Vec<_> = (1..=FACES.burst_idle_checks).map(|n| steer_face_burst(&mut burst, &back, t.at(u64::from(n)))).collect();
+        assert_eq!(stops.last(), Some(&Some(BurstChange::Stop)), "standing with their back to the camera");
+        assert!(stops[..stops.len() - 1].iter().all(Option::is_none));
+        let unsure = [person(0.4, Some(look(None, FaceState::Unknown)))];
+        let mut burst = FaceBurst::default();
+        assert_eq!(steer_face_burst(&mut burst, &unsure, t.at(0)), Some(BurstChange::Start));
+        let max = FACES.burst_max.as_secs();
+        assert_eq!(steer_face_burst(&mut burst, &unsure, t.at(max - 1)), None, "a usable face keeps it going");
+        assert_eq!(steer_face_burst(&mut burst, &unsure, t.at(max)), Some(BurstChange::Stop), "but not beyond its time");
+        let by = crate::sensors::types::TaughtMatch { sample: crate::sensors::types::SampleId(1), label: crate::sensors::types::BoxLabel::NotThis, similarity: 0.95 };
+        let statue = [Found { verdict: Verdict::Filtered(by), ..person(0.4, None) }];
+        assert_eq!(steer_face_burst(&mut FaceBurst::default(), &statue, t.at(0)), None, "taught not to be a person");
+    }
+
+    #[test]
+    fn face_questions_come_in_a_burst_per_person() {
+        let t = Clock(Instant::now());
+        let kari = PersonId(1);
+        let maybe = person(0.5, Some(look(None, FaceState::Ask(kari))));
+        let stranger = person(0.5, Some(look(None, FaceState::Unknown)));
+        let found = [maybe, stranger];
+        let mut asked: BTreeMap<Option<PersonId>, Vec<Instant>> = BTreeMap::new();
+        let about: Vec<Option<PersonId>> = face_questions(&REVIEW, &found, &asked, false, t.at(0)).into_iter().map(|q| q.0).collect();
+        assert_eq!(about, [Some(kari)], "nobody is asked about a stranger unless the sensor says so");
+        assert_eq!(face_questions(&REVIEW, &found, &asked, true, t.at(0)).len(), 2);
+        asked.insert(Some(kari), vec![t.at(0)]);
+        assert!(face_questions(&REVIEW, &found[..1], &asked, false, t.at(1)).is_empty(), "the next one waits ask_gap");
+        assert_eq!(face_questions(&REVIEW, &found[..1], &asked, false, t.at(3)).len(), 1);
+        asked.insert(Some(kari), (0..FACES.ask_burst as u64).map(|n| t.at(n * 3)).collect());
+        assert!(face_questions(&REVIEW, &found[..1], &asked, false, t.at(30)).is_empty(), "a burst per review cooldown");
+        assert_eq!(face_questions(&REVIEW, &found[..1], &asked, false, t.at(400)).len(), 1);
+        let carried = person(0.5, Some(crate::sensors::types::FaceLook { age: 1, ..look(None, FaceState::Ask(kari)) }));
+        assert!(face_questions(&REVIEW, &[carried], &BTreeMap::new(), false, t.at(0)).is_empty(), "only a face looked at now");
     }
 
     #[test]
@@ -793,7 +991,7 @@ mod tests {
     }
 
     fn seen(n: usize, key: &str) -> Vec<Found> {
-        vec![Found { class: class(key), score: 0.9, area: [0.0, 0.0, 0.1, 0.1], verdict: Verdict::Detector }; n]
+        vec![Found { class: class(key), score: 0.9, area: [0.0, 0.0, 0.1, 0.1], verdict: Verdict::Detector, face: None }; n]
     }
 
     fn keys(names: &[&str]) -> Vec<ObjectKey> {

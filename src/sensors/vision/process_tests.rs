@@ -159,7 +159,7 @@ fn a_sensor_created_over_the_wire_survives_a_restart() {
     vision.send(Command::Desired(Desired { feeds: Default::default(), interest }));
     let focused = vision.until("the focus on it", |r| matches!(r, Report::Focus(Some(_))));
     let Some(Report::Focus(Some(view))) = focused.last() else { unreachable!() };
-    assert_eq!((view.sensor, &view.detail), (id, &Detail::Samples { rows: Vec::new(), before: None, older: None }));
+    assert_eq!((view.sensor, &view.detail), (Some(id), &Detail::Samples { rows: Vec::new(), before: None, older: None }));
     vision.stop();
 
     let vision = Vision::start(&binary, &dir);

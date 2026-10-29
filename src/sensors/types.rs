@@ -32,6 +32,8 @@ pub const CLEAR_AFTER_LIMIT_S: u32 = 3600; // OBJECT_LIMITS["clear_after_s"]
 pub const MAX_OWN_LABELS: usize = 10; // TEACH["max_labels"]
 pub const MIN_BOX_SIDE: f32 = 0.01; // TEACH["min_box"]
 pub const MAX_TAUGHT: usize = 500; // TEACH["max_examples"]
+pub const MAX_PEOPLE: usize = 10; // FACES["max_people"]
+pub const MAX_FACES_PER_PERSON: usize = 50; // FACES["max_faces_per_person"]
 const MAX_URL_BYTES: usize = 2048;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -69,6 +71,21 @@ impl LabelId {
         Self(SensorId::random().0)
     }
 }
+
+/// Someone named by their face, known to every object sensor that recognises faces. Chosen by the
+/// app when the user names them, so naming is idempotent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PersonId(pub(in crate::sensors) u64);
+
+impl PersonId {
+    pub fn random() -> Self {
+        Self(SensorId::random().0)
+    }
+}
+
+/// A taught face (its crop and the person it shows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FaceId(pub(in crate::sensors) i64);
 
 /// A frame the vision process still holds. Valid for the life of one vision process only.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -357,6 +374,7 @@ impl Settings {
                 clear_after: ClearAfter(DEFAULT_CLEAR_AFTER_S),
                 use_taught: true,
                 labels: OwnLabels(Vec::new()),
+                faces: FaceSettings::default(),
             }),
         }
     }
@@ -443,6 +461,18 @@ pub struct ObjectsSettings {
     /// Off: the detector alone decides; taught boxes are kept but not compared.
     pub use_taught: bool,
     pub labels: OwnLabels,
+    /// Absent in sensors saved before faces existed: off.
+    #[serde(default)]
+    pub faces: FaceSettings,
+}
+
+/// Recognising people by their face (origin `FACE_DEFAULTS`). Off until the user turns it on; the
+/// limits are the origin's constants and the chosen face model's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaceSettings {
+    pub enabled: bool,
+    /// Put faces nobody was taught for in the review queue ("Quem é?").
+    pub ask_unknown: bool,
 }
 
 impl ObjectsSettings {
@@ -451,18 +481,35 @@ impl ObjectsSettings {
         self.labels.iter().filter(|l| self.classes.contains(l.parent))
     }
 
-    /// What the sensor reports: its classes, then its own labels in use (origin `object_keys`).
-    pub fn keys(&self) -> Vec<ObjectKey> {
-        let labels = self.active_labels().map(|l| ObjectKey::Own(l.id));
-        self.classes.iter().map(ObjectKey::Class).chain(labels).collect()
+    /// Turned on, and the sensor looks for people (origin `faces_on`).
+    pub fn faces_on(&self) -> bool {
+        self.faces.enabled && self.classes.contains(ObjectClass::PERSON)
     }
 
-    pub fn key_name(&self, key: ObjectKey) -> &str {
+    /// What the sensor reports: its classes, its own labels in use, then, while it recognises
+    /// faces, every person and the unknown person (origin `object_keys` with `with_people`).
+    pub fn keys(&self, people: &[PersonId]) -> Vec<ObjectKey> {
+        let labels = self.active_labels().map(|l| ObjectKey::Own(l.id));
+        let faces: Vec<ObjectKey> = if self.faces_on() {
+            people.iter().map(|p| ObjectKey::Person(*p)).chain([ObjectKey::Stranger]).collect()
+        } else {
+            Vec::new()
+        };
+        self.classes.iter().map(ObjectKey::Class).chain(labels).chain(faces).collect()
+    }
+
+    pub fn key_name<'a>(&'a self, key: ObjectKey, people: &'a [PersonView]) -> &'a str {
         match key {
             ObjectKey::Class(class) => class.name(),
             ObjectKey::Own(id) => self.labels.get(id).map_or("?", |l| l.name.as_str()),
+            ObjectKey::Person(id) => person_name(people, id),
+            ObjectKey::Stranger => "Pessoa desconhecida",
         }
     }
+}
+
+pub fn person_name(people: &[PersonView], id: PersonId) -> &str {
+    people.iter().find(|p| p.id == id).map_or("?", |p| p.name.as_str())
 }
 
 /// 1 to `OBJECT_MAX_CLASSES` distinct classes, in the order chosen.
@@ -595,11 +642,14 @@ impl OwnLabels {
     }
 }
 
-/// What an object sensor reports on: a class, or an own label.
+/// What an object sensor reports on: a class, an own label, a person, or the unknown person.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum ObjectKey {
     Class(ObjectClass),
     Own(LabelId),
+    Person(PersonId),
+    /// A clearly seen face that matched nobody (origin `FACE_UNKNOWN_KEY`).
+    Stranger,
 }
 
 /// What a taught box really is (origin: the taught label).
@@ -773,6 +823,11 @@ impl SensorsView {
     pub fn image(&self, id: ImageId) -> Option<&Arc<ColorImage>> {
         self.images.get(&id)
     }
+
+    /// Everyone named, as the vision process last said; empty before its first `System`.
+    pub fn people(&self) -> &[PersonView] {
+        self.system.as_ref().map_or(&[], |s| &s.people)
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -884,6 +939,10 @@ pub struct Found {
     /// `[x1, y1, x2, y2]`.
     pub area: [f32; 4],
     pub verdict: Verdict,
+    /// A person box of a sensor that recognises faces: what its face said. Absent in rows
+    /// recorded before faces existed.
+    #[serde(default)]
+    pub face: Option<FaceLook>,
 }
 
 impl Found {
@@ -904,13 +963,107 @@ impl Found {
             && match key {
                 ObjectKey::Class(class) => self.class == class,
                 ObjectKey::Own(id) => self.own_label() == Some(id),
+                ObjectKey::Person(id) => self.face.and_then(|f| f.person()) == Some(id),
+                ObjectKey::Stranger => self.face.is_some_and(|f| f.stranger()),
             }
     }
 
-    /// Whether the box may be the own label `key`, but not clearly (origin `unsure_for`).
+    /// Whether the box may be the own label or person `key`, but not clearly (origin `unsure_for`).
     pub fn unsure_for(&self, key: ObjectKey) -> bool {
-        matches!((self.verdict, key), (Verdict::Unsure { label, .. }, ObjectKey::Own(id)) if label == id)
+        match key {
+            ObjectKey::Own(id) => matches!(self.verdict, Verdict::Unsure { label, .. } if label == id),
+            ObjectKey::Person(id) => {
+                !self.filtered() && self.face.is_some_and(|f| f.state == FaceState::Ask(id))
+            }
+            ObjectKey::Class(_) | ObjectKey::Stranger => false,
+        }
     }
+}
+
+/// Checks in a row a clearly seen face must match nobody before its box counts as the unknown
+/// person (origin `FACES["unknown_after"]`).
+pub const UNKNOWN_AFTER: u8 = 2;
+
+/// What looking for a face in a person box said, and what the box carries to the next check
+/// (origin: a detection's `face`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceLook {
+    /// The face found in the box, normalised to the frame.
+    pub marks: Option<FaceMarks>,
+    /// The face's width in the frame's pixels (origin `face_px`); 0 without a face.
+    pub width_px: f32,
+    /// Why the face cannot be used; `None`: usable.
+    pub problem: Option<FaceProblem>,
+    pub state: FaceState,
+    /// How close the face is to `candidate`, the closest person.
+    pub similarity: f32,
+    pub candidate: Option<PersonId>,
+    /// Checks in a row whose face matched nobody.
+    pub unknown: u8,
+    /// The box had a name in an earlier check: it never becomes the unknown person.
+    pub named: bool,
+    /// Checks since the face was last looked for; 0: looked for in this very frame.
+    pub age: u8,
+}
+
+impl FaceLook {
+    pub fn person(&self) -> Option<PersonId> {
+        match self.state {
+            FaceState::Match { person, .. } => Some(person),
+            _ => None,
+        }
+    }
+
+    /// Counts as the unknown person: matched nobody `UNKNOWN_AFTER` checks in a row and never
+    /// had a name.
+    pub fn stranger(&self) -> bool {
+        self.person().is_none() && !self.named && self.unknown >= UNKNOWN_AFTER
+    }
+
+    pub fn usable(&self) -> bool {
+        self.marks.is_some() && self.problem.is_none()
+    }
+}
+
+/// A face's box and its five points (eyes, nose tip, mouth corners, as seen in the picture),
+/// normalised to the frame, and how sure the face detector was.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceMarks {
+    pub area: [f32; 4],
+    pub points: [[f32; 2]; 5],
+    pub score: f32,
+}
+
+/// Why a face cannot be used (origin `faces.problem`): never someone unknown, only no face.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FaceProblem {
+    /// No face in the box.
+    Missing,
+    /// The frame's edge cuts it.
+    Cut,
+    Small,
+    /// The face detector was not sure it is a face.
+    Unsure,
+    Turned,
+    Blurry,
+}
+
+/// Who a person box's face is (origin: a face's `state`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FaceState {
+    /// Nothing decided: no usable face, or nobody taught yet.
+    Open,
+    /// It is `person`. `sure`: at the model's sure similarity, so the next checks keep the name
+    /// without looking again. `kept`: no usable face now; the box kept the name it had.
+    Match { person: PersonId, sure: bool, kept: bool },
+    /// Looks like `person`; a second check must agree first.
+    Pending(PersonId),
+    /// Maybe `person`, not sure: counted for nobody, and asked about.
+    Ask(PersonId),
+    /// Small or turned and like nobody: that may only be the angle.
+    Unclear,
+    /// Clearly seen and like nobody taught.
+    Unknown,
 }
 
 /// What comparing a box with the taught boxes said (origin: `match`, `filtered`, `label`, `was`,
@@ -962,6 +1115,16 @@ pub struct Question {
     pub similarity: f32,
 }
 
+/// "É <pessoa>?", or with `person` `None` "Quem é?", about the face of one person box (origin
+/// `_record_question` about a face). The answer teaches that face.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceQuestion {
+    pub person: Option<PersonId>,
+    pub area: [f32; 4],
+    pub face: FaceMarks,
+    pub similarity: f32,
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Notice {
     pub at: SystemTime,
@@ -977,6 +1140,16 @@ pub enum NoticeKind {
     OutsideRegion,
     /// The sensor has `MAX_TAUGHT` taught boxes already.
     TaughtFull,
+    /// The sensor does not recognise faces.
+    FacesOff,
+    /// A face can be named only when it can be used: a back or a jacket never becomes someone.
+    NoFace(FaceProblem),
+    /// `MAX_PEOPLE` people are known already.
+    PeopleFull,
+    /// The person has `MAX_FACES_PER_PERSON` faces already.
+    FacesFull,
+    /// Another person has that name, ignoring case.
+    NameTaken,
     Store(String),
 }
 
@@ -987,7 +1160,67 @@ pub struct SystemStatus {
     pub models: Vec<ModelStatus>,
     /// The detector every object sensor uses.
     pub detector: Detector,
+    /// The face model every sensor that recognises faces uses.
+    pub recogniser: Recogniser,
+    /// Everyone named, oldest first, with where they are seen.
+    pub people: Vec<PersonView>,
+    /// The taught faces are being embedded; meanwhile checks go on without naming anyone.
+    pub faces_indexing: bool,
     pub notice: Option<Notice>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct PersonView {
+    pub id: PersonId,
+    pub name: Name,
+    pub faces: u32,
+    /// When and by which sensor they were last seen in this vision process.
+    pub last_seen: Option<Sighting>,
+    /// The sensors on which they are present now.
+    pub here: Vec<SensorId>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Sighting {
+    pub at: SystemTime,
+    pub sensor: SensorId,
+}
+
+/// The face model that tells people apart (origin `faces.json` recognisers; one global choice, as
+/// the origin's `face_model` setting). YuNet always finds the faces.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum Recogniser {
+    #[default]
+    #[serde(rename = "sface-2021dec")]
+    Sface,
+    #[serde(rename = "auraface-v1")]
+    AuraFace,
+}
+
+impl Recogniser {
+    pub const ALL: [Self; 2] = [Self::Sface, Self::AuraFace];
+
+    /// The origin's id, also the model's id in the registry.
+    pub const fn id(self) -> &'static str {
+        match self {
+            Self::Sface => "sface-2021dec",
+            Self::AuraFace => "auraface-v1",
+        }
+    }
+
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Sface => "SFace (rápido)",
+            Self::AuraFace => "AuraFace v1 (preciso)",
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::Sface => "Pequeno e rápido; feito para o YuNet. Recomendado. 39 MB.",
+            Self::AuraFace => "Distingue melhor rostos com pouca luz e de lado, mas precisa de uns 600 MB de memória e é lento em CPUs pequenas. 261 MB.",
+        }
+    }
 }
 
 /// History pruning (origin `STORAGE_DEFAULTS`): by age, then by size. Samples are never pruned.
@@ -1024,7 +1257,8 @@ pub enum ModelState {
 }
 
 /// What the panel looks at. The app sends it when it differs from what the current vision child
-/// last received; the answer is the `FocusView` the vision process pushes.
+/// last received; the answer is the `FocusView` the vision process pushes. `Tab::People` is about
+/// everyone, not one sensor: its `sensor` is ignored.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Interest {
     pub sensor: Option<SensorId>,
@@ -1045,13 +1279,16 @@ pub enum Tab {
     Samples,
     Review,
     History,
+    /// Everyone named and their taught faces, shared by every sensor.
+    People,
 }
 
 /// The vision process's answer to the current `Interest`, re-sent whole when anything in it
 /// changes. Image bytes travel separately, before the first view that references them.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FocusView {
-    pub sensor: SensorId,
+    /// `None` for the people, who belong to no sensor.
+    pub sensor: Option<SensorId>,
     pub preview: Option<Preview>,
     pub detail: Detail,
     pub opened: Option<OpenedItem>,
@@ -1065,6 +1302,7 @@ impl FocusView {
             Detail::Live => Vec::new(),
             Detail::Samples { rows, .. } => rows.iter().map(|s| s.thumb).collect(),
             Detail::Review(rows) | Detail::History { rows, .. } => rows.iter().filter_map(|r| r.thumb).collect(),
+            Detail::People(faces) => faces.iter().map(|f| f.thumb).collect(),
         };
         let preview = self.preview.as_ref().map(|p| p.image);
         let opened = self.opened.as_ref().map(|o| o.image);
@@ -1087,6 +1325,18 @@ pub enum Detail {
     Samples { rows: Vec<SampleItem>, before: Option<SampleId>, older: Option<SampleId> },
     Review(Vec<HistoryItem>),
     History { rows: Vec<HistoryItem>, older: bool },
+    /// Every taught face, newest first; the people themselves are in `SystemStatus`.
+    People(Vec<FaceItem>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct FaceItem {
+    pub id: FaceId,
+    pub person: PersonId,
+    pub thumb: ImageId,
+    pub at: SystemTime,
+    /// The sensor it was taught on; `None` once that sensor is deleted (the face stays).
+    pub sensor: Option<SensorId>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1124,6 +1374,8 @@ pub enum ReviewReason {
     SpotCheck,
     /// An object sensor asks whether a box is one of its own labels.
     Ask(Question),
+    /// An object sensor that recognises faces asks who a face is.
+    Face(FaceQuestion),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1184,6 +1436,40 @@ pub enum UserCommand {
     },
     SetRetention(Retention),
     SetDetector(Detector),
+    SetRecogniser(Recogniser),
+    /// Teaches the face of a person box as `person` (a new one is made with it). Refused unless
+    /// the sensor recognises faces and the face can be used. From a review item, it also answers
+    /// it.
+    NameFace {
+        id: SensorId,
+        from: FaceFrom,
+        person: PersonPick,
+    },
+    RenamePerson {
+        person: PersonId,
+        name: Name,
+    },
+    /// Deletes the person with every face taught for them.
+    ForgetPerson(PersonId),
+    /// Moves a taught face to another person; `None` deletes it.
+    RelabelFace {
+        face: FaceId,
+        person: Option<PersonId>,
+    },
+}
+
+/// Where a face to name is: a person box of a held, checked frame, or a review item's question.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum FaceFrom {
+    Frame { frame: FrameId, area: NormBox },
+    Review(HistoryId),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum PersonPick {
+    Known(PersonId),
+    /// Made with the first face; naming again with the same id adds to them.
+    New { id: PersonId, name: Name },
 }
 
 #[cfg(test)]
@@ -1288,7 +1574,7 @@ mod tests {
             events: Vec::new(),
         };
         let view = FocusView {
-            sensor: SensorId(1),
+            sensor: Some(SensorId(1)),
             preview: Some(Preview {
                 frame: FrameId(3),
                 image: ImageId(10),
@@ -1326,8 +1612,29 @@ mod tests {
         let ours = OwnLabel { id: LabelId(7), name: Name("Nosso carro".into()), parent: class("car") };
         let rex = OwnLabel { id: LabelId(8), name: Name("Rex".into()), parent: class("dog") };
         settings.labels = vec![ours, rex].try_into().unwrap();
-        assert_eq!(settings.keys(), [ObjectKey::Class(class("car")), ObjectKey::Own(LabelId(7))], "Rex's dog is not chosen");
-        assert_eq!(settings.key_name(ObjectKey::Own(LabelId(7))), "Nosso carro");
+        assert_eq!(settings.keys(&[PersonId(3)]), [ObjectKey::Class(class("car")), ObjectKey::Own(LabelId(7))], "Rex's dog is not chosen");
+        assert_eq!(settings.key_name(ObjectKey::Own(LabelId(7)), &[]), "Nosso carro");
         assert_eq!((f32::from(settings.threshold), u8::from(settings.debounce)), (0.60, 1), "origin defaults");
+    }
+
+    #[test]
+    fn people_are_keys_only_while_faces_are_recognised_on_people() {
+        let class = |key: &str| ObjectClass::by_key(key).unwrap();
+        let objects = |classes: Vec<ObjectClass>, enabled: bool| match Settings::new_objects(Name("Porta".into()), classes.try_into().unwrap()).kind {
+            KindSettings::Objects(objects) => ObjectsSettings { faces: FaceSettings { enabled, ask_unknown: false }, ..objects },
+            KindSettings::States(_) => unreachable!(),
+        };
+        let people = [PersonId(1), PersonId(2)];
+        assert_eq!(objects(vec![class("person")], false).keys(&people), [ObjectKey::Class(ObjectClass::PERSON)], "off by default");
+        assert_eq!(objects(vec![class("car")], true).keys(&people), [ObjectKey::Class(class("car"))], "no people to look at");
+        assert_eq!(
+            objects(vec![class("person")], true).keys(&people),
+            [ObjectKey::Class(ObjectClass::PERSON), ObjectKey::Person(PersonId(1)), ObjectKey::Person(PersonId(2)), ObjectKey::Stranger]
+        );
+        let old: ObjectsSettings = serde_json::from_str(
+            r#"{"classes":["person"],"threshold":0.6,"debounce":1,"min_size":0.0,"clear_after":30,"use_taught":true,"labels":[]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.faces, FaceSettings::default(), "a sensor saved before faces existed has them off");
     }
 }

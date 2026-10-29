@@ -111,6 +111,9 @@ pub const POPULAR: [&str; 8] = ["person", "car", "cat", "dog", "bicycle", "truck
 pub struct ObjectClass(u8);
 
 impl ObjectClass {
+    /// `person`, the first class of the set: its boxes are where faces are looked for.
+    pub const PERSON: Self = Self(0);
+
     /// The class at this position of the model's output, if the set has one.
     pub fn from_index(index: usize) -> Option<Self> {
         (index < COCO.len()).then_some(Self(index as u8))

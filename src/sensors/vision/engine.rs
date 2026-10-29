@@ -1,7 +1,7 @@
-//! The engine: the single owner of every sensor's settings, runtime state and storage. It waits for
-//! the next input or deadline, handles it, then runs `tick`. Decisions come from `logic` and
-//! `teach`, pixel work from `pixels`, persistence from `store`, frames from `feeds`, vectors, heads
-//! and boxes from `infer`.
+//! The engine: the single owner of every sensor's settings, runtime state and storage, and of the
+//! people, who are shared by every sensor. It waits for the next input or deadline, handles it,
+//! then runs `tick`. Decisions come from `logic`, `teach` and `faces`, pixel work from `pixels`,
+//! persistence from `store`, frames from `feeds`, vectors, heads, boxes and faces from `infer`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -13,23 +13,27 @@ use std::time::{Duration, Instant, SystemTime};
 use egui::ColorImage;
 
 use super::Input;
+use super::faces::{self, FACES, Face, FaceIndex};
 use super::feeds::{FeedId, FeedSource, Feeds};
-use super::infer::{BACKBONE, Compare, DetectRequest, Done, Indexed, Infer, Job, Model, ModelEvent, Trained};
+use super::infer::{BACKBONE, DetectRequest, Done, FacesIndexed, Indexed, Infer, Job, Model, ModelEvent, Trained};
 use super::logic::{
-    self, CheckKind, Debouncer, FeedFact, GeometryVerdict, ObjectTrack, REVIEW, Schedule, Signature, StatusFacts,
+    self, CheckKind, Debouncer, FaceBurst, FeedFact, GeometryVerdict, ObjectTrack, REVIEW, Schedule, Signature, StatusFacts,
 };
 use super::pixels::{self, Rgb};
-use super::store::{Counts, NewHistory, SensorRecord, Store, StoreError, StoredHead, StoredHistory, TAUGHT_CROP, TaughtBox};
+use super::store::{
+    Counts, NewHistory, SensorRecord, Store, StoreError, StoredHead, StoredHistory, StoredPerson, TAUGHT_CROP, TaughtBox,
+};
 use super::teach::{self, TaughtIndex};
 use crate::frames::StreamKey;
 use crate::plan::RtspUrl;
 use crate::procs::UrlKey;
 use crate::sensors::types::{
-    BoxLabel, Detail, Detector, FocusView, Found, FrameId, Geometry, HistoryId, HistoryItem, ImageId, Interest, KindLive,
-    KindSettings, LabelId, MAX_TAUGHT, ModelState, ModelStatus, NormBox, Notice, NoticeKind, ObjectClass, ObjectEvent,
-    ObjectKey, ObjectsLive, ObjectsSettings, OpenedItem, Preview, Question, ReviewReason, SampleItem, SampleLabel,
-    SensorEntry, SensorId, SensorStatus, SensorValue, Settings, SourceSpec, SourceView, StateKey, StatesLive,
-    StatesSettings, SystemStatus, Tab, TrackView, UserCommand, Verdict,
+    BoxLabel, Detail, Detector, FaceFrom, FaceItem, FaceMarks, FaceProblem, FaceQuestion, FocusView, Found, FrameId,
+    Geometry, HistoryId, HistoryItem, ImageId, Interest, KindLive, KindSettings, LabelId, MAX_FACES_PER_PERSON,
+    MAX_PEOPLE, MAX_TAUGHT, ModelState, ModelStatus, NormBox, Notice, NoticeKind, ObjectClass, ObjectEvent, ObjectKey,
+    ObjectsLive, ObjectsSettings, OpenedItem, PersonId, PersonPick, PersonView, Preview, Question, Recogniser,
+    ReviewReason, SampleItem, SampleLabel, SensorEntry, SensorId, SensorStatus, SensorValue, Settings, Sighting,
+    SourceSpec, SourceView, StateKey, StatesLive, StatesSettings, SystemStatus, Tab, TrackView, UserCommand, Verdict,
 };
 use crate::sensors::wire::{Command, Desired, HEARTBEAT, MAX_WIRE_EDGE, PROTOCOL, Report};
 
@@ -44,11 +48,13 @@ const HISTORY_PAGE: usize = 50;
 const REVIEW_PAGE: usize = 100;
 const SAMPLE_PAGE: usize = 100;
 const THUMB_EDGE: usize = 160;
+const FACE_EDGE: usize = 96;
 const SAMPLE_QUALITY: u8 = 90;
 const HISTORY_QUALITY: u8 = 80;
 
 /// Stored images get ids from their row, tagged by kind in the top bits, so the same image keeps
 /// its id across views and is sent once. Previews count up from 1 and never reach the tags.
+const FACE_THUMB: u64 = 1 << 61;
 const SAMPLE_THUMB: u64 = 1 << 62;
 const HISTORY_THUMB: u64 = 2 << 62;
 const HISTORY_FRAME: u64 = 3 << 62;
@@ -77,6 +83,16 @@ pub struct Engine {
     models: BTreeMap<Model, ModelState>,
     model_retry: BTreeMap<Model, Instant>,
     detector: Detector,
+    recogniser: Recogniser,
+    /// Everyone named, oldest first, as stored.
+    people: Vec<StoredPerson>,
+    /// The people's faces embedded by `recogniser`; checks name nobody until it is built.
+    face_index: Option<Arc<FaceIndex>>,
+    /// Faces were taught, moved or forgotten: the index is built again then.
+    faces_reindex_at: Option<Instant>,
+    faces_indexing: bool,
+    /// When and where each person was last seen in this process.
+    sightings: BTreeMap<PersonId, Sighting>,
     notice: Option<Notice>,
     preview: Option<Shown>,
     next_id: u64,
@@ -144,8 +160,12 @@ struct ObjectsRun {
     /// The last checked frame and the boxes found in it.
     analysed: Option<(FrameId, Arc<ColorImage>)>,
     found: Vec<Found>,
+    /// The boxes of the last `FRAME_RING` checked frames, so a face is named on the frame shown.
+    checked: VecDeque<(FrameId, Vec<Found>)>,
     /// When each own label was last asked about.
     asked: BTreeMap<LabelId, Instant>,
+    /// When each person (`None`: the unknown person) was asked about, within the review cooldown.
+    faces_asked: BTreeMap<Option<PersonId>, Vec<Instant>>,
     filtered: BTreeSet<ObjectClass>,
     filtered_logged: BTreeMap<ObjectClass, Instant>,
 }
@@ -239,6 +259,12 @@ impl Engine {
         let now = Instant::now();
         let engine = Self {
             detector: store.detector()?,
+            recogniser: store.recogniser()?,
+            people: store.people()?,
+            face_index: None,
+            faces_reindex_at: None,
+            faces_indexing: false,
+            sightings: BTreeMap::new(),
             store,
             feeds,
             infer,
@@ -296,6 +322,7 @@ impl Engine {
             Input::Infer(Done::Trained { sensor, region, outcome }) => self.trained(sensor, region, outcome, now),
             Input::Infer(Done::Indexed { sensor, outcome }) => self.indexed(sensor, outcome),
             Input::Infer(Done::Detected { sensor, found }) => self.detected(sensor, found, now),
+            Input::Infer(Done::FacesIndexed { recogniser, outcome }) => self.faces_indexed(recogniser, outcome, now),
             Input::Model(ModelEvent { model, state }) => {
                 if matches!(state, ModelState::Failed(_)) {
                     self.model_retry.insert(model, now + MODEL_RETRY);
@@ -347,6 +374,7 @@ impl Engine {
                     Ok(()) => {
                         self.sensors.remove(&id);
                         self.emit(Report::Removed(id), Vec::new());
+                        self.sightings.retain(|_, seen| seen.sensor != id);
                         self.feeds_dirty = true;
                         self.focus_dirty = true;
                         self.system_dirty = true;
@@ -408,7 +436,184 @@ impl Engine {
                 }
                 self.system_dirty = true;
             }
+            UserCommand::SetRecogniser(recogniser) => {
+                match self.store.set_recogniser(recogniser) {
+                    Ok(()) => self.recogniser = recogniser,
+                    Err(e) => self.note(NoticeKind::Store(e.to_string())),
+                }
+                self.system_dirty = true;
+            }
+            UserCommand::NameFace { id, from, person } => {
+                let named = self.name_face(id, from, &person, now);
+                let Some(s) = self.sensors.get_mut(&id) else { return };
+                if let Err(refusal) = named {
+                    s.note(refusal);
+                }
+                match self.store.counts(id) {
+                    Ok(counts) => s.counts = counts,
+                    Err(e) => s.note(NoticeKind::Store(e.to_string())),
+                }
+            }
+            UserCommand::RenamePerson { person, name } => {
+                let taken = self.people.iter().any(|p| p.id != person && p.name.as_str().to_lowercase() == name.as_str().to_lowercase());
+                let renamed = if taken { Err(NoticeKind::NameTaken) } else { self.store.rename_person(person, &name).map_err(store_notice) };
+                self.people_changed(renamed.and_then(|done| if done { Ok(()) } else { Err(NoticeKind::UnknownItem) }), now);
+            }
+            UserCommand::ForgetPerson(person) => {
+                let forgotten = self.store.forget_person(person).map_err(store_notice);
+                if matches!(forgotten, Ok(true)) {
+                    self.sightings.remove(&person);
+                }
+                self.people_changed(forgotten.and_then(|done| if done { Ok(()) } else { Err(NoticeKind::UnknownItem) }), now);
+            }
+            UserCommand::RelabelFace { face, person } => {
+                let target = person.map(|p| self.people.iter().find(|x| x.id == p));
+                let moved = match target {
+                    Some(None) => Err(NoticeKind::UnknownItem),
+                    Some(Some(p)) if p.faces as usize >= MAX_FACES_PER_PERSON => Err(NoticeKind::FacesFull),
+                    _ => self.store.relabel_face(face, person).map_err(store_notice),
+                };
+                self.people_changed(moved.and_then(|done| if done { Ok(()) } else { Err(NoticeKind::UnknownItem) }), now);
+            }
         }
+    }
+
+    /// After the people or their faces changed: fresh counts, an index built again within
+    /// `RETRAIN_DELAY`, and new views.
+    fn people_changed(&mut self, outcome: Result<(), NoticeKind>, now: Instant) {
+        if let Err(refusal) = outcome {
+            self.note(refusal);
+        }
+        match self.store.people() {
+            Ok(people) => self.people = people,
+            Err(e) => self.note(NoticeKind::Store(e.to_string())),
+        }
+        self.faces_reindex_at = Some(now + RETRAIN_DELAY);
+        self.system_dirty = true;
+        self.focus_dirty = true;
+    }
+
+    /// Teaches the face of a person box as `pick` (origin `teach_face`). Only a face that passes the
+    /// quality gate is taught, so a back or a jacket never becomes someone; a new person is made
+    /// with their first face. Named on a live frame, the person was there just now.
+    fn name_face(&mut self, id: SensorId, from: FaceFrom, pick: &PersonPick, now: Instant) -> Result<(), NoticeKind> {
+        let s = self.sensors.get_mut(&id).ok_or(NoticeKind::UnknownItem)?;
+        let Kind::Objects(objects, run) = s.kind() else { return Err(NoticeKind::KindMismatch) };
+        if !objects.faces_on() {
+            return Err(NoticeKind::FacesOff);
+        }
+        let (image, marks, item): (Arc<ColorImage>, FaceMarks, Option<HistoryId>) = match from {
+            FaceFrom::Frame { frame, area } => {
+                let look = run
+                    .checked
+                    .iter()
+                    .find(|(checked, _)| *checked == frame)
+                    .and_then(|(_, found)| found.iter().find(|f| f.area == area.area()))
+                    .and_then(|f| f.face);
+                let marks = match look {
+                    Some(look) if look.age == 0 && look.usable() => look.marks.ok_or(NoticeKind::NoFace(FaceProblem::Missing))?,
+                    Some(look) => return Err(NoticeKind::NoFace(look.problem.unwrap_or(FaceProblem::Missing))),
+                    None => return Err(NoticeKind::NoFace(FaceProblem::Missing)),
+                };
+                (s.held(frame).ok_or(NoticeKind::FrameExpired)?, marks, None)
+            }
+            FaceFrom::Review(item) => {
+                let row = self.store.history_item(id, item).map_err(store_notice)?.ok_or(NoticeKind::UnknownItem)?;
+                let Some(ReviewReason::Face(question)) = row.review else { return Err(NoticeKind::UnknownItem) };
+                let bytes = fs::read(&row.image).map_err(|e| NoticeKind::Store(e.to_string()))?;
+                let frame = pixels::decode(&bytes).map_err(|e| NoticeKind::Store(e.to_string()))?;
+                (Arc::new(frame), question.face, Some(item))
+            }
+        };
+        let known = |person: PersonId| self.people.iter().find(|p| p.id == person).map(|p| (p.id, p.faces));
+        let (person, faces, new) = match pick {
+            PersonPick::Known(person) => {
+                let (person, faces) = known(*person).ok_or(NoticeKind::UnknownItem)?;
+                (person, faces, None)
+            }
+            PersonPick::New { id: person, name } => match known(*person) {
+                Some((person, faces)) => (person, faces, None),
+                None if self.people.len() >= MAX_PEOPLE => return Err(NoticeKind::PeopleFull),
+                None if self.people.iter().any(|p| p.name.as_str().to_lowercase() == name.as_str().to_lowercase()) => {
+                    return Err(NoticeKind::NameTaken);
+                }
+                None => (*person, 0, Some(name)),
+            },
+        };
+        if faces as usize >= MAX_FACES_PER_PERSON {
+            return Err(NoticeKind::FacesFull);
+        }
+        let face = Face::from_marks(&marks, image.size);
+        let area = faces::crop_area(&face, image.size);
+        let local = face.moved(-(area[0] as f32), -(area[1] as f32), 1.0);
+        let crop = jpeg(&pixels::crop_pixels(&image, area), SAMPLE_QUALITY).map_err(store_notice)?;
+        if let Some(name) = new {
+            self.store.add_person(person, name).map_err(store_notice)?;
+        }
+        self.store.add_face(person, id, &crop, &local).map_err(store_notice)?;
+        if let Some(item) = item {
+            self.store.mark_resolved(item).map_err(store_notice)?;
+        } else {
+            self.sightings.insert(person, Sighting { at: SystemTime::now(), sensor: id });
+        }
+        self.people_changed(Ok(()), now);
+        Ok(())
+    }
+
+    /// The people's faces are ready to compare with: every sensor that recognises faces checks at
+    /// once (origin `faces_changed`). Failing to embed them counts as the face model failing.
+    fn faces_indexed(&mut self, recogniser: Recogniser, outcome: Result<FacesIndexed, String>, now: Instant) {
+        self.faces_indexing = false;
+        self.system_dirty = true;
+        let FacesIndexed { index, fresh } = match outcome {
+            Ok(indexed) => indexed,
+            Err(error) => {
+                self.models.insert(Model::Recogniser(recogniser), ModelState::Failed(error));
+                self.model_retry.insert(Model::Recogniser(recogniser), now + MODEL_RETRY);
+                return;
+            }
+        };
+        if let Err(e) = self.store.put_face_embeddings(&faces::embedding_key(recogniser), &fresh) {
+            self.note(NoticeKind::Store(e.to_string()));
+        }
+        if recogniser != self.recogniser {
+            return;
+        }
+        self.face_index = Some(Arc::new(index));
+        for s in self.sensors.values_mut() {
+            if matches!(&s.rec.settings.kind, KindSettings::Objects(objects) if objects.faces_on()) {
+                s.schedule.force = true;
+            }
+        }
+    }
+
+    /// Whether any sensor recognises faces: only then are the face models fetched and loaded.
+    fn faces_needed(&self) -> bool {
+        self.sensors.values().any(|s| matches!(&s.rec.settings.kind, KindSettings::Objects(objects) if objects.faces_on()))
+    }
+
+    /// Builds the people's index once the recogniser is ready, again when faces changed or another
+    /// recogniser was chosen. Returns when it wants to run again.
+    fn step_faces(&mut self, now: Instant) -> Option<Instant> {
+        if self.faces_indexing || !self.faces_needed() || self.model(Model::Recogniser(self.recogniser)) != ModelState::Ready {
+            return None;
+        }
+        let stale = self.face_index.as_ref().is_none_or(|index| index.recogniser != self.recogniser);
+        match self.faces_reindex_at {
+            Some(at) if at > now && !stale => return Some(at),
+            None if !stale => return None,
+            _ => {}
+        }
+        self.faces_reindex_at = None;
+        match self.store.face_set(&faces::embedding_key(self.recogniser)) {
+            Ok(rows) => {
+                self.faces_indexing = true;
+                self.system_dirty = true;
+                self.infer.submit(Job::IndexFaces { recogniser: self.recogniser, rows });
+            }
+            Err(e) => self.note(NoticeKind::Store(e.to_string())),
+        }
+        None
     }
 
     fn configure(&mut self, id: SensorId, settings: Settings, now: Instant) {
@@ -626,10 +831,13 @@ impl Engine {
     }
 
     /// One check of an object sensor came back (origin `_run_objects` from the tracks on): the
-    /// tracks move, what changed goes to the history, unsure own labels are asked about.
+    /// tracks move, what changed goes to the history, unsure own labels and faces are asked about,
+    /// each person seen is where they were seen last, and a person nobody is named for starts
+    /// looking for a face more often.
     fn detected(&mut self, id: SensorId, found: Result<Vec<Found>, String>, now: Instant) {
         let frame_id = FrameId(self.next_id);
         self.next_id += 1;
+        let people: Vec<PersonId> = self.people.iter().map(|p| p.id).collect();
         let Some(s) = self.sensors.get_mut(&id) else { return };
         let Some(frame) = s.in_flight.take() else { return };
         let found = match found {
@@ -642,7 +850,8 @@ impl Engine {
         s.failure = None;
         s.last_check = Some(SystemTime::now());
         let Kind::Objects(objects, run) = s.kind() else { return };
-        let keys = objects.keys();
+        let keys = objects.keys(&people);
+        let faces_on = objects.faces_on();
         let changed = logic::update_tracks(&mut run.tracks, &found, &keys, objects.debounce, objects.clear_after.get(), now);
         let (filtered, newly) = logic::filtered_classes(&found, &run.filtered, &run.filtered_logged, now);
         run.filtered = filtered;
@@ -663,11 +872,40 @@ impl Engine {
                 _ => None,
             })
             .collect();
+        let face_asks: Vec<FaceQuestion> = if faces_on {
+            logic::face_questions(&REVIEW, &found, &run.faces_asked, objects.faces.ask_unknown, now)
+                .into_iter()
+                .filter_map(|(person, f)| {
+                    let look = f.face?;
+                    Some(FaceQuestion { person, area: f.area, face: look.marks?, similarity: look.similarity })
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let seen: Vec<PersonId> = people
+            .iter()
+            .copied()
+            .filter(|p| run.tracks.get(&ObjectKey::Person(*p)).is_some_and(|t| t.on) && found.iter().any(|f| f.counts_for(ObjectKey::Person(*p))))
+            .collect();
         let value = logic::present(&run.tracks, &keys);
         run.analysed = Some((frame_id, frame.clone()));
         run.found = found.clone();
+        run.checked.push_back((frame_id, found.clone()));
+        if run.checked.len() > FRAME_RING {
+            run.checked.pop_front();
+        }
         let recheck = logic::recheck_at(&run.tracks, now);
         s.schedule.recheck_at = recheck;
+        if faces_on {
+            logic::steer_face_burst(&mut s.schedule.face_burst, &found, now);
+        } else {
+            s.schedule.face_burst = FaceBurst::default();
+        }
+        for person in seen {
+            self.sightings.insert(person, Sighting { at: SystemTime::now(), sensor: id });
+        }
+        self.system_dirty |= changed.iter().any(|k| matches!(k, ObjectKey::Person(_)));
         self.focus_dirty |= self.interest.sensor == Some(id) && self.interest.tab == Tab::Live;
         if !events.is_empty() {
             let row = NewHistory { at: SystemTime::now(), value: &value, confidence, changed: true, review: None, jpeg: &[], events: &events, found: &found };
@@ -676,6 +914,33 @@ impl Engine {
         for question in asks {
             self.ask(id, &frame, &value, &found, question, now);
         }
+        for question in face_asks {
+            self.ask_face(id, &frame, &value, &found, question, now);
+        }
+    }
+
+    /// "É <pessoa>?" or "Quem é?" in the review queue, unless `FACES.ask_burst` questions about
+    /// that person wait there already (origin `_record_question` about a face).
+    fn ask_face(&mut self, id: SensorId, frame: &ColorImage, value: &SensorValue, found: &[Found], question: FaceQuestion, now: Instant) {
+        let waiting = match self.store.reviews(id, REVIEW_PAGE) {
+            Ok(rows) => rows.iter().filter(|r| matches!(r.review, Some(ReviewReason::Face(q)) if q.person == question.person)).count(),
+            Err(e) => {
+                self.note(NoticeKind::Store(e.to_string()));
+                return;
+            }
+        };
+        if waiting >= FACES.ask_burst {
+            return;
+        }
+        if let Some(Run::Objects(run)) = self.sensors.get_mut(&id).map(|s| &mut s.run) {
+            let times = run.faces_asked.entry(question.person).or_default();
+            times.retain(|at| now.duration_since(*at) < REVIEW.cooldown);
+            times.push(now);
+        }
+        let confidence = found.iter().filter(|f| f.area == question.area).map(|f| f.score).fold(0.0, f32::max);
+        let review = Some(ReviewReason::Face(question));
+        let row = NewHistory { at: SystemTime::now(), value, confidence, changed: false, review, jpeg: &[], events: &[], found };
+        self.record(id, frame, row);
     }
 
     /// "Is this <label>?" in the review queue, unless a question about that label already waits
@@ -714,6 +979,9 @@ impl Engine {
         self.ensure_models(now);
         for at in self.model_retry.values() {
             soon(*at);
+        }
+        if let Some(at) = self.step_faces(now) {
+            soon(at);
         }
         let ids: Vec<SensorId> = self.sensors.keys().copied().collect();
         for id in &ids {
@@ -755,8 +1023,9 @@ impl Engine {
     }
 
     /// The backbone is needed once a state sensor has samples to learn or a head to check with, or
-    /// an object sensor has taught boxes to compare; the detector once an object sensor exists.
-    /// Each is fetched once and retried after a failure. A sensor nobody taught downloads nothing.
+    /// an object sensor has taught boxes to compare; the detector once an object sensor exists;
+    /// the face models once a sensor recognises faces. Each is fetched once and retried after a
+    /// failure. A sensor nobody taught, or with faces off, downloads nothing for it.
     fn ensure_models(&mut self, now: Instant) {
         let mut needed = BTreeSet::new();
         for s in self.sensors.values() {
@@ -769,6 +1038,10 @@ impl Engine {
                     needed.insert(Model::Detector(self.detector));
                     if objects.use_taught && s.counts.taught > 0 {
                         needed.insert(Model::Backbone);
+                    }
+                    if objects.faces_on() {
+                        needed.insert(Model::FaceDetector);
+                        needed.insert(Model::Recogniser(self.recogniser));
                     }
                 }
             }
@@ -804,6 +1077,9 @@ impl Engine {
         let backbone = self.model(Model::Backbone) == ModelState::Ready;
         let detector = self.model(Model::Detector(self.detector)) == ModelState::Ready;
         let which = self.detector;
+        let faces_ready = self.model(Model::FaceDetector) == ModelState::Ready
+            && self.model(Model::Recogniser(self.recogniser)) == ModelState::Ready;
+        let face_index = self.face_index.clone().filter(|index| faces_ready && index.recogniser == self.recogniser);
         let s = self.sensors.get_mut(&id)?;
         let feed = s.feed();
         if let Some(seen) = self.feeds.latest(&feed).and_then(|f| f.geometry) {
@@ -874,21 +1150,20 @@ impl Engine {
         s.baseline = Some(pixels::signature(&frame.image, &region));
         let job = match s.kind() {
             Kind::States(..) => Job::Embed { sensor: id, crop: pixels::crop(&frame.image, &region) },
-            Kind::Objects(objects, run) => {
-                let taught = run.index.clone().filter(|_| objects.use_taught && backbone);
-                Job::Detect {
-                    sensor: id,
-                    frame: frame.image.clone(),
-                    request: DetectRequest {
-                        detector: which,
-                        region,
-                        classes: objects.classes.clone(),
-                        threshold: objects.threshold,
-                        min_size: objects.min_size,
-                        taught: taught.map(|index| Compare { index, previous: run.found.clone() }),
-                    },
-                }
-            }
+            Kind::Objects(objects, run) => Job::Detect {
+                sensor: id,
+                frame: frame.image.clone(),
+                request: DetectRequest {
+                    detector: which,
+                    region,
+                    classes: objects.classes.clone(),
+                    threshold: objects.threshold,
+                    min_size: objects.min_size,
+                    taught: run.index.clone().filter(|_| objects.use_taught && backbone),
+                    faces: face_index.filter(|_| objects.faces_on()),
+                    previous: run.found.clone(),
+                },
+            },
         };
         self.infer.submit(job);
         s.in_flight = Some(frame.image);
@@ -988,7 +1263,7 @@ impl Engine {
             failure: s.failure.clone(),
             trained,
         });
-        let entry = entry(s, status);
+        let entry = entry(s, status, &self.people);
         let s = self.sensors.get_mut(&id).expect("looked up above");
         if s.sent.as_ref() != Some(&entry) {
             s.sent = Some(entry.clone());
@@ -1004,10 +1279,35 @@ impl Engine {
                 Default::default()
             }
         };
-        let models = [Model::Backbone, Model::Detector(self.detector)]
+        let models = [Model::Backbone, Model::Detector(self.detector), Model::FaceDetector, Model::Recogniser(self.recogniser)]
             .map(|model| ModelStatus { name: model.spec().name.to_owned(), state: self.model(model) })
             .into();
-        SystemStatus { retention, usage, models, detector: self.detector, notice: self.notice.clone() }
+        let people = self
+            .people
+            .iter()
+            .map(|p| PersonView {
+                id: p.id,
+                name: p.name.clone(),
+                faces: p.faces,
+                last_seen: self.sightings.get(&p.id).copied(),
+                here: self
+                    .sensors
+                    .values()
+                    .filter(|s| matches!(&s.run, Run::Objects(run) if run.tracks.get(&ObjectKey::Person(p.id)).is_some_and(|t| t.on)))
+                    .map(|s| s.rec.id)
+                    .collect(),
+            })
+            .collect();
+        SystemStatus {
+            retention,
+            usage,
+            models,
+            detector: self.detector,
+            recogniser: self.recogniser,
+            people,
+            faces_indexing: self.faces_indexing,
+            notice: self.notice.clone(),
+        }
     }
 
     /// The answer to the current `Interest`. Images the app does not hold yet go first, then the
@@ -1029,6 +1329,9 @@ impl Engine {
 
     /// Items whose image cannot be read are left out, so every image the view names was sent.
     fn focus_view(&mut self, held: &BTreeSet<ImageId>, images: &mut Vec<(ImageId, ColorImage)>) -> Option<FocusView> {
+        if self.interest.tab == Tab::People {
+            return Some(self.people_view(held, images));
+        }
         let id = self.interest.sensor.filter(|id| self.sensors.contains_key(id))?;
         let preview = match &self.preview {
             Some(shown) if shown.sensor == id && self.interest.tab == Tab::Live => {
@@ -1039,21 +1342,7 @@ impl Engine {
             }
             _ => None,
         };
-        let mut load = |image: ImageId, path: &Path, edge: usize| -> bool {
-            if held.contains(&image) {
-                return true;
-            }
-            match fs::read(path).map_err(|e| e.to_string()).and_then(|b| pixels::decode(&b).map_err(|e| e.to_string())) {
-                Ok(frame) => {
-                    images.push((image, pixels::fit_rgba(&frame, edge)));
-                    true
-                }
-                Err(e) => {
-                    eprintln!("image {} unreadable: {e}", path.display());
-                    false
-                }
-            }
-        };
+        let mut load = |image: ImageId, path: &Path, edge: usize| load_image(held, images, image, path, edge);
         let history_item = |row: StoredHistory, load: &mut dyn FnMut(ImageId, &Path, usize) -> bool| {
             let thumb = ImageId(HISTORY_THUMB | row.id.0 as u64);
             load(thumb, &row.image, THUMB_EDGE).then_some(HistoryItem {
@@ -1067,7 +1356,7 @@ impl Engine {
             })
         };
         let detail = match self.interest.tab {
-            Tab::Live => Ok(Detail::Live),
+            Tab::Live | Tab::People => Ok(Detail::Live),
             Tab::Samples => self.store.samples(id, self.interest.samples_before, SAMPLE_PAGE).map(|(rows, older)| {
                 Detail::Samples {
                     rows: rows.into_iter()
@@ -1105,7 +1394,24 @@ impl Engine {
             self.note(NoticeKind::Store(e.to_string()));
             Detail::Live
         });
-        Some(FocusView { sensor: id, preview, detail, opened })
+        Some(FocusView { sensor: Some(id), preview, detail, opened })
+    }
+
+    /// Every taught face, newest first, for the people tab.
+    fn people_view(&mut self, held: &BTreeSet<ImageId>, images: &mut Vec<(ImageId, ColorImage)>) -> FocusView {
+        let faces = self.store.faces().unwrap_or_else(|e| {
+            self.note(NoticeKind::Store(e.to_string()));
+            Vec::new()
+        });
+        let items = faces
+            .into_iter()
+            .filter_map(|f| {
+                let thumb = ImageId(FACE_THUMB | f.id.0 as u64);
+                load_image(held, images, thumb, &f.image, FACE_EDGE)
+                    .then_some(FaceItem { id: f.id, person: f.person, thumb, at: f.at, sensor: f.sensor })
+            })
+            .collect();
+        FocusView { sensor: None, preview: None, detail: Detail::People(items), opened: None }
     }
 
     fn note(&mut self, kind: NoticeKind) {
@@ -1133,14 +1439,36 @@ fn jpeg(img: &Rgb, quality: u8) -> Result<Vec<u8>, StoreError> {
     pixels::encode_jpeg(img, quality).map_err(|e| StoreError::from(std::io::Error::other(e)))
 }
 
-fn entry(s: &Sensor, status: SensorStatus) -> SensorEntry {
+fn store_notice(e: StoreError) -> NoticeKind {
+    NoticeKind::Store(e.to_string())
+}
+
+/// Queues a stored image, fitted to `edge`, unless the app holds it already. `false` when it
+/// cannot be read: the item that names it is left out.
+fn load_image(held: &BTreeSet<ImageId>, images: &mut Vec<(ImageId, ColorImage)>, image: ImageId, path: &Path, edge: usize) -> bool {
+    if held.contains(&image) {
+        return true;
+    }
+    match fs::read(path).map_err(|e| e.to_string()).and_then(|b| pixels::decode(&b).map_err(|e| e.to_string())) {
+        Ok(frame) => {
+            images.push((image, pixels::fit_rgba(&frame, edge)));
+            true
+        }
+        Err(e) => {
+            eprintln!("image {} unreadable: {e}", path.display());
+            false
+        }
+    }
+}
+
+fn entry(s: &Sensor, status: SensorStatus, people: &[StoredPerson]) -> SensorEntry {
     let source = match &s.rec.source {
         SourceSpec::Dvr(camera) => SourceView::Dvr(camera.clone()),
         SourceSpec::Url(url) => SourceView::Url { display: url.display(), snapshot: url.is_snapshot() },
     };
     let (value, live) = match (&s.rec.settings.kind, &s.run) {
         (KindSettings::Objects(objects), Run::Objects(run)) => {
-            let keys = objects.keys();
+            let keys = objects.keys(&people.iter().map(|p| p.id).collect::<Vec<_>>());
             let tracks = keys
                 .iter()
                 .map(|key| {

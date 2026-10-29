@@ -164,7 +164,7 @@ fn paint_sensor_badges(ui: &egui::Ui, rect: Rect, cam: &CameraId, scene: &Scene)
     let color = if ready { Color32::LIGHT_GREEN } else { Color32::GRAY };
     let mut top = rect.top() + 30.0;
     for entry in scene.sensors.on_camera(cam) {
-        let text = format!("{}: {}", entry.settings.name.as_str(), crate::sensors_ui::value_label(entry));
+        let text = format!("{}: {}", entry.settings.name.as_str(), crate::sensors_ui::value_label(entry, scene.sensors.people()));
         let galley = painter.layout(text, FontId::proportional(13.0), color, (rect.width() - 20.0).max(1.0));
         let badge = Rect::from_min_size(pos2(rect.right() - galley.size().x - 16.0, top), galley.size() + vec2(10.0, 4.0));
         painter.rect_filled(badge, 3.0, Color32::from_black_alpha(190));

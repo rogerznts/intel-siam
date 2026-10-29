@@ -1,5 +1,6 @@
 //! The vision process. Private to `sensors`; the binary reaches it through `sensors::run_vision`.
-//! `logic`, `pixels` and the classifier in `infer` are pure: no I/O, no clock, no randomness.
+//! `logic`, `pixels`, `teach`, `faces` and the classifier in `infer` are pure: no I/O, no clock, no
+//! randomness.
 //!
 //! ```text
 //! stdin reader ─Command─┐
@@ -9,6 +10,7 @@
 //! ```
 
 mod engine;
+mod faces;
 mod feeds;
 mod infer;
 mod logic;

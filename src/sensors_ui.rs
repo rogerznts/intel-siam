@@ -12,6 +12,7 @@ use crate::ui::{Actions, Scene};
 /// Origin `OBJECT_BOX_COLOR`.
 const BOX_COLOR: Color32 = Color32::from_rgb(0x7e, 0xe2, 0xb8);
 const OWN_LABEL_COLOR: Color32 = Color32::from_rgb(0x6c, 0xc4, 0xff);
+const PERSON_COLOR: Color32 = Color32::from_rgb(0xff, 0xb3, 0x6c);
 const UNSURE_COLOR: Color32 = Color32::YELLOW;
 const FILTERED_COLOR: Color32 = Color32::from_gray(140);
 
@@ -36,6 +37,13 @@ pub struct SensorsPanel {
     delete_confirm: bool,
     images: HashMap<ImageId, TextureHandle>,
     error: Option<String>,
+    /// The people, shared by every sensor, shown instead of a sensor.
+    people_open: bool,
+    /// A name being typed for a new person.
+    new_person: String,
+    /// Names being edited, by person.
+    renames: HashMap<PersonId, String>,
+    forget_confirm: Option<PersonId>,
 }
 
 /// A box chosen on the preview, to teach what it is.
@@ -45,6 +53,8 @@ struct Picked {
     area: NormBox,
     /// The detector's class for a tapped box; `None` for a drawn one.
     detected: Option<ObjectClass>,
+    /// What its face said, for a person box of a sensor that recognises faces.
+    face: Option<FaceLook>,
 }
 
 struct NewSensor {
@@ -67,12 +77,14 @@ impl Default for NewSensor {
 
 impl SensorsPanel {
     pub fn interest(&self) -> Interest {
-        if self.open { Interest { sensor: self.selected, tab: self.tab, history_before: self.before, samples_before: self.samples_before, open: self.opened } }
-        else { Interest::default() }
+        if !self.open { Interest::default() }
+        else if self.people_open { Interest { tab: Tab::People, ..Interest::default() } }
+        else { Interest { sensor: self.selected, tab: self.tab, history_before: self.before, samples_before: self.samples_before, open: self.opened } }
     }
 
     fn select(&mut self, id: SensorId) {
         self.selected = Some(id);
+        self.people_open = false;
         self.tab = Tab::Live;
         self.before = None;
         self.samples_before = None;
@@ -87,11 +99,11 @@ impl SensorsPanel {
     }
 }
 
-pub fn value_label(entry: &SensorEntry) -> String {
+pub fn value_label(entry: &SensorEntry, people: &[PersonView]) -> String {
     match &entry.status {
         SensorStatus::Live => match &entry.settings.kind {
             KindSettings::States(_) => state_label(entry, entry.value.as_ref()),
-            KindSettings::Objects(objects) => presence_label(objects, entry.value.as_ref()),
+            KindSettings::Objects(objects) => presence_label(objects, people, entry.value.as_ref()),
         },
         SensorStatus::Paused => "pausado".into(),
         SensorStatus::GeometryChanged { .. } => "mudou a resolução".into(),
@@ -111,11 +123,11 @@ fn state_label(entry: &SensorEntry, value: Option<&SensorValue>) -> String {
     }
 }
 
-/// "Carro 2 · Pessoa 1": each object present with its count.
-fn presence_label(objects: &ObjectsSettings, value: Option<&SensorValue>) -> String {
+/// "Carro 2 · Pessoa 1 · Tom 1": each object, own label and person present with its count.
+fn presence_label(objects: &ObjectsSettings, people: &[PersonView], value: Option<&SensorValue>) -> String {
     match value {
         Some(SensorValue::Objects(present)) if present.is_empty() => "nenhum objeto".into(),
-        Some(SensorValue::Objects(present)) => present.iter().map(|(key, count)| format!("{} {count}", objects.key_name(*key))).collect::<Vec<_>>().join(" · "),
+        Some(SensorValue::Objects(present)) => present.iter().map(|(key, count)| format!("{} {count}", objects.key_name(*key, people))).collect::<Vec<_>>().join(" · "),
         _ => "?".into(),
     }
 }
@@ -124,7 +136,7 @@ fn box_label_name(objects: &ObjectsSettings, label: BoxLabel) -> String {
     match label {
         BoxLabel::NotThis => "Não é isso".into(),
         BoxLabel::Class(class) => class.name().into(),
-        BoxLabel::Own(id) => objects.key_name(ObjectKey::Own(id)).into(),
+        BoxLabel::Own(id) => objects.key_name(ObjectKey::Own(id), &[]).into(),
     }
 }
 
@@ -149,8 +161,12 @@ pub fn draw(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, actions:
     }
     egui::ScrollArea::vertical().show(ui, |ui| {
         for entry in scene.sensors.sensors.values() {
-            let text = format!("{}: {}", entry.settings.name.as_str(), value_label(entry));
-            if ui.selectable_label(panel.selected == Some(entry.id), text).clicked() { panel.select(entry.id); }
+            let text = format!("{}: {}", entry.settings.name.as_str(), value_label(entry, scene.sensors.people()));
+            if ui.selectable_label(panel.selected == Some(entry.id) && !panel.people_open, text).clicked() { panel.select(entry.id); }
+        }
+        if ui.selectable_label(panel.people_open, format!("Pessoas ({})", scene.sensors.people().len())).clicked() {
+            panel.people_open = !panel.people_open;
+            panel.forget_confirm = None;
         }
         ui.add_enabled_ui(ready, |ui| {
             if ui.button("Novo sensor").clicked() { panel.create = Some(NewSensor::default()); }
@@ -158,7 +174,9 @@ pub fn draw(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, actions:
                 let close = new_sensor(ui, scene, panel, &mut form, actions);
                 if !close { panel.create = Some(form); }
             }
-            if let Some(entry) = panel.selected.and_then(|id| scene.sensors.sensors.get(&id)) {
+            if panel.people_open {
+                people(ui, scene, panel, actions);
+            } else if let Some(entry) = panel.selected.and_then(|id| scene.sensors.sensors.get(&id)) {
                 selected(ui, scene, panel, entry, actions);
             }
             ui.separator();
@@ -268,7 +286,8 @@ fn class_picker(ui: &mut egui::Ui, id: &str, classes: &mut Vec<ObjectClass>) {
 
 fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &SensorEntry, actions: &mut Actions) {
     ui.separator();
-    ui.strong(format!("{}: {}", entry.settings.name.as_str(), value_label(entry)));
+    let people = scene.sensors.people();
+    ui.strong(format!("{}: {}", entry.settings.name.as_str(), value_label(entry, people)));
     ui.weak(match &entry.source { SourceView::Dvr(c) => camera_label(scene, c), SourceView::Url { display, .. } => display.clone() });
     if let SensorStatus::GeometryChanged { expected, seen } = entry.status {
         ui.colored_label(Color32::YELLOW, format!("{}×{} → {}×{}. Salve a região para aceitar.", expected.width, expected.height, seen.width, seen.height));
@@ -289,16 +308,16 @@ fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &
             if ui.button("Cancelar exclusão").clicked() { panel.delete_confirm = false; }
         });
     }
-    if let KindSettings::Objects(objects) = &entry.settings.kind { objects_settings(ui, entry, objects, actions); }
+    if let KindSettings::Objects(objects) = &entry.settings.kind { objects_settings(ui, entry, objects, scene.sensors.system.as_ref(), actions); }
     let samples = if matches!(entry.settings.kind, KindSettings::Objects(_)) { "Ensinados" } else { "Amostras" };
     ui.horizontal(|ui| {
         for (tab, label) in [(Tab::Live, "Ao vivo"), (Tab::Samples, samples), (Tab::Review, "Revisão"), (Tab::History, "Histórico")] {
             if ui.selectable_value(&mut panel.tab, tab, label).changed() { panel.opened = None; panel.before = None; panel.samples_before = None; panel.sample_pages.clear(); }
         }
     });
-    let Some(focus) = scene.sensors.focus.as_ref().filter(|f| f.sensor == entry.id) else { ui.spinner(); return };
+    let Some(focus) = scene.sensors.focus.as_ref().filter(|f| f.sensor == Some(entry.id)) else { ui.spinner(); return };
     match (&focus.detail, panel.tab) {
-        (Detail::Live, Tab::Live) => live(ui, panel, entry, focus, actions),
+        (Detail::Live, Tab::Live) => live(ui, panel, entry, people, focus, actions),
         (Detail::Samples { rows: samples, before, older }, Tab::Samples) if *before == panel.samples_before => {
             if samples.is_empty() { ui.label("Nenhuma amostra. Ensine na aba Ao vivo."); }
             for sample in samples {
@@ -343,12 +362,12 @@ fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &
                             && ui.add(egui::Image::new(texture).fit_to_exact_size(vec2(100.0, 56.25)).sense(Sense::click())).clicked()
                         { panel.opened = Some(row.id); }
                         ui.vertical(|ui| {
-                            ui.label(history_label(entry, row));
+                            ui.label(history_label(entry, people, row));
                             ui.weak(timestamp(row.at));
-                            if let Some(reason) = row.review { ui.label(review_label(entry, reason)); }
+                            if let Some(reason) = row.review { ui.label(review_label(entry, people, reason)); }
                         });
                     });
-                    if panel.tab == Tab::Review { review_answers(ui, entry, row, actions); }
+                    if panel.tab == Tab::Review { review_answers(ui, entry, row, people, &mut panel.new_person, &mut panel.error, actions); }
                 });
             }
             if let Detail::History { older, .. } = &focus.detail {
@@ -363,7 +382,7 @@ fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &
     if let Some(opened) = &focus.opened {
         if let Some(texture) = panel.images.get(&opened.image) {
             let shown = ui.add(egui::Image::new(texture).max_width(ui.available_width()));
-            if let KindSettings::Objects(objects) = &entry.settings.kind { paint_found(ui, shown.rect, &opened.found, objects, None); }
+            if let KindSettings::Objects(objects) = &entry.settings.kind { paint_found(ui, shown.rect, &opened.found, objects, people, None); }
         }
         if ui.button("Fechar imagem").clicked() { panel.opened = None; }
     }
@@ -383,33 +402,49 @@ fn box_choices(objects: &ObjectsSettings, found_by_detector: bool) -> Vec<BoxLab
     not_this.into_iter().chain(objects.classes.iter().map(BoxLabel::Class)).chain(objects.active_labels().map(|l| BoxLabel::Own(l.id))).collect()
 }
 
-fn history_label(entry: &SensorEntry, row: &HistoryItem) -> String {
+fn history_label(entry: &SensorEntry, people: &[PersonView], row: &HistoryItem) -> String {
     let KindSettings::Objects(objects) = &entry.settings.kind else {
         return format!("{} · {:.0}%", state_label(entry, Some(&row.value)), row.confidence * 100.0);
     };
     let events: Vec<String> = row.events.iter().map(|event| match event {
-        ObjectEvent::On(key) => format!("{} chegou", objects.key_name(*key)),
-        ObjectEvent::Off(key) => format!("{} saiu", objects.key_name(*key)),
+        ObjectEvent::On(key) => format!("{} chegou", objects.key_name(*key, people)),
+        ObjectEvent::Off(key) => format!("{} saiu", objects.key_name(*key, people)),
         ObjectEvent::Filtered(class) => format!("{} filtrado por caixa ensinada", class.name()),
     }).collect();
-    let present = presence_label(objects, Some(&row.value));
+    let present = presence_label(objects, people, Some(&row.value));
     if events.is_empty() { present } else { format!("{} · agora: {present}", events.join(", ")) }
 }
 
-fn review_label(entry: &SensorEntry, reason: ReviewReason) -> String {
+fn review_label(entry: &SensorEntry, people: &[PersonView], reason: ReviewReason) -> String {
     match (reason, &entry.settings.kind) {
         (ReviewReason::LowConfidence, _) => "Baixa confiança".into(),
         (ReviewReason::Flip, _) => "Mudanças frequentes".into(),
         (ReviewReason::SpotCheck, _) => "Conferência aleatória".into(),
         (ReviewReason::Ask(question), KindSettings::Objects(objects)) => {
-            format!("É {}? ({:.0}% parecido)", objects.key_name(ObjectKey::Own(question.label)), question.similarity * 100.0)
+            format!("É {}? ({:.0}% parecido)", objects.key_name(ObjectKey::Own(question.label), people), question.similarity * 100.0)
         }
+        (ReviewReason::Face(FaceQuestion { person: Some(person), similarity, .. }), _) => {
+            format!("É {}? ({:.0}% parecido)", person_name(people, person), similarity * 100.0)
+        }
+        (ReviewReason::Face(FaceQuestion { person: None, .. }), _) => "Quem é? Rosto de ninguém nomeado".into(),
         (ReviewReason::Ask(_), KindSettings::States(_)) => "Pergunta".into(),
     }
 }
 
-fn review_answers(ui: &mut egui::Ui, entry: &SensorEntry, row: &HistoryItem, actions: &mut Actions) {
+fn review_answers(ui: &mut egui::Ui, entry: &SensorEntry, row: &HistoryItem, people: &[PersonView], new_person: &mut String, error: &mut Option<String>, actions: &mut Actions) {
     let resolve = |label: Option<SampleLabel>| UserCommand::Resolve { id: entry.id, item: row.id, label };
+    if let Some(ReviewReason::Face(question)) = row.review {
+        let name = |person: PersonPick| UserCommand::NameFace { id: entry.id, from: FaceFrom::Review(row.id), person };
+        if let Some(person) = question.person && ui.button("Sim").clicked() {
+            actions.sensors.push(name(PersonPick::Known(person)));
+        }
+        ui.label(if question.person.is_some() { "Não, é:" } else { "É:" });
+        if let Some(pick) = person_picker(ui, people, question.person, new_person, error) {
+            actions.sensors.push(name(pick));
+        }
+        if ui.button("Descartar").clicked() { actions.sensors.push(resolve(None)); }
+        return;
+    }
     ui.horizontal_wrapped(|ui| {
         match (&entry.settings.kind, row.review) {
             (KindSettings::Objects(objects), Some(ReviewReason::Ask(question))) => {
@@ -429,9 +464,32 @@ fn review_answers(ui: &mut egui::Ui, entry: &SensorEntry, row: &HistoryItem, act
     });
 }
 
-/// The classes, own labels and comparison of an object sensor, applied with `Configure`.
-fn objects_settings(ui: &mut egui::Ui, entry: &SensorEntry, objects: &ObjectsSettings, actions: &mut Actions) {
-    egui::CollapsingHeader::new("Objetos e rótulos próprios").id_salt(("objects", entry.id)).show(ui, |ui| {
+/// One button per person (but `except`) and a field to name a new one; the person chosen.
+fn person_picker(ui: &mut egui::Ui, people: &[PersonView], except: Option<PersonId>, new_person: &mut String, error: &mut Option<String>) -> Option<PersonPick> {
+    let mut pick = None;
+    ui.horizontal_wrapped(|ui| {
+        for person in people.iter().filter(|p| Some(p.id) != except) {
+            if ui.button(person.name.as_str()).clicked() { pick = Some(PersonPick::Known(person.id)); }
+        }
+    });
+    ui.horizontal(|ui| {
+        ui.add(egui::TextEdit::singleline(new_person).hint_text("Nova pessoa, ex.: Tom").desired_width(160.0));
+        if ui.add_enabled(people.len() < MAX_PEOPLE, egui::Button::new("Criar pessoa")).clicked() {
+            match Name::try_from(new_person.clone()) {
+                Ok(name) => {
+                    pick = Some(PersonPick::New { id: PersonId::random(), name });
+                    new_person.clear();
+                }
+                Err(e) => *error = Some(e.to_string()),
+            }
+        }
+    });
+    pick
+}
+
+/// The classes, own labels, comparison and faces of an object sensor, applied with `Configure`.
+fn objects_settings(ui: &mut egui::Ui, entry: &SensorEntry, objects: &ObjectsSettings, system: Option<&SystemStatus>, actions: &mut Actions) {
+    egui::CollapsingHeader::new("Objetos, rótulos próprios e rostos").id_salt(("objects", entry.id)).show(ui, |ui| {
         let mut classes: Vec<ObjectClass> = objects.classes.iter().collect();
         class_picker(ui, "sensor-classes", &mut classes);
         let mut changed = objects.clone();
@@ -446,6 +504,15 @@ fn objects_settings(ui: &mut egui::Ui, entry: &SensorEntry, objects: &ObjectsSet
                 if ui.small_button("Remover").clicked() { changed.labels = changed.labels.without(label.id); }
             });
         }
+        ui.add_enabled_ui(objects.classes.contains(ObjectClass::PERSON), |ui| {
+            ui.checkbox(&mut changed.faces.enabled, "Reconhecer pessoas pelo rosto")
+                .on_disabled_hover_text("Escolha o objeto Pessoa para reconhecer rostos.");
+            ui.add_enabled(changed.faces.enabled, egui::Checkbox::new(&mut changed.faces.ask_unknown, "Perguntar quem é quando o rosto é de ninguém nomeado"));
+        });
+        if objects.faces_on() {
+            let indexing = if system.is_some_and(|s| s.faces_indexing) { " Preparando os rostos ensinados…" } else { "" };
+            ui.weak(format!("Os rostos ficam só neste computador. Enquanto os modelos de rosto baixam, o sensor segue contando objetos.{indexing}"));
+        }
         if changed != *objects {
             let mut settings = entry.settings.clone();
             settings.kind = KindSettings::Objects(changed);
@@ -454,7 +521,7 @@ fn objects_settings(ui: &mut egui::Ui, entry: &SensorEntry, objects: &ObjectsSet
     });
 }
 
-fn live(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, focus: &FocusView, actions: &mut Actions) {
+fn live(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, people: &[PersonView], focus: &FocusView, actions: &mut Actions) {
     let objects = match (&entry.settings.kind, &entry.live) { (KindSettings::Objects(o), KindLive::Objects(l)) => Some((o, l)), _ => None };
     ui.horizontal(|ui| {
         if objects.is_some() {
@@ -493,13 +560,13 @@ fn live(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, focus:
                     .min_by(|a, b| area(a.area).total_cmp(&area(b.area)));
                 panel.picked = hit.and_then(|f| {
                     let detected = match f.verdict { Verdict::Taught { was: Some(was), .. } => was, _ => f.class };
-                    NormBox::try_from(f.area).ok().map(|area| Picked { frame: preview.frame, area, detected: Some(detected) })
+                    NormBox::try_from(f.area).ok().map(|area| Picked { frame: preview.frame, area, detected: Some(detected), face: f.face })
                 });
             }
             if response.drag_started() { panel.drag_start = response.interact_pointer_pos().map(normal); }
             if let (Some(start), Some(end)) = (panel.drag_start, response.interact_pointer_pos().map(normal)) {
                 if response.drag_stopped() {
-                    panel.picked = NormBox::between(start, end).ok().map(|area| Picked { frame: preview.frame, area, detected: None });
+                    panel.picked = NormBox::between(start, end).ok().map(|area| Picked { frame: preview.frame, area, detected: None, face: None });
                     panel.drag_start = None;
                 } else if response.dragged() {
                     ui.painter().rect_stroke(screen(rect, [start.x(), start.y(), end.x(), end.y()]), 0.0, Stroke::new(2.0, Color32::WHITE), StrokeKind::Middle);
@@ -521,11 +588,11 @@ fn live(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, focus:
         for pair in points.windows(2) { ui.painter().line_segment([pair[0], pair[1]], Stroke::new(2.0, Color32::YELLOW)); }
         if let Some((settings, _)) = objects {
             let picked = panel.picked.filter(|p| p.frame == preview.frame).map(|p| p.area.area());
-            paint_found(ui, rect, found, settings, picked);
+            paint_found(ui, rect, found, settings, people, picked);
         }
     }
     match objects {
-        Some((settings, live)) => objects_live(ui, panel, entry, settings, live, actions),
+        Some((settings, live)) => objects_live(ui, panel, entry, settings, people, live, actions),
         None => states_live(ui, entry, preview, actions),
     }
     save_region(ui, panel, entry, actions);
@@ -555,23 +622,36 @@ fn states_live(ui: &mut egui::Ui, entry: &SensorEntry, preview: &Preview, action
     if live.training { ui.label("Treinando…"); }
 }
 
-/// Each object with its presence and count, then what the picked box is.
-fn objects_live(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, objects: &ObjectsSettings, live: &ObjectsLive, actions: &mut Actions) {
+/// Each object with its presence and count, then what the picked box is, and whose face it shows.
+fn objects_live(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, objects: &ObjectsSettings, people: &[PersonView], live: &ObjectsLive, actions: &mut Actions) {
     for track in &live.tracks {
         let state = if track.on { format!("presente ({})", track.count) } else { "ausente".into() };
         let score = if track.score > 0.0 { format!(" · {:.0}%", track.score * 100.0) } else { String::new() };
-        ui.label(format!("{}: {state}{score}", objects.key_name(track.key)));
+        ui.label(format!("{}: {state}{score}", objects.key_name(track.key, people)));
     }
     let comparing = if live.indexing { " · preparando comparação…" } else { "" };
     ui.weak(format!("{} caixas ensinadas{comparing}", live.taught));
     if !panel.teaching_boxes {
-        ui.weak("Em Ensinar caixas, toque numa caixa para corrigi-la ou arraste em volta de algo que não foi achado.");
+        let faces = if objects.faces_on() { " Toque numa pessoa para dar nome ao rosto." } else { "" };
+        ui.weak(format!("Em Ensinar caixas, toque numa caixa para corrigi-la ou arraste em volta de algo que não foi achado.{faces}"));
         return;
     }
     let Some(picked) = panel.picked else {
         ui.label("Toque numa caixa ou arraste para desenhar uma.");
         return;
     };
+    if objects.faces_on() && let Some(look) = picked.face {
+        if look.age == 0 && look.usable() {
+            ui.label("O rosto desta pessoa é:");
+            if let Some(person) = person_picker(ui, people, None, &mut panel.new_person, &mut panel.error) {
+                actions.sensors.push(UserCommand::NameFace { id: entry.id, from: FaceFrom::Frame { frame: picked.frame, area: picked.area }, person });
+                panel.picked = None;
+            }
+        } else {
+            ui.weak(look.problem.map_or("O rosto não foi procurado neste quadro.", face_problem_label));
+        }
+        ui.separator();
+    }
     let teach = |label: BoxLabel| UserCommand::TeachBox { id: entry.id, frame: picked.frame, area: picked.area, detected: picked.detected, label };
     ui.label(match picked.detected { Some(class) => format!("Caixa achada como {}. Ela é:", class.name().to_lowercase()), None => "Caixa desenhada. Ela é:".into() });
     ui.horizontal_wrapped(|ui| {
@@ -608,18 +688,26 @@ fn screen(rect: Rect, a: [f32; 4]) -> Rect {
     Rect::from_two_pos(rect.min + vec2(a[0] * rect.width(), a[1] * rect.height()), rect.min + vec2(a[2] * rect.width(), a[3] * rect.height()))
 }
 
-/// The boxes of a check over the frame they were found in, each with what it counts as.
-fn paint_found(ui: &egui::Ui, rect: Rect, found: &[Found], objects: &ObjectsSettings, picked: Option<[f32; 4]>) {
+/// The boxes of a check over the frame they were found in, each with what it counts as, and the
+/// faces found in the person boxes.
+fn paint_found(ui: &egui::Ui, rect: Rect, found: &[Found], objects: &ObjectsSettings, people: &[PersonView], picked: Option<[f32; 4]>) {
     for f in found {
-        let (color, name) = match f.verdict {
-            Verdict::Filtered(_) => (FILTERED_COLOR, format!("{} (filtrado)", f.class.name())),
-            Verdict::Unsure { label, .. } => (UNSURE_COLOR, format!("{}?", objects.key_name(ObjectKey::Own(label)))),
-            Verdict::Taught { label: Some(label), .. } => (OWN_LABEL_COLOR, objects.key_name(ObjectKey::Own(label)).to_owned()),
-            Verdict::Taught { .. } | Verdict::Detector => (BOX_COLOR, f.class.name().to_owned()),
+        let (color, name) = match (f.verdict, f.face) {
+            (Verdict::Filtered(_), _) => (FILTERED_COLOR, format!("{} (filtrado)", f.class.name())),
+            (Verdict::Unsure { label, .. }, _) => (UNSURE_COLOR, format!("{}?", objects.key_name(ObjectKey::Own(label), people))),
+            (Verdict::Taught { label: Some(label), .. }, _) => (OWN_LABEL_COLOR, objects.key_name(ObjectKey::Own(label), people).to_owned()),
+            (_, Some(look)) if look.person().is_some() => (PERSON_COLOR, look.person().map_or("?", |p| person_name(people, p)).to_owned()),
+            (_, Some(FaceLook { state: FaceState::Ask(person), .. })) => (UNSURE_COLOR, format!("{}?", person_name(people, person))),
+            (_, Some(look)) if look.stranger() => (PERSON_COLOR, objects.key_name(ObjectKey::Stranger, people).to_owned()),
+            (Verdict::Taught { .. } | Verdict::Detector, _) => (BOX_COLOR, f.class.name().to_owned()),
         };
         let shown = screen(rect, f.area);
         let width = if picked == Some(f.area) { 4.0 } else { 2.0 };
         ui.painter().rect_stroke(shown, 0.0, Stroke::new(width, if width > 2.0 { Color32::WHITE } else { color }), StrokeKind::Middle);
+        if let Some(marks) = f.face.and_then(|l| l.marks) {
+            let usable = f.face.is_some_and(|l| l.usable());
+            ui.painter().rect_stroke(screen(rect, marks.area), 0.0, Stroke::new(1.0, if usable { PERSON_COLOR } else { FILTERED_COLOR }), StrokeKind::Middle);
+        }
         let text = format!("{name} {:.0}%", f.score * 100.0);
         let galley = ui.painter().layout_no_wrap(text, FontId::proportional(12.0), Color32::BLACK);
         let tag = Align2::LEFT_BOTTOM.anchor_size(shown.left_top(), galley.size() + vec2(6.0, 2.0));
@@ -628,6 +716,87 @@ fn paint_found(ui: &egui::Ui, rect: Rect, found: &[Found], objects: &ObjectsSett
     }
     if let Some(a) = picked.filter(|a| !found.iter().any(|f| f.area == *a)) {
         ui.painter().rect_stroke(screen(rect, a), 0.0, Stroke::new(3.0, Color32::WHITE), StrokeKind::Middle);
+    }
+}
+
+fn face_problem_label(problem: FaceProblem) -> &'static str {
+    match problem {
+        FaceProblem::Missing => "Nenhum rosto nesta caixa.",
+        FaceProblem::Cut => "O rosto está cortado pela borda da imagem.",
+        FaceProblem::Small => "O rosto está pequeno demais.",
+        FaceProblem::Unsure => "Não dá para ter certeza de que é um rosto.",
+        FaceProblem::Turned => "O rosto está virado de lado.",
+        FaceProblem::Blurry => "O rosto está desfocado.",
+    }
+}
+
+/// Everyone named, shared by every sensor: rename, where and when each was seen, their taught
+/// faces (moved to another person or deleted), and forgetting them.
+fn people(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, actions: &mut Actions) {
+    ui.separator();
+    ui.strong("Pessoas");
+    let people = scene.sensors.people();
+    if people.is_empty() {
+        ui.label("Ninguém foi nomeado. Ligue o reconhecimento de rostos num sensor de Objetos e, em Ensinar caixas, toque numa pessoa.");
+        return;
+    }
+    let faces = match scene.sensors.focus.as_ref().filter(|f| f.sensor.is_none()).map(|f| &f.detail) {
+        Some(Detail::People(faces)) => &faces[..],
+        _ => &[],
+    };
+    let sensor_name = |id: SensorId| scene.sensors.sensors.get(&id).map_or("sensor apagado", |e| e.settings.name.as_str());
+    for person in people {
+        ui.push_id(person.id, |ui| {
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    let name = panel.renames.entry(person.id).or_insert_with(|| person.name.as_str().to_owned());
+                    ui.add(egui::TextEdit::singleline(name).desired_width(160.0));
+                    if name.as_str() != person.name.as_str() && ui.button("Renomear").clicked() {
+                        match Name::try_from(name.clone()) {
+                            Ok(name) => actions.sensors.push(UserCommand::RenamePerson { person: person.id, name }),
+                            Err(e) => panel.error = Some(e.to_string()),
+                        }
+                        panel.renames.remove(&person.id);
+                    }
+                });
+                let here: Vec<&str> = person.here.iter().map(|id| sensor_name(*id)).collect();
+                let seen = if !here.is_empty() {
+                    format!("Vista agora em {}", here.join(", "))
+                } else if let Some(last) = person.last_seen {
+                    format!("Vista por último em {} ({})", sensor_name(last.sensor), timestamp(last.at))
+                } else {
+                    "Ainda não vista desde que o app abriu".into()
+                };
+                ui.weak(format!("{} rostos ensinados · {seen}", person.faces));
+                ui.horizontal_wrapped(|ui| {
+                    for face in faces.iter().filter(|f| f.person == person.id) {
+                        ui.push_id(face.id, |ui| {
+                            ui.vertical(|ui| {
+                                image(ui, &panel.images, face.thumb, 64.0);
+                                ui.weak(face.sensor.map_or("sensor apagado", sensor_name));
+                                egui::ComboBox::from_id_salt("move").selected_text("Mover").width(64.0).show_ui(ui, |ui| {
+                                    for other in people.iter().filter(|p| p.id != person.id) {
+                                        if ui.selectable_label(false, other.name.as_str()).clicked() {
+                                            actions.sensors.push(UserCommand::RelabelFace { face: face.id, person: Some(other.id) });
+                                        }
+                                    }
+                                });
+                                if ui.small_button("Excluir").clicked() { actions.sensors.push(UserCommand::RelabelFace { face: face.id, person: None }); }
+                            });
+                        });
+                    }
+                });
+                if panel.forget_confirm == Some(person.id) {
+                    ui.label(format!("Apagar {} e os {} rostos ensinados?", person.name.as_str(), person.faces));
+                    ui.horizontal(|ui| {
+                        if ui.button("Confirmar").clicked() { actions.sensors.push(UserCommand::ForgetPerson(person.id)); panel.forget_confirm = None; }
+                        if ui.button("Cancelar").clicked() { panel.forget_confirm = None; }
+                    });
+                } else if ui.button("Apagar pessoa").clicked() {
+                    panel.forget_confirm = Some(person.id);
+                }
+            });
+        });
     }
 }
 
@@ -659,6 +828,11 @@ fn settings(ui: &mut egui::Ui, view: &SensorsView, actions: &mut Actions) {
                 for choice in Detector::ALL { ui.selectable_value(&mut detector, choice, choice.name()).on_hover_text(choice.description()); }
             });
             if detector != system.detector { actions.sensors.push(UserCommand::SetDetector(detector)); }
+            let mut recogniser = system.recogniser;
+            egui::ComboBox::from_label("Reconhecedor de rostos").selected_text(recogniser.name()).show_ui(ui, |ui| {
+                for choice in Recogniser::ALL { ui.selectable_value(&mut recogniser, choice, choice.name()).on_hover_text(choice.description()); }
+            });
+            if recogniser != system.recogniser { actions.sensors.push(UserCommand::SetRecogniser(recogniser)); }
             for model in &system.models {
                 let state = match &model.state {
                     ModelState::NotNeeded => "não baixado".into(),
@@ -680,6 +854,11 @@ fn notice_label(notice: &NoticeKind) -> String {
         NoticeKind::UnknownItem => "Item não encontrado.".into(),
         NoticeKind::OutsideRegion => "A base da caixa está fora da região, então ela nunca contaria.".into(),
         NoticeKind::TaughtFull => format!("O sensor já tem {MAX_TAUGHT} caixas ensinadas."),
+        NoticeKind::FacesOff => "Ligue o reconhecimento de rostos neste sensor primeiro.".into(),
+        NoticeKind::NoFace(problem) => format!("Esse rosto não pode ser ensinado. {}", face_problem_label(*problem)),
+        NoticeKind::PeopleFull => format!("Já existem {MAX_PEOPLE} pessoas."),
+        NoticeKind::FacesFull => format!("Essa pessoa já tem {MAX_FACES_PER_PERSON} rostos ensinados."),
+        NoticeKind::NameTaken => "Já existe uma pessoa com esse nome.".into(),
         NoticeKind::Store(error) => format!("Falha ao gravar: {error}"),
     }
 }
