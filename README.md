@@ -42,6 +42,8 @@ no dia a dia: abre direto nas câmeras que você escolheu, na ordem em que você
   valor ou acima do limite vai para a revisão, onde você confirma ou digita o valor certo; uma leitura um passo
   abaixo é a última roda girando e mantém o valor. O limite aprende com os dias de uso. Os leitores PP-OCRv6 e de
   rodas são baixados no primeiro uso.
+- **Botões na cor primária.** Todo botão usa o verde do ícone: verde vivo quando ligado, verde escuro quando
+  desligado. Valores e regras em [docs/design/visual.md](docs/design/visual.md).
 
 ## Como funciona
 
@@ -51,10 +53,15 @@ flowchart LR
   B --> C[Túnel P2P libt2u<br/>helper x86_64]
   C --> D[ffmpeg por câmera<br/>RTSP → RGBA]
   D --> E[Grade egui]
+  C --> V[Processo de visão<br/>ffmpeg + ONNX + SQLite]
+  V -- valores dos sensores --> E
 ```
 
 O túnel e cada câmera rodam como processos filhos supervisionados. Uma câmera com problema derruba só o próprio tile.
-Detalhes em [docs/spec/viewer-architecture.md](docs/spec/viewer-architecture.md); requisitos em
+Os sensores rodam no processo `intel-siam-vision`, também supervisionado: ele abre os próprios decoders, um por fonte
+com sensor, roda os modelos ONNX só na CPU e guarda sensores, amostras e histórico num SQLite próprio. Se ele cair, a
+grade continua. Detalhes em [docs/spec/viewer-architecture.md](docs/spec/viewer-architecture.md) e
+[docs/spec/sensors-architecture.md](docs/spec/sensors-architecture.md); requisitos em
 [docs/spec/viewer.md](docs/spec/viewer.md); protocolo em [docs/protocol/](docs/protocol/).
 
 ## Requisitos
@@ -64,6 +71,8 @@ Detalhes em [docs/spec/viewer-architecture.md](docs/spec/viewer-architecture.md)
 - `ffmpeg` (`brew install ffmpeg`).
 - `libt2u.so`, a biblioteca de túnel do SIMPlay 1.4.1. Ela é da Intelbras e **não** vem neste repositório: copie-a da
   sua instalação do SIMPlay.
+- Internet no primeiro uso de cada tipo de sensor, para baixar os modelos (conferidos por SHA-256). Depois, tudo roda
+  local.
 
 ## Uso
 
@@ -100,7 +109,8 @@ As [evidências de verificação dos sensores](docs/spec/sensors-ui-verification
 
 Sem uma variável obrigatória, o app abre e mostra qual falta.
 
-Token de sessão, layout e logs ficam em `~/Library/Application Support/intel-siam/`, fora do repositório.
+Token de sessão, layout, logs, sensores e modelos baixados (`sensors/`) ficam em
+`~/Library/Application Support/intel-siam/`, fora do repositório.
 
 ### App para macOS
 
@@ -109,7 +119,8 @@ tools/package/macos.sh --install
 install -m 600 .env ~/Library/Application\ Support/intel-siam/config.env
 ```
 
-O script gera `Intel SIAM.app` com o ícone e o instala em `/Applications`. Aberto pelo Finder ou pelo Dock, o app
+O script gera `Intel SIAM.app` com o ícone e os dois executáveis (`intel-siam` e `intel-siam-vision`) e o instala em
+`/Applications`. Aberto pelo Finder ou pelo Dock, o app
 não recebe as variáveis do terminal; ele as lê de `config.env` na pasta de dados. Variáveis definidas no ambiente
 têm prioridade.
 
