@@ -173,10 +173,19 @@ ambiente ONNX duplicado, corrigido antes desta.
 O app subiu com `.env` e o executável release, mas a janela não pôde ser observada nem operada. O
 `orca computer get-app-state` falhou com `permission_denied` ("AX reads stayed blocked"), mesmo com as permissões de
 acessibilidade e captura concedidas. O `screencapture` da janela saiu em branco, embora o `sample` do processo
-mostrasse o laço do egui pintando texturas. A suspeita é a janela num Space que não está à mostra. Movê-la pediria
-acessibilidade ou alterar o estado salvo da janela do usuário. Não há capturas da interface de Objetos nesta rodada.
+mostrasse o laço do egui pintando texturas. Não há capturas da interface de Objetos.
+
+A causa é a tela do Mac travada, não um Space oculto. `CGSessionCopyCurrentDictionary` retornou
+`CGSSessionScreenIsLocked = 1`, com `CGSSessionScreenLockedTime` às 22:03, antes das duas tentativas. Na segunda
+tentativa, o `CGWindowListCopyWindowInfo` mostrou a janela **Intel SIAM** visível em `{50, 60}`, com `1400×850`, na
+tela principal. Mesmo assim, o `System Events` contou zero janelas no app e também no Finder. A captura de cada
+monitor mostrou só o papel de parede, sem barra de menus. O `sample` mostrou a thread principal ociosa no laço de
+eventos, sem travamento do app. Um vigia esperou 30 minutos pelo desbloqueio, e a tela continuou travada.
+Os eventos sintéticos não foram enviados, pois chegariam à tela de bloqueio.
+
 O painel (criar com escolha de classes, prévia com caixas, ensinar tocando ou desenhando, revisão, histórico, selo
-com contagem) compila e foi exercitado só pelo protocolo acima.
+com contagem) compila e foi exercitado só pelo protocolo acima. O smoke na interface depende de a tela estar
+desbloqueada.
 
 Nenhum sensor do usuário foi criado ou removido. O banco do usuário foi migrado para a versão 2 ao abrir o app,
 sem sensores. Os dados do smoke ficaram só em `/tmp/smoke-objects`.
