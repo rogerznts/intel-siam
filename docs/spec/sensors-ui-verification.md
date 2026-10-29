@@ -168,27 +168,11 @@ Nosso carro?". A resposta "é outro carro" o deixou como carro comum. Um toque m
 isso** a filtrou na checagem seguinte, e o histórico registrou cada evento. A primeira rodada achou o defeito do
 ambiente ONNX duplicado, corrigido antes desta.
 
-## Smoke na interface real: não feito
+## Smoke na interface real
 
-O app subiu com `.env` e o executável release, mas a janela não pôde ser observada nem operada. O
-`orca computer get-app-state` falhou com `permission_denied` ("AX reads stayed blocked"), mesmo com as permissões de
-acessibilidade e captura concedidas. O `screencapture` da janela saiu em branco, embora o `sample` do processo
-mostrasse o laço do egui pintando texturas. Não há capturas da interface de Objetos.
-
-A causa é a tela do Mac travada, não um Space oculto. `CGSessionCopyCurrentDictionary` retornou
-`CGSSessionScreenIsLocked = 1`, com `CGSSessionScreenLockedTime` às 22:03, antes das duas tentativas. Na segunda
-tentativa, o `CGWindowListCopyWindowInfo` mostrou a janela **Intel SIAM** visível em `{50, 60}`, com `1400×850`, na
-tela principal. Mesmo assim, o `System Events` contou zero janelas no app e também no Finder. A captura de cada
-monitor mostrou só o papel de parede, sem barra de menus. O `sample` mostrou a thread principal ociosa no laço de
-eventos, sem travamento do app. Um vigia esperou 30 minutos pelo desbloqueio, e a tela continuou travada.
-Os eventos sintéticos não foram enviados, pois chegariam à tela de bloqueio.
-
-O painel (criar com escolha de classes, prévia com caixas, ensinar tocando ou desenhando, revisão, histórico, selo
-com contagem) compila e foi exercitado só pelo protocolo acima. O smoke na interface depende de a tela estar
-desbloqueada.
-
-Nenhum sensor do usuário foi criado ou removido. O banco do usuário foi migrado para a versão 2 ao abrir o app,
-sem sensores. Os dados do smoke ficaram só em `/tmp/smoke-objects`.
+Feito em 2026-10-29, na seção [Smoke na interface real de Objetos, Pessoas e Leitura](#smoke-na-interface-real-de-objetos-pessoas-e-leitura).
+As tentativas de 2026-10-28 pararam porque a tela do Mac estava travada (`CGSSessionScreenIsLocked = 1`).
+Com a tela travada, o AX e a captura da janela não respondiam.
 
 # Verificação de Pessoas nos sensores de Objetos
 
@@ -238,13 +222,10 @@ progresso):
 - A aba Pessoas devolveu o rosto ensinado com o sensor de origem; `ForgetPerson` apagou a pessoa e o arquivo do
   rosto, e o processo terminou com código 0 ao fechar o stdin.
 
-## Smoke na interface real: não feito
+## Smoke na interface real
 
-A tela do Mac estava bloqueada (`CGSSessionScreenIsLocked` = true no `ioreg`), e não tentei desbloquear. A chave
-de rostos no sensor, a seção Pessoas (lista, renomear, apagar, mover e excluir rostos, onde e quando foi vista),
-nomear tocando numa pessoa em Ensinar caixas, as perguntas "É <pessoa>?"/"Quem é?" na revisão e o selo com os nomes
-compilam e foram exercitados só pelo protocolo acima. Nenhum sensor ou pessoa do usuário foi criado; os dados do
-smoke ficaram só em `/tmp/smoke-people`.
+Feito em 2026-10-29, na seção [Smoke na interface real de Objetos, Pessoas e Leitura](#smoke-na-interface-real-de-objetos-pessoas-e-leitura).
+A tentativa de 2026-10-28 parou porque a tela do Mac estava bloqueada.
 
 # Verificação dos sensores de Leitura
 
@@ -305,11 +286,178 @@ Na primeira rodada o driver esperava a leitura de cada sensor só nas mensagens 
 chegado; foi corrigido para olhar também o último estado recebido. Os modelos e o processo não mudaram entre as
 rodadas.
 
-## Smoke na interface real: não feito
+## Smoke na interface real
 
-Às 23:50 a tela do Mac estava bloqueada (`CGSSessionScreenIsLocked` = true no `ioreg`), e não tentei desbloquear. O
-formulário de criação com o tipo Leitura (Main por padrão, modo, visor, rodas, unidade, casas, limite), a prévia com
-a caixa, o valor com unidade e vazão, os diagnósticos, a qualidade, as respostas da revisão (leitura certa, corrigir
-digitando, descartar), o histórico, o leitor de números nas configurações e o selo com valor e unidade compilam e
-foram exercitados só pelo protocolo acima. Nenhum sensor do usuário foi criado; os dados ficaram em
-`/tmp/smoke-reading`.
+Feito em 2026-10-29, na seção [Smoke na interface real de Objetos, Pessoas e Leitura](#smoke-na-interface-real-de-objetos-pessoas-e-leitura).
+A tentativa de 2026-10-28 parou porque a tela do Mac estava bloqueada.
+
+# Smoke na interface real de Objetos, Pessoas e Leitura
+
+## Método
+
+Em 2026-10-29, com a tela desbloqueada, o app subiu com `set -a; . ./.env; set +a; cargo run --release` no HEAD
+`4c78524`. O build release já estava atualizado. Um servidor HTTP em loopback (`/tmp/smoke-ui/serve.py`, porta 8777)
+serviu quatro fontes, `/objects`, `/people`, `/reading` e `/wheels`. Cada fonte servia o arquivo nomeado em
+`current-<fonte>`. As imagens vieram de `/tmp/smoke-objects`, `/tmp/smoke-people` e `/tmp/smoke-reading`. Cada
+fonte alternou apenas entre imagens do mesmo tamanho.
+
+As ações semânticas do `orca computer` funcionaram para botões, abas, caixas de seleção, rádios e campos de texto.
+Cada efeito foi confirmado por uma nova leitura da árvore AX ou por uma captura. Três controles exigiram entrada
+nativa:
+
+- O `AXPress` não abriu os `ComboBox`. Um clique do CoreGraphics abriu a lista, e outro clique escolheu o item.
+- A ação `increment` não alterou o valor dos `DragValue`. Um clique nativo abriu a edição. Em seguida, `Cmd+A`, o
+  número e `Return` foram enviados pelo `System Events`.
+- Os toques e arrastos na prévia usaram `/tmp/smoke-ui/mouse`. Esse driver, derivado do driver de Estados, publica
+  eventos em `.cghidEventTap` e também envia rolagem.
+
+O painel de Sensores rola sozinho entre ações. Antes de cada toque, a rolagem voltou ao topo e uma captura da janela
+indicou as coordenadas.
+
+As capturas foram feitas com `screencapture -l <janela>` e recortadas a partir da borda do painel. O recorte excluiu
+a grade de câmeras. Os selos dos tiles foram recortados apenas no rótulo.
+
+## Objetos
+
+O sensor **Garagem Smoke** foi criado com tipo Objetos, fonte `/objects` com `driveway.jpg` e as classes Pessoa e
+Carro. O D-FINE S baixou e o sensor publicou **Pessoa 1 · Carro 4**.
+
+Em **Ensinar caixas**, o toque no carro vermelho selecionou a caixa, que ficou com contorno branco. O painel
+mostrou **Caixa achada como carro. Ela é:**. Depois de digitar **Nosso carro**, o botão **Criar (carro)** criou o
+rótulo e ensinou a caixa. O valor passou a **Pessoa 1 · Carro 4 · Nosso carro 1**. O carro ao lado ficou amarelo,
+com **Nosso carro? 93%**.
+
+![Carro ensinado como Nosso carro e o vizinho em dúvida](../images/objects-taught.png)
+
+Um arrasto em volta do carro escuro sem caixa, à direita do carrinho, desenhou a caixa branca. O painel mostrou
+**Caixa desenhada. Ela é:**. Depois de **Carro**, o contador passou a **2 caixas ensinadas**.
+
+![Caixa desenhada em volta de um carro que o detector não achou](../images/objects-drawn-box.png)
+
+A aba Revisão mostrou **É Nosso carro? (86% parecido)**, com **Sim**, **Não, é outro carro** e **Descartar**.
+
+![Pergunta da revisão sobre o carro parecido](../images/objects-review-question.png)
+
+A resposta **Não, é outro carro** esvaziou a revisão. Depois de **Checar agora**, a caixa amarela voltou como
+**Carro 93%**.
+
+![A caixa respondida volta como carro comum](../images/objects-answered.png)
+
+A aba Ensinados listou as três caixas: a desenhada, a resposta da revisão, ambas como Carro, e o Nosso carro. A aba
+Histórico registrou **Pessoa chegou, Carro chegou**, **Nosso carro chegou** e a checagem que fez a pergunta.
+
+![As três caixas ensinadas](../images/objects-taught-boxes.png)
+
+![Histórico do sensor de Objetos](../images/objects-history.png)
+
+O valor **Carro 4 · Nosso carro 1** conta o carro rotulado também como carro. Esse é o comportamento esperado
+pelo teste `tracks_skip_filtered_boxes_count_own_labels_and_forget_deselected_keys` em `logic.rs`.
+
+## Pessoas
+
+O sensor **Rostos Smoke** foi criado em `/people`, apenas com a classe Pessoa. A opção **Reconhecer pessoas pelo
+rosto**, em **Objetos, rótulos próprios e rostos**, baixou YuNet e SFace. Ambos passaram a **pronto**. Com
+`face_williams_2006.jpg`, o toque na caixa da pessoa mostrou **O rosto desta pessoa é:**. O nome **Williams** e
+**Criar pessoa** mudaram o valor para **Pessoa 1 · Williams 1**. A caixa passou a laranja, com o nome.
+
+![Rosto nomeado Williams pelo toque na caixa](../images/people-named.png)
+
+O servidor passou a servir a cena vazia, e o valor mudou para **nenhum objeto**. Depois, com
+`face_williams_2018.jpg` ajustado a 480×600, o sensor reconheceu **Williams 95%** sem novo ensino.
+
+![Williams reconhecida na foto de 2018](../images/people-recognized-2018.png)
+
+Com a cena vazia entre as fotos, `face_wilmore.jpg` resultou em **Pessoa 1 · Pessoa desconhecida 1**.
+
+![Rosto sem nome publicado como pessoa desconhecida](../images/people-unknown.png)
+
+A seção **Pessoas (1)** mostrou o nome editável e **1 rostos ensinados · Vista por último em Rostos Smoke (29/10
+00:37:03)**. Ela também mostrou a miniatura do rosto, o sensor de origem, **Mover**, **Excluir** e **Apagar
+pessoa**. **Apagar pessoa** pediu **Apagar Williams e os 1 rostos ensinados?**. **Confirmar** deixou **Pessoas
+(0)**. A consulta somente leitura retornou zero linhas em `person`, `face` e `face_embedding`, sem arquivos de
+rosto em `img/`.
+
+![Seção Pessoas com onde e quando Williams foi vista](../images/people-section.png)
+
+## Leitura
+
+O sensor **Medidor LCD Smoke** foi criado com tipo Leitura em `/reading`, com `lcd.png`. O stream padrão foi Main.
+A configuração usou modo Contador, visor **LCD (dígitos escuros no claro)**, **1 casas decimais** e unidade
+**kWh**. A região padrão foi a imagem inteira. Depois que o PP-OCRv6 tiny baixou, o sensor publicou
+**123456.7 kWh**. O painel mostrou a imagem **O que o leitor viu**, **Última leitura: «0123456.7» · 99% · aceita**
+e o limite aprendido. Em **Qualidade**, apareceu **Hoje: 1 leituras · 100% aceitas**.
+
+![Leitura do LCD com unidade, diagnósticos e qualidade](../images/reading-lcd-live.png)
+
+O servidor passou a `seq_down.png`, com 813×200 e `0123450.0`. **Checar agora** produziu **rejeitada: o
+contador desceu**, e o valor ficou em 123456.7 kWh. O painel mostrou **1 leituras rejeitadas na revisão**. A
+qualidade mudou para **50% aceitas · rejeitadas: o contador desceu 1**.
+
+![Leitura rejeitada porque o contador desceu](../images/reading-lcd-rejected.png)
+
+Na Revisão, a linha ofereceu **Leitura certa (123450.0 kWh)**, um campo e **Corrigir**. O texto **123456.8**
+digitado e **Corrigir** esvaziaram a revisão e mudaram o valor para **123456.8 kWh**. Em seguida, o servidor
+passou a `seq_next.png`, com `0123456.8`. **Checar agora** não criou nova linha no Histórico, e o valor ficou em
+123456.8 kWh.
+
+![Correção digitada na revisão](../images/reading-lcd-review.png)
+
+![Histórico com a leitura aceita e a rejeitada](../images/reading-lcd-history.png)
+
+O sensor **Hidrômetro Smoke** foi criado em `/wheels`, com `counter_red.jpg`. A configuração usou **Contador de
+rodas**, **7 rodas**, **Leitor de rodas v2**, **3 casas decimais** e unidade **m³**. O sensor baixou o leitor v2
+e publicou **632.289 m³**. A tela mostrou **«0632289» · 100% · aceita** e as sete células vistas pelo leitor.
+
+![Contador de rodas lido como 632.289 m³](../images/reading-wheels-live.png)
+
+## Selos nos tiles
+
+Um sensor de fonte URL não tem tile. Por isso, o selo foi testado com dois sensores temporários no **Canal1**:
+
+- **Selo Smoke** era um sensor de Objetos com a classe Pessoa.
+- **Selo Leitura** era um sensor de Leitura em modo Valor, com stream Main e unidade **ano**. Sua região foi
+  desenhada em volta do ano no carimbo de data do DVR.
+
+O primeiro selo mostrou **nenhum objeto**. A primeira checagem do segundo, ainda com a imagem inteira, rejeitou a
+leitura como **nada lido**. Depois de **Salvar região**, **Checar agora** leu **«2026» · 100% · aceita**. As
+imagens contêm só os rótulos.
+
+![Selo do sensor de Objetos no tile](../images/objects-tile-badge.png)
+
+![Selo do sensor de Leitura com valor e unidade no tile](../images/reading-tile-badge.png)
+
+## Limpeza
+
+**Apagar** e **Confirmar exclusão** removeram os seis sensores criados. **Apagar pessoa** já tinha removido
+Williams. A consulta final somente leitura em `sensors.db`, com `user_version` 4, retornou zero linhas em todas
+as tabelas, exceto `setting`. Essa tabela manteve a retenção padrão de 7 dias e 2048 MB. As pastas de `img/`
+ficaram vazias.
+
+O smoke baixou cinco modelos: D-FINE S, YuNet, SFace, PP-OCRv6 tiny e leitor de rodas v2. Eles foram apagados de
+`models/`, que voltou a ter apenas o DINOv2, como antes do smoke.
+
+Durante a rodada, a janela mudou de 1400×850 em `{50, 60}` para 1728×1084 em `{0, 33}`. A causa não foi
+identificada. O `System Events` restaurou a posição e o tamanho. O divisor do painel voltou a cerca de um terço
+da largura. O app foi fechado com `Cmd+Q` e terminou com código 0. O servidor HTTP também foi encerrado.
+
+## Achados
+
+Nenhum defeito do app apareceu nos caminhos exercitados, e o código não mudou. Por isso, `cargo test` e `cargo
+clippy` não foram repetidos. Dois comportamentos parecem estranhos, mas seguem o código:
+
+- Depois de respondida, a linha da pergunta continua no Histórico com **É Nosso carro?**. Pelo código de
+  `Engine::resolve`, o `mark_resolved` tira a linha só da Revisão; a razão da revisão fica gravada.
+- A correção digitada em uma leitura muda o valor, mas não cria uma linha nova no Histórico. A linha rejeitada
+  continua com **lida de novo 1 vezes**.
+
+Os itens abaixo não foram exercitados pela interface nesta rodada. Os casos com cobertura pelo protocolo seguem
+cobertos por ele.
+
+- As perguntas de rosto **É <pessoa>?** e **Quem é?** não foram exercitadas, porque **Perguntar quem é** ficou
+  desligado.
+- Na seção Pessoas, não foram exercitados renomear, **Mover** e **Excluir**.
+- Em Objetos, não foram exercitados **Não é isso**, a região em polígono e o selo com contagem acima de zero.
+  Nenhuma pessoa estava no Canal1.
+- Na Leitura, não foram exercitados **Leitura certa**, **Descartar**, o estado de assentando, o salto acima do
+  limite, a vazão, os visores LED e Automático, o leitor de rodas v1, **Texto (OCR)**, `counter_turning.jpg` e a
+  troca do leitor de números nas configurações.

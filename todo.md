@@ -42,7 +42,9 @@ Spec: docs/spec/viewer.md. Fluxo: pstack poteto-mode / Feature + architect.
 - [x] Detector D-FINE (N/S/M/L) atrás do contrato ONNX, filtros, trilhas, recheck, rótulos próprios, revisão.
 - [x] Smoke do processo de visão com D-FINE S baixado e fotos reais (docs/spec/sensors-ui-verification.md).
 - [x] Pessoas nomeadas pelo rosto (YuNet com SFace ou AuraFace), pessoa desconhecida e perguntas na revisão.
-- [ ] Smoke na UI real com capturas: a tela do Mac estava bloqueada nas tentativas.
+- [x] Smoke na UI real com capturas: criar, caixas, rótulo próprio, caixa desenhada, revisão, histórico, selo,
+      rostos nomeados, reconhecidos e desconhecidos, seção Pessoas (docs/spec/sensors-ui-verification.md).
+- [ ] Smoke na UI das perguntas de rosto ("É <pessoa>?", "Quem é?"), renomear, mover e excluir rosto.
 - [ ] Aviso "visto de leve" ao desenhar caixa perdida e ensino a partir de quadro do histórico.
 
 ## Sensores de Leitura
@@ -51,7 +53,8 @@ Spec: docs/spec/viewer.md. Fluxo: pstack poteto-mode / Feature + architect.
 - [x] Veredito, assentando, limite do contador (auto/fixo/passo/desligado) com dias persistidos, vazão,
       diagnósticos, qualidade, revisão com confirmação ou correção digitada.
 - [x] Smoke do processo de visão com modelos reais e as imagens da origem (docs/spec/sensors-ui-verification.md).
-- [ ] Smoke na UI real com capturas: a tela do Mac estava bloqueada.
+- [x] Smoke na UI real com capturas: LCD e rodas com unidade, diagnósticos, qualidade, rejeição corrigida
+      digitando na revisão, histórico e selo no tile (docs/spec/sensors-ui-verification.md).
 - [ ] Conferência aleatória por sensor (`spot_rate`) e exportação das leituras com a posição de cada roda.
 
 ## Roadmap (futuro)
