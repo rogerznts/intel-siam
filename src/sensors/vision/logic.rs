@@ -565,7 +565,7 @@ pub fn face_questions<'a>(
         let Some(look) = f.face.filter(|l| l.age == 0 && l.usable()) else { continue };
         let about = match look.state {
             FaceState::Ask(person) => Some(person),
-            FaceState::Unknown if ask_unknown => None,
+            FaceState::Unknown if ask_unknown && look.unknown > 0 => None,
             _ => continue,
         };
         if best.get(&about).is_none_or(|(s, _)| look.similarity > *s) {
@@ -717,12 +717,14 @@ mod tests {
         let t = Clock(Instant::now());
         let kari = PersonId(1);
         let maybe = person(0.5, Some(look(None, FaceState::Ask(kari))));
-        let stranger = person(0.5, Some(look(None, FaceState::Unknown)));
+        let stranger = person(0.5, Some(crate::sensors::types::FaceLook { unknown: 1, ..look(None, FaceState::Unknown) }));
         let found = [maybe, stranger];
         let mut asked: BTreeMap<Option<PersonId>, Vec<Instant>> = BTreeMap::new();
         let about: Vec<Option<PersonId>> = face_questions(&REVIEW, &found, &asked, false, t.at(0)).into_iter().map(|q| q.0).collect();
         assert_eq!(about, [Some(kari)], "nobody is asked about a stranger unless the sensor says so");
         assert_eq!(face_questions(&REVIEW, &found, &asked, true, t.at(0)).len(), 2);
+        let untaught = person(0.5, Some(look(None, FaceState::Unknown)));
+        assert!(face_questions(&REVIEW, &[untaught], &asked, true, t.at(0)).is_empty(), "with nobody taught there is no unknown to ask about");
         asked.insert(Some(kari), vec![t.at(0)]);
         assert!(face_questions(&REVIEW, &found[..1], &asked, false, t.at(1)).is_empty(), "the next one waits ask_gap");
         assert_eq!(face_questions(&REVIEW, &found[..1], &asked, false, t.at(3)).len(), 1);
