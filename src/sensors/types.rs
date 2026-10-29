@@ -10,6 +10,7 @@ use egui::ColorImage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub use super::coco::{Detector, ObjectClass};
 use crate::frames::{StreamKey, StreamKind};
 use crate::model::CameraId;
 
@@ -22,6 +23,15 @@ pub const MAX_STATES: usize = 9; // MAX_STATES
 pub const MAX_POLYGON_POINTS: usize = 32; // ROI_MAX_POINTS
 pub const MIN_REGION_SIDE: f32 = 0.01; // imaging.normalise_roi: `w < 0.01 or h < 0.01`
 pub const MAX_NAME_CHARS: usize = 64; // api/common.py: `name: str = Field(min_length=1, max_length=64)`
+pub const OBJECT_DEFAULT_THRESHOLD: f32 = 0.60; // OBJECT_SENSOR_DEFAULTS["threshold"]
+pub const OBJECT_DEFAULT_DEBOUNCE: u8 = 1; // OBJECT_SENSOR_DEFAULTS["debounce"]
+pub const OBJECT_MAX_CLASSES: usize = 20; // OBJECT_MAX_CLASSES
+pub const MIN_SIZE_LIMIT: f32 = 0.5; // OBJECT_LIMITS["min_size"]
+pub const DEFAULT_CLEAR_AFTER_S: u32 = 30; // OBJECT_DEFAULTS["clear_after_s"]
+pub const CLEAR_AFTER_LIMIT_S: u32 = 3600; // OBJECT_LIMITS["clear_after_s"]
+pub const MAX_OWN_LABELS: usize = 10; // TEACH["max_labels"]
+pub const MIN_BOX_SIDE: f32 = 0.01; // TEACH["min_box"]
+pub const MAX_TAUGHT: usize = 500; // TEACH["max_examples"]
 const MAX_URL_BYTES: usize = 2048;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,6 +56,17 @@ impl SensorId {
                 return Self(id);
             }
         }
+    }
+}
+
+/// An own label. Chosen by the app when the user names it, so creating it is idempotent and a
+/// taught box can refer to it in the same frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LabelId(pub(in crate::sensors) u64);
+
+impl LabelId {
+    pub fn random() -> Self {
+        Self(SensorId::random().0)
     }
 }
 
@@ -319,6 +340,26 @@ impl Settings {
             }),
         }
     }
+
+    /// Origin `OBJECT_SENSOR_DEFAULTS` and `OBJECT_DEFAULTS`.
+    pub fn new_objects(name: Name, classes: ClassSet) -> Self {
+        Self {
+            name,
+            region: Region::WHOLE,
+            interval: Interval(DEFAULT_INTERVAL_S),
+            triggers: Triggers { regular: true, change_detection: false },
+            paused: false,
+            kind: KindSettings::Objects(ObjectsSettings {
+                classes,
+                threshold: Unit(OBJECT_DEFAULT_THRESHOLD),
+                debounce: Debounce(OBJECT_DEFAULT_DEBOUNCE),
+                min_size: MinSize(0.0),
+                clear_after: ClearAfter(DEFAULT_CLEAR_AFTER_S),
+                use_taught: true,
+                labels: OwnLabels(Vec::new()),
+            }),
+        }
+    }
 }
 
 /// Trimmed, 1 to `MAX_NAME_CHARS` characters.
@@ -386,6 +427,225 @@ pub struct Triggers {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum KindSettings {
     States(StatesSettings),
+    Objects(ObjectsSettings),
+}
+
+/// Origin `OBJECT_DEFAULTS` with `OBJECT_SENSOR_DEFAULTS`.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ObjectsSettings {
+    pub classes: ClassSet,
+    /// The detector's minimum confidence for a box to count.
+    pub threshold: Unit,
+    /// Checks in a row with an object present before it switches on.
+    pub debounce: Debounce,
+    pub min_size: MinSize,
+    pub clear_after: ClearAfter,
+    /// Off: the detector alone decides; taught boxes are kept but not compared.
+    pub use_taught: bool,
+    pub labels: OwnLabels,
+}
+
+impl ObjectsSettings {
+    /// Own labels in use: those whose class is still selected (origin `active_custom`).
+    pub fn active_labels(&self) -> impl Iterator<Item = &OwnLabel> {
+        self.labels.iter().filter(|l| self.classes.contains(l.parent))
+    }
+
+    /// What the sensor reports: its classes, then its own labels in use (origin `object_keys`).
+    pub fn keys(&self) -> Vec<ObjectKey> {
+        let labels = self.active_labels().map(|l| ObjectKey::Own(l.id));
+        self.classes.iter().map(ObjectKey::Class).chain(labels).collect()
+    }
+
+    pub fn key_name(&self, key: ObjectKey) -> &str {
+        match key {
+            ObjectKey::Class(class) => class.name(),
+            ObjectKey::Own(id) => self.labels.get(id).map_or("?", |l| l.name.as_str()),
+        }
+    }
+}
+
+/// 1 to `OBJECT_MAX_CLASSES` distinct classes, in the order chosen.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<ObjectClass>", into = "Vec<ObjectClass>")]
+pub struct ClassSet(Vec<ObjectClass>);
+
+impl TryFrom<Vec<ObjectClass>> for ClassSet {
+    type Error = InvalidInput;
+    fn try_from(classes: Vec<ObjectClass>) -> Result<Self, InvalidInput> {
+        if !(1..=OBJECT_MAX_CLASSES).contains(&classes.len()) {
+            return Err(InvalidInput("escolha de 1 a 20 objetos"));
+        }
+        if classes.iter().collect::<BTreeSet<_>>().len() != classes.len() {
+            return Err(InvalidInput("objetos repetidos"));
+        }
+        Ok(Self(classes))
+    }
+}
+
+impl From<ClassSet> for Vec<ObjectClass> {
+    fn from(set: ClassSet) -> Self {
+        set.0
+    }
+}
+
+impl ClassSet {
+    pub fn iter(&self) -> impl Iterator<Item = ObjectClass> + '_ {
+        self.0.iter().copied()
+    }
+
+    pub fn contains(&self, class: ObjectClass) -> bool {
+        self.0.contains(&class)
+    }
+}
+
+/// The smallest box that counts, as a share of the region's area, in `0.0..=MIN_SIZE_LIMIT`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "f32", into = "f32")]
+pub struct MinSize(f32);
+
+impl TryFrom<f32> for MinSize {
+    type Error = InvalidInput;
+    fn try_from(share: f32) -> Result<Self, InvalidInput> {
+        if (0.0..=MIN_SIZE_LIMIT).contains(&share) { Ok(Self(share)) } else { Err(InvalidInput("tamanho mínimo fora de 0 a 50%")) }
+    }
+}
+
+impl From<MinSize> for f32 {
+    fn from(size: MinSize) -> f32 {
+        size.0
+    }
+}
+
+/// How long an object stays present after it was last seen, `0..=CLEAR_AFTER_LIMIT_S` seconds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "u32", into = "u32")]
+pub struct ClearAfter(u32);
+
+impl TryFrom<u32> for ClearAfter {
+    type Error = InvalidInput;
+    fn try_from(seconds: u32) -> Result<Self, InvalidInput> {
+        if seconds <= CLEAR_AFTER_LIMIT_S { Ok(Self(seconds)) } else { Err(InvalidInput("tempo para sumir fora de 0 s a 1 h")) }
+    }
+}
+
+impl From<ClearAfter> for u32 {
+    fn from(clear: ClearAfter) -> u32 {
+        clear.0
+    }
+}
+
+impl ClearAfter {
+    pub fn get(self) -> Duration {
+        Duration::from_secs(self.0.into())
+    }
+}
+
+/// A name the user gives one specific object, as a kind of one class ("Nosso carro", a car).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnLabel {
+    pub id: LabelId,
+    pub name: Name,
+    pub parent: ObjectClass,
+}
+
+/// At most `MAX_OWN_LABELS`, with distinct ids and distinct names ignoring case. A label whose
+/// class is not selected stays, unused, until its class is chosen again.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "Vec<OwnLabel>", into = "Vec<OwnLabel>")]
+pub struct OwnLabels(Vec<OwnLabel>);
+
+impl TryFrom<Vec<OwnLabel>> for OwnLabels {
+    type Error = InvalidInput;
+    fn try_from(labels: Vec<OwnLabel>) -> Result<Self, InvalidInput> {
+        if labels.len() > MAX_OWN_LABELS {
+            return Err(InvalidInput("no máximo 10 rótulos próprios por sensor"));
+        }
+        let ids: BTreeSet<LabelId> = labels.iter().map(|l| l.id).collect();
+        let names: BTreeSet<String> = labels.iter().map(|l| l.name.0.to_lowercase()).collect();
+        if ids.len() != labels.len() || names.len() != labels.len() {
+            return Err(InvalidInput("já existe um rótulo com esse nome"));
+        }
+        Ok(Self(labels))
+    }
+}
+
+impl From<OwnLabels> for Vec<OwnLabel> {
+    fn from(labels: OwnLabels) -> Self {
+        labels.0
+    }
+}
+
+impl OwnLabels {
+    pub fn iter(&self) -> impl Iterator<Item = &OwnLabel> {
+        self.0.iter()
+    }
+
+    pub fn get(&self, id: LabelId) -> Option<&OwnLabel> {
+        self.0.iter().find(|l| l.id == id)
+    }
+
+    /// A copy with `label` added, checked like any set.
+    pub fn with(&self, label: OwnLabel) -> Result<Self, InvalidInput> {
+        self.0.iter().cloned().chain([label]).collect::<Vec<_>>().try_into()
+    }
+
+    pub fn without(&self, id: LabelId) -> Self {
+        Self(self.0.iter().filter(|l| l.id != id).cloned().collect())
+    }
+}
+
+/// What an object sensor reports on: a class, or an own label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ObjectKey {
+    Class(ObjectClass),
+    Own(LabelId),
+}
+
+/// What a taught box really is (origin: the taught label).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum BoxLabel {
+    /// Not what the detector said (origin `NONE_LABEL`): boxes like it are not counted.
+    NotThis,
+    Class(ObjectClass),
+    Own(LabelId),
+}
+
+/// A box drawn or tapped by the user, normalised to the frame, each side at least `MIN_BOX_SIDE`.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "[f32; 4]", into = "[f32; 4]")]
+pub struct NormBox([f32; 4]);
+
+impl TryFrom<[f32; 4]> for NormBox {
+    type Error = InvalidInput;
+    /// `[x1, y1, x2, y2]`, clamped to the frame (origin `TeachIn._valid_box`).
+    fn try_from(area: [f32; 4]) -> Result<Self, InvalidInput> {
+        if area.iter().any(|v| v.is_nan()) {
+            return Err(InvalidInput("caixa inválida"));
+        }
+        let [x1, y1, x2, y2] = area.map(|v| v.clamp(0.0, 1.0));
+        if x2 - x1 < MIN_BOX_SIDE || y2 - y1 < MIN_BOX_SIDE {
+            return Err(InvalidInput("caixa pequena demais"));
+        }
+        Ok(Self([x1, y1, x2, y2]))
+    }
+}
+
+impl From<NormBox> for [f32; 4] {
+    fn from(area: NormBox) -> Self {
+        area.0
+    }
+}
+
+impl NormBox {
+    /// The box between two corners, in any order.
+    pub fn between(a: NormPoint, b: NormPoint) -> Result<Self, InvalidInput> {
+        [a.x.min(b.x), a.y.min(b.y), a.x.max(b.x), a.y.max(b.y)].try_into()
+    }
+
+    pub fn area(self) -> [f32; 4] {
+        self.0
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -574,11 +834,14 @@ pub enum SensorValue {
     State(StateKey),
     /// Below the threshold (origin `UNKNOWN_STATE`).
     Unknown,
+    /// The objects present, each with its published count; what is absent is off.
+    Objects(Vec<(ObjectKey, u32)>),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum KindLive {
     States(StatesLive),
+    Objects(ObjectsLive),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
@@ -588,6 +851,115 @@ pub struct StatesLive {
     pub training: bool,
     pub samples: BTreeMap<StateKey, u32>,
     pub review_pending: u32,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct ObjectsLive {
+    /// The frame `found` belongs to. The preview shows it, so the boxes are drawn on their frame.
+    pub frame: Option<FrameId>,
+    pub found: Vec<Found>,
+    /// One per key the sensor reports, in `ObjectsSettings::keys` order.
+    pub tracks: Vec<TrackView>,
+    /// Taught boxes, and whether they are being compared yet.
+    pub taught: u32,
+    pub indexing: bool,
+    pub review_pending: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TrackView {
+    pub key: ObjectKey,
+    pub on: bool,
+    pub count: u32,
+    /// Best confidence in the last check.
+    pub score: f32,
+}
+
+/// One box of a check, normalised to the whole frame (origin: a detection dict).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Found {
+    /// The detector's class, or the class a taught box changed it to.
+    pub class: ObjectClass,
+    pub score: f32,
+    /// `[x1, y1, x2, y2]`.
+    pub area: [f32; 4],
+    pub verdict: Verdict,
+}
+
+impl Found {
+    pub fn own_label(&self) -> Option<LabelId> {
+        match self.verdict {
+            Verdict::Taught { label, .. } => label,
+            _ => None,
+        }
+    }
+
+    pub fn filtered(&self) -> bool {
+        matches!(self.verdict, Verdict::Filtered(_))
+    }
+
+    /// Whether the box counts for `key`; filtered boxes count for nothing (origin `counts_for`).
+    pub fn counts_for(&self, key: ObjectKey) -> bool {
+        !self.filtered()
+            && match key {
+                ObjectKey::Class(class) => self.class == class,
+                ObjectKey::Own(id) => self.own_label() == Some(id),
+            }
+    }
+
+    /// Whether the box may be the own label `key`, but not clearly (origin `unsure_for`).
+    pub fn unsure_for(&self, key: ObjectKey) -> bool {
+        matches!((self.verdict, key), (Verdict::Unsure { label, .. }, ObjectKey::Own(id)) if label == id)
+    }
+}
+
+/// What comparing a box with the taught boxes said (origin: `match`, `filtered`, `label`, `was`,
+/// `kept`, `rescued`, `ask`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub enum Verdict {
+    /// Not compared, or no clear answer: the detector's class stands.
+    Detector,
+    /// May be this own label, but not clearly: counted for neither, and asked about.
+    Unsure { label: LabelId, similarity: f32 },
+    /// Clearly a taught box that is not one of the sensor's objects: not counted.
+    Filtered(TaughtMatch),
+    /// Clearly a taught box: counted as `class`, and as `label` when it is an own label.
+    Taught { by: TaughtMatch, label: Option<LabelId>, was: Option<ObjectClass>, how: MatchHow },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaughtMatch {
+    pub sample: SampleId,
+    pub label: BoxLabel,
+    pub similarity: f32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MatchHow {
+    /// At least `match_similarity`.
+    Clear,
+    /// The same object at the same place as in the last check, still close to its answer.
+    Kept,
+    /// A box the detector was unsure about, very close to a taught box it had missed.
+    Rescued,
+}
+
+/// What changed at a check of an object sensor, kept with its history row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ObjectEvent {
+    On(ObjectKey),
+    Off(ObjectKey),
+    /// Boxes of this class started being filtered away by taught boxes.
+    Filtered(ObjectClass),
+}
+
+/// "Is this <label>?" about one box, in the review queue (origin `_record_question`).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct Question {
+    pub label: LabelId,
+    pub detected: ObjectClass,
+    pub area: [f32; 4],
+    pub similarity: f32,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -601,6 +973,10 @@ pub enum NoticeKind {
     FrameExpired,
     KindMismatch,
     UnknownItem,
+    /// A taught box whose bottom centre is outside the region would never count.
+    OutsideRegion,
+    /// The sensor has `MAX_TAUGHT` taught boxes already.
+    TaughtFull,
     Store(String),
 }
 
@@ -609,6 +985,8 @@ pub struct SystemStatus {
     pub retention: Retention,
     pub usage: StorageUsage,
     pub models: Vec<ModelStatus>,
+    /// The detector every object sensor uses.
+    pub detector: Detector,
     pub notice: Option<Notice>,
 }
 
@@ -714,9 +1092,17 @@ pub enum Detail {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SampleItem {
     pub id: SampleId,
-    pub label: Option<StateKey>,
+    /// `None`: a sample nobody labelled yet.
+    pub label: Option<SampleLabel>,
     pub thumb: ImageId,
     pub at: SystemTime,
+}
+
+/// A state sample's state, or what a taught box of an object sensor is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SampleLabel {
+    State(StateKey),
+    Box(BoxLabel),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -727,13 +1113,17 @@ pub struct HistoryItem {
     pub confidence: f32,
     pub review: Option<ReviewReason>,
     pub thumb: Option<ImageId>,
+    /// What changed at that check of an object sensor; empty for a state sensor.
+    pub events: Vec<ObjectEvent>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ReviewReason {
     LowConfidence,
     Flip,
     SpotCheck,
+    /// An object sensor asks whether a box is one of its own labels.
+    Ask(Question),
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -741,6 +1131,8 @@ pub struct OpenedItem {
     pub id: HistoryId,
     /// Whole frame as recorded; the region may have moved since.
     pub image: ImageId,
+    /// The boxes an object sensor found in that frame.
+    pub found: Vec<Found>,
 }
 
 /// Everything the UI can ask. Each variant is idempotent: sending it twice has the effect of
@@ -761,25 +1153,37 @@ pub enum UserCommand {
     Delete(SensorId),
     /// One full check now, paused or not.
     CheckNow(SensorId),
-    /// Teaching the same frame again relabels it.
+    /// Teaching the same frame again relabels it. State sensors only.
     Teach {
         id: SensorId,
         frame: FrameId,
         state: StateKey,
     },
-    /// `Some(state)` turns the item's frame into a sample; `None` dismisses it.
+    /// Object sensors only: what one box of a held frame really is. A new own label is added with
+    /// `Configure` first. `detected` is the detector's class for a tapped box, `None` for a box
+    /// the user drew around something it missed.
+    TeachBox {
+        id: SensorId,
+        frame: FrameId,
+        area: NormBox,
+        detected: Option<ObjectClass>,
+        label: BoxLabel,
+    },
+    /// Answers a review item. A state sensor's `Some(State)` turns the frame into a sample; an
+    /// object sensor's `Some(Box)` teaches the asked box as that label. `None` dismisses it.
     Resolve {
         id: SensorId,
         item: HistoryId,
-        state: Option<StateKey>,
+        label: Option<SampleLabel>,
     },
     /// `None` deletes the sample.
     Relabel {
         id: SensorId,
         sample: SampleId,
-        state: Option<StateKey>,
+        label: Option<SampleLabel>,
     },
     SetRetention(Retention),
+    SetDetector(Detector),
 }
 
 #[cfg(test)]
@@ -881,6 +1285,7 @@ mod tests {
             confidence: 0.5,
             review: None,
             thumb: thumb.map(ImageId),
+            events: Vec::new(),
         };
         let view = FocusView {
             sensor: SensorId(1),
@@ -890,8 +1295,39 @@ mod tests {
                 geometry: Geometry { width: 704, height: 480 },
             }),
             detail: Detail::History { rows: vec![item(1, Some(11)), item(2, None)], older: true },
-            opened: Some(OpenedItem { id: HistoryId(1), image: ImageId(12) }),
+            opened: Some(OpenedItem { id: HistoryId(1), image: ImageId(12), found: Vec::new() }),
         };
         assert_eq!(view.images(), [10, 11, 12].map(ImageId).into());
+    }
+
+    #[test]
+    fn object_settings_invariants() {
+        let class = |key: &str| ObjectClass::by_key(key).unwrap();
+        assert!(ClassSet::try_from(vec![]).is_err(), "at least one object");
+        assert!(ClassSet::try_from(vec![class("car"), class("car")]).is_err());
+        assert!(ClassSet::try_from(ObjectClass::all().take(OBJECT_MAX_CLASSES + 1).collect::<Vec<_>>()).is_err());
+        assert!(serde_json::from_str::<ClassSet>(r#"["car","unicorn"]"#).is_err());
+        assert!(serde_json::from_str::<MinSize>("0.51").is_err());
+        assert!(serde_json::from_str::<ClearAfter>("3601").is_err());
+        let label = |id: u64, name: &str, parent: &str| OwnLabel { id: LabelId(id), name: Name(name.into()), parent: class(parent) };
+        assert!(OwnLabels::try_from(vec![label(1, "Nosso carro", "car"), label(2, "nosso CARRO", "truck")]).is_err());
+        assert!(OwnLabels::try_from((0..=MAX_OWN_LABELS as u64).map(|i| label(i, &format!("L{i}"), "car")).collect::<Vec<_>>()).is_err());
+        assert!(NormBox::try_from([0.2, 0.2, 0.205, 0.5]).is_err(), "narrower than 1% of the frame");
+        assert_eq!(NormBox::between(p(0.9, 1.0), p(0.1, 0.3)).unwrap().area(), [0.1, 0.3, 0.9, 1.0]);
+    }
+
+    #[test]
+    fn object_keys_are_the_classes_then_the_labels_in_use() {
+        let class = |key: &str| ObjectClass::by_key(key).unwrap();
+        let mut settings = match Settings::new_objects(Name("Garagem".into()), vec![class("car")].try_into().unwrap()).kind {
+            KindSettings::Objects(objects) => objects,
+            KindSettings::States(_) => unreachable!(),
+        };
+        let ours = OwnLabel { id: LabelId(7), name: Name("Nosso carro".into()), parent: class("car") };
+        let rex = OwnLabel { id: LabelId(8), name: Name("Rex".into()), parent: class("dog") };
+        settings.labels = vec![ours, rex].try_into().unwrap();
+        assert_eq!(settings.keys(), [ObjectKey::Class(class("car")), ObjectKey::Own(LabelId(7))], "Rex's dog is not chosen");
+        assert_eq!(settings.key_name(ObjectKey::Own(LabelId(7))), "Nosso carro");
+        assert_eq!((f32::from(settings.threshold), u8::from(settings.debounce)), (0.60, 1), "origin defaults");
     }
 }

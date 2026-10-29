@@ -27,6 +27,12 @@ no dia a dia: abre direto nas câmeras que você escolheu, na ordem em que você
   HTTP, desenhe um retângulo ou polígono e ensine até nove estados com botões ou teclas 1–9. O valor aparece
   no painel e no tile da câmera. Amostras podem ser corrigidas; a revisão e o histórico guardam as checagens.
   Inferência e armazenamento rodam num processo separado. O modelo é baixado após o primeiro ensino.
+- **Sensores de Objetos.** Escolha entre os 80 objetos do conjunto COCO (pessoa, carro, gato…) e o sensor diz,
+  para cada um, se está presente e quantos há. Um objeto conta quando a base da caixa fica dentro da região. Ensine
+  um rótulo próprio, como "Nosso carro", tocando na caixa dele ou desenhando-a; uma caixa errada é corrigida com
+  um toque. Na dúvida entre o rótulo próprio e outro objeto da mesma classe, o sensor pergunta na revisão. O
+  detector D-FINE S é baixado na criação do primeiro sensor de Objetos; as variantes N, M e L ficam nas
+  configurações.
 
 ## Como funciona
 
@@ -64,9 +70,12 @@ cargo run --release
 Na primeira abertura, clique em **Entrar** e faça login com a sua conta Intelbras no navegador. Depois marque as
 câmeras no painel **Câmeras**.
 
-Em **Sensores**, escolha **Novo sensor de Estado**. A região nasce como o quadro inteiro. Na aba **Ao vivo**,
-arraste um retângulo ou clique nos pontos de um polígono, feche-o e salve a região. Ensine quadros diferentes
-para pelo menos dois estados. As configurações do painel controlam a retenção do histórico; amostras não expiram.
+Em **Sensores**, escolha **Novo sensor** e o tipo **Estado** ou **Objetos**. A região nasce como o quadro inteiro.
+Na aba **Ao vivo**, arraste um retângulo ou clique nos pontos de um polígono, feche-o e salve a região. Num sensor
+de Estado, ensine quadros diferentes para pelo menos dois estados. Num sensor de Objetos, a prévia mostra o último
+quadro checado com as caixas; em **Ensinar caixas**, toque numa caixa ou arraste em volta de algo que o detector não
+achou e diga o que ela é. As configurações do painel controlam a retenção do histórico e o detector; amostras e
+caixas ensinadas não expiram.
 Uma câmera usada só por sensores não precisa estar na grade. URL avulsa aparece apenas no painel.
 As [evidências de verificação dos sensores](docs/spec/sensors-ui-verification.md) registram o smoke e seus limites.
 
@@ -98,7 +107,7 @@ têm prioridade.
 - Gravação contínua e por evento.
 - Screenshots de uma câmera ou da grade.
 - Envio de gravações e screenshots para o Google Drive.
-- Sensores de Objetos e Pessoas.
+- Pessoas nomeadas pelo rosto nos sensores de Objetos.
 - Sensores de Leituras (placas, texto e valores).
 - Publicação MQTT dos valores dos sensores.
 - Modo servidor por linha de comando, sem interface.

@@ -124,7 +124,7 @@ fn settings() -> Settings {
 
 fn entry(reports: &[Report], id: SensorId) -> Option<&SensorEntry> {
     reports.iter().rev().find_map(|r| match r {
-        Report::Sensor(e) if e.id == id => Some(e),
+        Report::Sensor(e) if e.id == id => Some(&**e),
         _ => None,
     })
 }
@@ -172,7 +172,7 @@ fn a_sensor_created_over_the_wire_survives_a_restart() {
     vision.stop();
 
     let mut store = super::store::Store::open(&dir.join("data")).unwrap();
-    let jpeg = super::pixels::encode_jpeg(&egui::ColorImage::filled([2, 2], egui::Color32::BLACK), 90).unwrap();
+    let jpeg = super::pixels::encode_jpeg(&super::pixels::Rgb::from(&egui::ColorImage::filled([2, 2], egui::Color32::BLACK)), 90).unwrap();
     for index in 0u32..205 {
         let mut bytes = jpeg.clone();
         bytes.extend(index.to_le_bytes());

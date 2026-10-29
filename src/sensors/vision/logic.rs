@@ -2,12 +2,12 @@
 //! `engine/history.py`). No I/O, no clock (time comes in as arguments), no randomness (the roll
 //! comes in). Constants are copied from `settings.py`, with the origin's name beside each.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use crate::sensors::types::{
-    Debounce, Geometry, HistoryId, Interval, ModelState, Retention, ReviewReason, SensorStatus, SensorValue, StateKey,
-    Triggers, Unit,
+    ClassSet, Debounce, Found, Geometry, HistoryId, Interval, LabelId, MinSize, ModelState, ObjectClass, ObjectKey,
+    Region, RegionShape, Retention, ReviewReason, SensorStatus, SensorValue, StateKey, Triggers, Unit, Verdict,
 };
 
 pub const BURST_INTERVAL: Duration = Duration::from_secs(2); // TRIGGER_DEFAULTS["burst_interval_s"]
@@ -16,6 +16,10 @@ pub const CHANGE_INTERVAL: Duration = Duration::from_secs(2); // TRIGGER_DEFAULT
 pub const CHANGE_THRESHOLD: f32 = 0.04; // TRIGGER_DEFAULTS["change_threshold"]
 pub const SIGNATURE_SIZE: usize = 48; // CHANGE_SIGNATURE_SIZE
 pub const NEUTRAL_FILL: [u8; 3] = [124, 116, 104]; // NEUTRAL_FILL
+pub const CONTEXT_MARGIN: f32 = 0.25; // DETECTION["context_margin"]
+pub const CLEAR_MISSES: u32 = 2; // DETECTION["clear_misses"]
+pub const RECHECK: Duration = Duration::from_secs(5); // DETECTION["recheck_s"]
+pub const FILTERED_RECORD_COOLDOWN: Duration = Duration::from_secs(600); // TEACH["filtered_record_cooldown_s"]
 
 /// Review queue rules. Global for now: no per-sensor overrides.
 #[derive(Clone, Copy, Debug)]
@@ -299,6 +303,182 @@ pub fn retention_plan(rows_oldest_first: &[RowCost], policy: Retention) -> Vec<H
     doomed.into_iter().map(|r| r.id).collect()
 }
 
+/// The region's bounding box grown by `margin` × its size on each side, clamped to the frame, as
+/// `[x1, y1, x2, y2]` (`imaging.region_box`).
+pub fn region_box(region: &Region, margin: f32) -> [f32; 4] {
+    let (min, max) = region.bounds();
+    let (dx, dy) = ((max.x() - min.x()) * margin, (max.y() - min.y()) * margin);
+    [(min.x() - dx).max(0.0), (min.y() - dy).max(0.0), (max.x() + dx).min(1.0), (max.y() + dy).min(1.0)]
+}
+
+/// Whether a normalised point lies inside the region; ray casting for a polygon
+/// (`imaging.in_region`).
+pub fn in_region(x: f32, y: f32, region: &Region) -> bool {
+    match region.shape() {
+        RegionShape::Whole => true,
+        RegionShape::Rect { min, max } => (min.x()..=max.x()).contains(&x) && (min.y()..=max.y()).contains(&y),
+        RegionShape::Polygon(points) => {
+            let mut inside = false;
+            for (a, b) in points.iter().zip(points.iter().cycle().skip(points.len() - 1)) {
+                let (xi, yi, xj, yj) = (a.x(), a.y(), b.x(), b.y());
+                if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+                    inside = !inside;
+                }
+            }
+            inside
+        }
+    }
+}
+
+/// One box as the detector gives it, normalised to the image it was shown (origin `Detection`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Detection {
+    pub class: ObjectClass,
+    pub score: f32,
+    pub area: [f32; 4],
+}
+
+/// What decides which boxes count, from the sensor's settings.
+pub struct ObjectFilter<'a> {
+    pub region: &'a Region,
+    pub classes: &'a ClassSet,
+    pub min_size: MinSize,
+}
+
+/// Maps boxes from the `analysed` part of the frame to the whole frame and keeps those that count:
+/// the bottom centre (where a person or car stands) inside the region, at least `min_size` of the
+/// region's area, and of a chosen class unless `all_classes` (origin `filter_detections`).
+pub fn filter_detections(found: &[Detection], analysed: [f32; 4], filter: &ObjectFilter<'_>, all_classes: bool) -> Vec<Found> {
+    let [x1, y1, x2, y2] = analysed;
+    let (aw, ah) = (x2 - x1, y2 - y1);
+    let [rx1, ry1, rx2, ry2] = region_box(filter.region, 0.0);
+    let least = f32::from(filter.min_size) * (rx2 - rx1) * (ry2 - ry1);
+    found
+        .iter()
+        .filter(|d| all_classes || filter.classes.contains(d.class))
+        .filter_map(|d| {
+            let [bx1, by1, bx2, by2] = d.area;
+            let area = [x1 + bx1 * aw, y1 + by1 * ah, x1 + bx2 * aw, y1 + by2 * ah];
+            let big_enough = (area[2] - area[0]) * (area[3] - area[1]) >= least;
+            (big_enough && in_region((area[0] + area[2]) / 2.0, area[3], filter.region))
+                .then_some(Found { class: d.class, score: d.score, area, verdict: Verdict::Detector })
+        })
+        .collect()
+}
+
+/// The published state of one class or own label of an object sensor (origin `ObjectTrack`).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ObjectTrack {
+    pub on: bool,
+    /// Kept while on, until the object has cleared.
+    pub count: u32,
+    /// Best confidence in the last check.
+    pub score: f32,
+    /// Checks in a row with it present.
+    streak: u32,
+    /// Checks in a row without it.
+    misses: u32,
+    last_seen: Option<Instant>,
+}
+
+/// Advances every key after one check; returns the keys that switched on or off (origin
+/// `update_tracks`). On after `required` checks in a row with it present; off once it was missing
+/// `CLEAR_MISSES` checks in a row and for `clear_after`. A box that may be an own label counts
+/// neither way for that label. Tracks of keys no longer reported are dropped.
+pub fn update_tracks(
+    tracks: &mut BTreeMap<ObjectKey, ObjectTrack>,
+    found: &[Found],
+    keys: &[ObjectKey],
+    required: Debounce,
+    clear_after: Duration,
+    now: Instant,
+) -> Vec<ObjectKey> {
+    let mut changed = Vec::new();
+    for key in keys {
+        let track = tracks.entry(*key).or_default();
+        let present: Vec<&Found> = found.iter().filter(|f| f.counts_for(*key)).collect();
+        track.score = present.iter().map(|f| f.score).fold(0.0, f32::max);
+        if !present.is_empty() {
+            track.streak += 1;
+            track.misses = 0;
+            track.last_seen = Some(now);
+            if track.on || track.streak >= u32::from(u8::from(required)) {
+                if !track.on {
+                    changed.push(*key);
+                }
+                track.on = true;
+                track.count = present.len() as u32;
+            }
+        } else if found.iter().any(|f| f.unsure_for(*key)) {
+            track.streak = 0;
+        } else {
+            track.streak = 0;
+            track.misses += 1;
+            let long_gone = track.last_seen.is_none_or(|seen| now.duration_since(seen) >= clear_after);
+            if track.on && long_gone && track.misses >= CLEAR_MISSES {
+                track.on = false;
+                track.count = 0;
+                changed.push(*key);
+            }
+        }
+    }
+    tracks.retain(|key, _| keys.contains(key));
+    changed
+}
+
+/// Something that was there is missing: look again soon instead of at the next interval.
+pub fn recheck_at(tracks: &BTreeMap<ObjectKey, ObjectTrack>, now: Instant) -> Option<Instant> {
+    tracks.values().any(|t| t.on && (1..CLEAR_MISSES).contains(&t.misses)).then_some(now + RECHECK)
+}
+
+/// The published value: what is on, with its count.
+pub fn present(tracks: &BTreeMap<ObjectKey, ObjectTrack>, keys: &[ObjectKey]) -> SensorValue {
+    SensorValue::Objects(keys.iter().filter_map(|k| tracks.get(k).filter(|t| t.on).map(|t| (*k, t.count))).collect())
+}
+
+/// The own labels to ask about now, each with its most similar unsure box (origin
+/// `_ask_unsure`): one question per label per review cooldown, none while review is off.
+pub fn questions<'a>(
+    rules: &ReviewRules,
+    found: &'a [Found],
+    asked: &BTreeMap<LabelId, Instant>,
+    now: Instant,
+) -> Vec<(LabelId, &'a Found)> {
+    if !rules.enabled {
+        return Vec::new();
+    }
+    let mut best: BTreeMap<LabelId, (f32, &Found)> = BTreeMap::new();
+    for f in found {
+        if let Verdict::Unsure { label, similarity } = f.verdict
+            && best.get(&label).is_none_or(|(s, _)| similarity > *s)
+        {
+            best.insert(label, (similarity, f));
+        }
+    }
+    best.into_iter()
+        .filter(|(label, _)| asked.get(label).is_none_or(|at| now.duration_since(*at) >= rules.cooldown))
+        .map(|(label, (_, f))| (label, f))
+        .collect()
+}
+
+/// The classes filtered away in this check, and those of them to keep in the history: a class
+/// that starts being filtered, unless it was kept within `FILTERED_RECORD_COOLDOWN` (origin
+/// `_record_filtered`).
+pub fn filtered_classes(
+    found: &[Found],
+    before: &BTreeSet<ObjectClass>,
+    logged: &BTreeMap<ObjectClass, Instant>,
+    now: Instant,
+) -> (BTreeSet<ObjectClass>, Vec<ObjectClass>) {
+    let now_filtered: BTreeSet<ObjectClass> = found.iter().filter(|f| f.filtered()).map(|f| f.class).collect();
+    let record = now_filtered
+        .difference(before)
+        .filter(|c| logged.get(c).is_none_or(|at| now.duration_since(*at) >= FILTERED_RECORD_COOLDOWN))
+        .copied()
+        .collect();
+    (now_filtered, record)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +725,191 @@ mod tests {
         assert_eq!(retention_plan(&rows, Retention { max_bytes: 10, ..policy }), [2, 3].map(HistoryId));
         assert_eq!(retention_plan(&rows, Retention { max_bytes: 5, ..policy }), [2, 3, 1].map(HistoryId));
         assert!(retention_plan(&rows, Retention { max_bytes: 16, ..policy }).is_empty());
+    }
+
+    fn class(name: &str) -> ObjectClass {
+        ObjectClass::by_key(name).unwrap()
+    }
+
+    fn point(x: f32, y: f32) -> crate::sensors::types::NormPoint {
+        crate::sensors::types::NormPoint::new(x, y).unwrap()
+    }
+
+    fn classes(keys: &[&str]) -> ClassSet {
+        keys.iter().map(|k| class(k)).collect::<Vec<_>>().try_into().unwrap()
+    }
+
+    fn detection(key: &str, area: [f32; 4]) -> Detection {
+        Detection { class: class(key), score: 0.9, area }
+    }
+
+    fn close(got: [f32; 4], want: [f32; 4]) -> bool {
+        got.iter().zip(want).all(|(g, w)| (g - w).abs() < 1e-5)
+    }
+
+    #[test]
+    fn filter_maps_boxes_from_the_analysed_crop_to_the_frame() {
+        let region = Region::rect(point(0.5, 0.5), point(1.0, 1.0)).unwrap();
+        let analysed = region_box(&region, CONTEXT_MARGIN);
+        assert!(close(analysed, [0.375, 0.375, 1.0, 1.0]), "grown by 0.125 on each side, clamped: {analysed:?}");
+        let person = classes(&["person"]);
+        let filter = ObjectFilter { region: &region, classes: &person, min_size: 0.0.try_into().unwrap() };
+        let found = filter_detections(&[detection("person", [0.2, 0.2, 0.6, 1.0])], analysed, &filter, false);
+        assert_eq!(found.len(), 1);
+        assert!(close(found[0].area, [0.5, 0.5, 0.75, 1.0]), "{:?}", found[0].area);
+    }
+
+    #[test]
+    fn filter_ignores_objects_standing_in_the_margin() {
+        let region = Region::rect(point(0.4, 0.0), point(0.6, 1.0)).unwrap();
+        let analysed = region_box(&region, CONTEXT_MARGIN);
+        let dog = classes(&["dog"]);
+        let filter = ObjectFilter { region: &region, classes: &dog, min_size: 0.0.try_into().unwrap() };
+        let beside = detection("dog", [0.8, 0.5, 1.0, 0.9]);
+        assert!(filter_detections(&[beside], analysed, &filter, false).is_empty(), "feet at x = 0.62: in the margin only");
+    }
+
+    #[test]
+    fn filter_uses_the_bottom_centre_the_class_and_the_size() {
+        let triangle = Region::polygon(vec![point(0.0, 0.0), point(0.0, 1.0), point(1.0, 1.0)]).unwrap();
+        let inside = detection("person", [0.05, 0.3, 0.25, 0.9]);
+        let head_in_feet_out = detection("person", [0.6, 0.65, 0.8, 0.7]);
+        let tiny = detection("person", [0.1, 0.94, 0.12, 0.96]);
+        let dog = detection("dog", [0.05, 0.3, 0.25, 0.9]);
+        let person = classes(&["person"]);
+        let filter = ObjectFilter { region: &triangle, classes: &person, min_size: 0.01.try_into().unwrap() };
+        let whole = [0.0, 0.0, 1.0, 1.0];
+        let kept = filter_detections(&[inside, head_in_feet_out, tiny, dog], whole, &filter, false);
+        assert_eq!(kept.iter().map(|f| f.area[0]).collect::<Vec<_>>(), [0.05]);
+        assert_eq!(filter_detections(&[inside, dog], whole, &filter, true).len(), 2, "every class when rescuing");
+    }
+
+    #[test]
+    fn in_region_of_a_polygon() {
+        let region = Region::polygon(vec![point(0.1, 0.1), point(0.9, 0.1), point(0.5, 0.9)]).unwrap();
+        assert!(in_region(0.5, 0.3, &region));
+        assert!(!in_region(0.15, 0.8, &region));
+        assert!(in_region(0.99, 0.99, &Region::WHOLE));
+    }
+
+    fn seen(n: usize, key: &str) -> Vec<Found> {
+        vec![Found { class: class(key), score: 0.9, area: [0.0, 0.0, 0.1, 0.1], verdict: Verdict::Detector }; n]
+    }
+
+    fn keys(names: &[&str]) -> Vec<ObjectKey> {
+        names.iter().map(|k| ObjectKey::Class(class(k))).collect()
+    }
+
+    #[test]
+    fn tracks_switch_on_after_required_checks_and_hold_until_cleared() {
+        let t = Clock(Instant::now());
+        let mut tracks = BTreeMap::new();
+        let both = keys(&["person", "car"]);
+        let person = ObjectKey::Class(class("person"));
+        let mut update = |found: Vec<Found>, at: u64| update_tracks(&mut tracks, &found, &both, debounce(2), Duration::from_secs(30), t.at(at));
+        assert!(update(seen(2, "person"), 0).is_empty());
+        assert_eq!(update(seen(2, "person"), 5), [person]);
+        assert!(update(vec![], 20).is_empty(), "gone for less than clear_after");
+        update(seen(1, "person"), 25);
+        assert!(update(vec![], 50).is_empty());
+        assert_eq!(update(vec![], 56), [person], "gone long enough and missed twice");
+        assert_eq!((tracks[&person].on, tracks[&person].count), (false, 0));
+    }
+
+    #[test]
+    fn the_count_is_published_while_on() {
+        let t = Clock(Instant::now());
+        let mut tracks = BTreeMap::new();
+        let person = keys(&["person"]);
+        update_tracks(&mut tracks, &seen(2, "person"), &person, debounce(1), Duration::from_secs(30), t.at(0));
+        assert_eq!(present(&tracks, &person), SensorValue::Objects(vec![(person[0], 2)]));
+        update_tracks(&mut tracks, &seen(3, "person"), &person, debounce(1), Duration::from_secs(30), t.at(1));
+        assert_eq!(present(&tracks, &person), SensorValue::Objects(vec![(person[0], 3)]));
+        update_tracks(&mut tracks, &[], &person, debounce(1), Duration::from_secs(30), t.at(2));
+        assert_eq!(present(&tracks, &person), SensorValue::Objects(vec![(person[0], 3)]), "the last count holds until it clears");
+    }
+
+    #[test]
+    fn one_missed_check_does_not_switch_an_object_off_and_is_looked_at_again_soon() {
+        let t = Clock(Instant::now());
+        let mut tracks = BTreeMap::new();
+        let person = keys(&["person"]);
+        update_tracks(&mut tracks, &seen(1, "person"), &person, debounce(1), Duration::from_secs(30), t.at(0));
+        assert_eq!(recheck_at(&tracks, t.at(0)), None);
+        assert!(update_tracks(&mut tracks, &[], &person, debounce(1), Duration::from_secs(30), t.at(60)).is_empty(), "long gone, but missed once");
+        assert!(tracks[&person[0]].on);
+        assert_eq!(recheck_at(&tracks, t.at(60)), Some(t.at(60) + RECHECK));
+        assert_eq!(update_tracks(&mut tracks, &[], &person, debounce(1), Duration::from_secs(30), t.at(65)), person, "confirmed");
+        assert_eq!(recheck_at(&tracks, t.at(65)), None, "off: nothing to look for");
+    }
+
+    #[test]
+    fn an_unsure_box_keeps_an_own_label_as_it_was() {
+        let t = Clock(Instant::now());
+        let ours = LabelId(7);
+        let keys = [ObjectKey::Class(class("car")), ObjectKey::Own(ours)];
+        let car = seen(1, "car")[0];
+        let by = crate::sensors::types::TaughtMatch { sample: crate::sensors::types::SampleId(1), label: crate::sensors::types::BoxLabel::Own(ours), similarity: 0.95 };
+        let mine = [Found { verdict: Verdict::Taught { by, label: Some(ours), was: None, how: crate::sensors::types::MatchHow::Clear }, ..car }];
+        let unsure = [Found { verdict: Verdict::Unsure { label: ours, similarity: 0.8 }, ..car }];
+        let mut tracks = BTreeMap::new();
+        update_tracks(&mut tracks, &mine, &keys, debounce(1), Duration::ZERO, t.at(0));
+        for at in [10, 20, 30] {
+            assert!(update_tracks(&mut tracks, &unsure, &keys, debounce(1), Duration::ZERO, t.at(at)).is_empty());
+        }
+        assert!(tracks[&keys[1]].on && tracks[&keys[1]].misses == 0);
+        let mut fresh = BTreeMap::new();
+        update_tracks(&mut fresh, &unsure, &keys, debounce(1), Duration::ZERO, t.at(0));
+        assert!(!fresh[&keys[1]].on && fresh[&keys[0]].on, "a car, but not yet ours");
+    }
+
+    #[test]
+    fn tracks_skip_filtered_boxes_count_own_labels_and_forget_deselected_keys() {
+        let t = Clock(Instant::now());
+        let ours = LabelId(7);
+        let car = seen(1, "car")[0];
+        let by = crate::sensors::types::TaughtMatch { sample: crate::sensors::types::SampleId(1), label: crate::sensors::types::BoxLabel::NotThis, similarity: 0.95 };
+        let found = [
+            Found { verdict: Verdict::Filtered(by), ..seen(1, "person")[0] },
+            Found { verdict: Verdict::Taught { by, label: Some(ours), was: None, how: crate::sensors::types::MatchHow::Clear }, ..car },
+            car,
+        ];
+        let all = [ObjectKey::Class(class("person")), ObjectKey::Class(class("car")), ObjectKey::Own(ours)];
+        let mut tracks = BTreeMap::new();
+        update_tracks(&mut tracks, &found, &all, debounce(1), Duration::ZERO, t.at(1));
+        assert!(!tracks[&all[0]].on);
+        assert_eq!((tracks[&all[1]].count, tracks[&all[2]].count), (2, 1));
+        update_tracks(&mut tracks, &[], &all[1..2], debounce(1), Duration::ZERO, t.at(2));
+        assert_eq!(tracks.keys().copied().collect::<Vec<_>>(), [all[1]]);
+    }
+
+    #[test]
+    fn questions_come_once_per_label_per_cooldown() {
+        let t = Clock(Instant::now());
+        let ours = LabelId(7);
+        let car = seen(1, "car")[0];
+        let found = [Found { verdict: Verdict::Unsure { label: ours, similarity: 0.78 }, ..car }, Found { verdict: Verdict::Unsure { label: ours, similarity: 0.8 }, score: 0.5, ..car }];
+        let asked = questions(&REVIEW, &found, &BTreeMap::new(), t.at(0));
+        assert_eq!(asked.len(), 1);
+        assert_eq!(asked[0].1.score, 0.5, "the most similar box is asked about");
+        let before = BTreeMap::from([(ours, t.at(0))]);
+        assert!(questions(&REVIEW, &found, &before, t.at(299)).is_empty(), "within the review cooldown");
+        assert_eq!(questions(&REVIEW, &found, &before, t.at(300)).len(), 1);
+        assert!(questions(&ReviewRules { enabled: false, ..REVIEW }, &found, &BTreeMap::new(), t.at(0)).is_empty());
+    }
+
+    #[test]
+    fn a_class_filtered_again_soon_is_not_kept_twice() {
+        let t = Clock(Instant::now());
+        let by = crate::sensors::types::TaughtMatch { sample: crate::sensors::types::SampleId(1), label: crate::sensors::types::BoxLabel::NotThis, similarity: 0.95 };
+        let statue = [Found { verdict: Verdict::Filtered(by), ..seen(1, "person")[0] }];
+        let person = class("person");
+        let (now, record) = filtered_classes(&statue, &BTreeSet::new(), &BTreeMap::new(), t.at(0));
+        assert_eq!((now.clone(), record), (BTreeSet::from([person]), vec![person]));
+        let (_, again) = filtered_classes(&statue, &now, &BTreeMap::from([(person, t.at(0))]), t.at(10));
+        assert!(again.is_empty(), "still filtered: not a new start");
+        let logged = BTreeMap::from([(person, t.at(0))]);
+        assert!(filtered_classes(&statue, &BTreeSet::new(), &logged, t.at(599)).1.is_empty(), "within the cooldown");
+        assert_eq!(filtered_classes(&statue, &BTreeSet::new(), &logged, t.at(600)).1, [person]);
     }
 }

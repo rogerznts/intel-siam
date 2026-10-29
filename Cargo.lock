@@ -1742,6 +1742,7 @@ dependencies = [
  "libc",
  "open",
  "ort",
+ "percent-encoding",
  "rusqlite",
  "serde",
  "serde_json",

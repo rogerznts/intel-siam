@@ -130,3 +130,53 @@ As capturas de regiões, atalhos e retenção foram recortadas para excluir a gr
 Não foi encontrado defeito do aplicativo nos caminhos exercitados.
 Build, testes e clippy não foram repetidos, pois esta rodada alterou somente o relatório e as evidências.
 As aprovações da primeira seção pertencem à rodada anterior, não validam alterações concorrentes posteriores.
+
+# Verificação dos sensores de Objetos
+
+## Compilação e testes
+
+`cargo build --all-targets --release`, `cargo test` (138 testes aprovados) e `cargo clippy --all-targets`
+terminaram sem avisos. Os testes novos cobrem o parse da saída do D-FINE (sigmoide, centro/tamanho para cantos, NMS
+por classe, forma errada recusada), os filtros (margem de contexto, base da caixa na região, tamanho mínimo,
+classe), as trilhas (liga após `debounce`, só desliga após duas faltas e `clear_after`, contagem publicada,
+recheck após uma falta), o rótulo próprio (acerta, filtra, mantém o objeto parado, pergunta, resgata caixa
+incerta), e no engine o fluxo de ensinar, indexar, perguntar, responder e esquecer o rótulo.
+
+## Smoke do processo de visão com modelo real
+
+Um driver Python falou o protocolo real com `target/release/intel-siam-vision`, com dados em `/tmp`, e serviu por
+HTTP o `driveway.jpg` da origem e o `cat.jpg` redimensionado para 640×421, o mesmo tamanho. Saída da última rodada:
+
+```text
+[   5.8s] D-FINE S file 41535197 bytes, sha256 cd8a49a945feda6d28c6304ae8ae85c2759ba1d78a5a83a22c5ce8db82ef7238 matches
+[   8.6s] driveway counts {'person': 1, 'car': 4}
+[  38.7s] cat counts {'cat': 1}
+[  41.7s] teaching [7.288158e-05, 0.123342015, 0.16987748, 0.34896597] score 0.941 as Nosso carro on frame 33
+[  45.1s] Sensor status=Live value=[person=1, car=4, cat=1, Nosso carro=1] taught=1 indexing=False review=1 found: car:0.94:Taught(label=4242, sim=0.992, how=Clear) car:0.93:Unsure(sim=0.862) person:0.84:Detector car:0.83:Detector car:0.65:Detector
+[  48.2s] review item 6 {"Ask": {"label": 4242, "detected": "car", ...}}
+[  49.6s] after the corrections car:0.94:Taught(label=4242, sim=0.992, how=Clear) car:0.93:Detector person:0.84:Filtered car:0.83:Detector car:0.65:Detector
+[  79.6s] value without the person {'car': 4, 'Nosso carro': 1}
+[  79.7s] history 7 [{"Filtered": "person"}]
+[  79.7s] history 5 [{"On": {"Own": 4242}}]
+[  79.7s] exit code 0
+```
+
+O D-FINE S foi baixado de verdade e conferido por SHA-256. A garagem deu 4 carros e 1 pessoa (o teste da origem
+pede pelo menos 3 carros e 1 pessoa). Com o gato, carros e pessoa saíram depois de `clear_after` (30 s). O carro
+ensinado como **Nosso carro** voltou com similaridade 0,992. O segundo carro ficou a 0,862 e virou a pergunta "É
+Nosso carro?". A resposta "é outro carro" o deixou como carro comum. Um toque marcando a "pessoa" como **Não é
+isso** a filtrou na checagem seguinte, e o histórico registrou cada evento. A primeira rodada achou o defeito do
+ambiente ONNX duplicado, corrigido antes desta.
+
+## Smoke na interface real: não feito
+
+O app subiu com `.env` e o executável release, mas a janela não pôde ser observada nem operada. O
+`orca computer get-app-state` falhou com `permission_denied` ("AX reads stayed blocked"), mesmo com as permissões de
+acessibilidade e captura concedidas. O `screencapture` da janela saiu em branco, embora o `sample` do processo
+mostrasse o laço do egui pintando texturas. A suspeita é a janela num Space que não está à mostra. Movê-la pediria
+acessibilidade ou alterar o estado salvo da janela do usuário. Não há capturas da interface de Objetos nesta rodada.
+O painel (criar com escolha de classes, prévia com caixas, ensinar tocando ou desenhando, revisão, histórico, selo
+com contagem) compila e foi exercitado só pelo protocolo acima.
+
+Nenhum sensor do usuário foi criado ou removido. O banco do usuário foi migrado para a versão 2 ao abrir o app,
+sem sensores. Os dados do smoke ficaram só em `/tmp/smoke-objects`.

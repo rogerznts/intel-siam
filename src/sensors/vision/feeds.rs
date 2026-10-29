@@ -273,7 +273,7 @@ mod tests {
     use tiny_http::{Response, Server};
 
     fn jpeg() -> Vec<u8> {
-        pixels::encode_jpeg(&ColorImage::filled([2, 2], egui::Color32::BLACK), 90).unwrap()
+        pixels::encode_jpeg(&pixels::Rgb::from(&ColorImage::filled([2, 2], egui::Color32::BLACK)), 90).unwrap()
     }
 
     #[test]

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use crate::frames::StreamKind;
 use crate::model::{CameraId, ChannelIndex, DvrSerial};
-use crate::sensors::types::{Name, StateDef};
+use crate::sensors::types::{Name, NormPoint, OwnLabel, Region, StateDef};
 
 struct Fixture { dir: PathBuf }
 impl Fixture {
@@ -12,7 +12,7 @@ impl Fixture {
         Self { dir }
     }
     fn store(&self) -> Store { Store::open(&self.dir).unwrap() }
-    fn engine(&self) -> (Engine, Receiver<Out>, Receiver<Job>, Receiver<()>) {
+    fn engine(&self) -> (Engine, Receiver<Out>, Receiver<Job>, Receiver<Model>) {
         let feeds = Feeds::new("/nonexistent/ffmpeg".into(), self.dir.join("logs"), Arc::new(|| {}));
         let (infer, jobs, fetch) = super::super::infer::test_channels();
         let (out, rx) = mpsc::channel();
@@ -40,7 +40,7 @@ fn regression_restart_resumes_training_from_persisted_samples() {
     let now = Instant::now();
     engine.tick(now);
     assert!(fetch.try_recv().is_ok(), "restart must request the backbone without another teach");
-    engine.handle(Input::Model(ModelEvent::Ready));
+    engine.handle(Input::Model(ModelEvent { model: Model::Backbone, state: ModelState::Ready }));
     engine.tick(now + RETRAIN_DELAY);
     let Job::Train { rows, .. } = jobs.try_recv().expect("pending training resumes") else { panic!("expected training") };
     assert_eq!(rows.len(), 2);
@@ -66,7 +66,7 @@ fn regression_stalled_preview_never_returns_an_expired_deadline() {
 
 fn seed_many_samples(f: &Fixture, count: i64) {
     f.store().create(&record()).unwrap();
-    let image = pixels::encode_jpeg(&ColorImage::filled([2, 2], egui::Color32::BLACK), 90).unwrap();
+    let image = pixels::encode_jpeg(&Rgb::from(&ColorImage::filled([2, 2], egui::Color32::BLACK)), 90).unwrap();
     let dir = f.dir.join("img/s/0000000000000001");
     fs::create_dir_all(&dir).unwrap();
     let mut conn = rusqlite::Connection::open(f.dir.join("sensors.db")).unwrap();
@@ -116,7 +116,7 @@ fn regression_restart_rebuilds_old_head_after_labels_region_or_deletion_change()
         let head = super::super::infer::fit(&[vec![1.0, 0.0], vec![0.0, 1.0]], &[1.try_into().unwrap(), 2.try_into().unwrap()]).unwrap();
         store.put_training(rec.id, BACKBONE.id, rec.settings.region.hash(), Some(&head), &[]).unwrap();
         match change {
-            "labels" => { store.relabel(rec.id, a, Some(2.try_into().unwrap())).unwrap(); }
+            "labels" => { store.relabel(rec.id, a, Some(SampleLabel::State(2.try_into().unwrap()))).unwrap(); }
             "region" => {
                 rec.settings.region = crate::sensors::types::Region::rect(
                     crate::sensors::types::NormPoint::new(0.1, 0.1).unwrap(),
@@ -135,7 +135,7 @@ fn regression_restart_rebuilds_old_head_after_labels_region_or_deletion_change()
         let now = Instant::now();
         engine.tick(now);
         assert!(fetch.try_recv().is_ok());
-        engine.handle(Input::Model(ModelEvent::Ready));
+        engine.handle(Input::Model(ModelEvent { model: Model::Backbone, state: ModelState::Ready }));
         engine.tick(now + RETRAIN_DELAY);
         let Job::Train { rows, region, .. } = jobs.try_recv().expect("rebuild the head") else { panic!("expected training") };
         assert_eq!(region, rec.settings.region);
@@ -170,4 +170,128 @@ fn regression_unreadable_sample_page_keeps_a_cursor_to_older_samples() {
     let view = engine.focus_view(&BTreeSet::new(), &mut Vec::new()).unwrap();
     let Detail::Samples { rows, .. } = view.detail else { panic!("expected samples") };
     assert_eq!(rows.len(), 100);
+}
+
+const CARS: SensorId = SensorId(2);
+
+fn car() -> ObjectClass {
+    ObjectClass::by_key("car").unwrap()
+}
+
+fn objects_record() -> SensorRecord {
+    SensorRecord {
+        id: CARS, source: SourceSpec::Dvr(CameraId { dvr: DvrSerial::new("CAM"), channel: ChannelIndex::new(1) }),
+        stream: StreamKind::Sub, settings: Settings::new_objects("Garagem".to_owned().try_into().unwrap(), vec![car()].try_into().unwrap()), geometry: None,
+    }
+}
+
+/// A frame on the sensor's feed. A DVR feed without a URL is not reconciled into a decoder, so
+/// the engine is told its feeds are current.
+fn seed(engine: &mut Engine, now: Instant, seq: u64) {
+    let feed = engine.sensors[&CARS].feed();
+    let image = ColorImage::new([64, 48], (0..64 * 48).map(|i| egui::Color32::from_gray((i % 251) as u8)).collect());
+    engine.feeds.seed_frame(feed, super::super::feeds::Frame { image: Arc::new(image), at: now, geometry: None, seq });
+    engine.feeds_dirty = false;
+}
+
+fn box_at(area: [f32; 4], verdict: Verdict) -> Found {
+    Found { class: car(), score: 0.9, area, verdict }
+}
+
+/// One check of the object sensor, forced: returns its request.
+fn checked(engine: &mut Engine, jobs: &Receiver<Job>, now: Instant) -> DetectRequest {
+    engine.sensors.get_mut(&CARS).unwrap().schedule.force = true;
+    engine.tick(now);
+    match jobs.try_recv().expect("a check of the object sensor") {
+        Job::Detect { request, .. } => request,
+        _ => panic!("expected a detection"),
+    }
+}
+
+fn sent_value(engine: &Engine) -> Option<SensorValue> {
+    engine.sensors[&CARS].sent.as_ref().and_then(|e| e.value.clone())
+}
+
+#[test]
+fn an_object_sensor_needs_only_the_detector_and_counts_what_it_finds() {
+    let f = Fixture::new();
+    f.store().create(&objects_record()).unwrap();
+    let (mut engine, _, jobs, fetch) = f.engine();
+    let now = Instant::now();
+    seed(&mut engine, now, 1);
+    engine.tick(now);
+    assert_eq!(fetch.try_iter().collect::<Vec<_>>(), [Model::Detector(Detector::DfineS)], "no backbone without taught boxes");
+    assert!(jobs.try_recv().is_err(), "no check before the detector is ready");
+    engine.handle(Input::Model(ModelEvent { model: Model::Detector(Detector::DfineS), state: ModelState::Ready }));
+    let request = checked(&mut engine, &jobs, now);
+    assert!(request.taught.is_none());
+    let two = vec![box_at([0.1, 0.5, 0.3, 0.9], Verdict::Detector), box_at([0.5, 0.5, 0.7, 0.9], Verdict::Detector)];
+    engine.handle(Input::Infer(Done::Detected { sensor: CARS, found: Ok(two) }));
+    engine.tick(now);
+    let cars = ObjectKey::Class(car());
+    assert_eq!(sent_value(&engine), Some(SensorValue::Objects(vec![(cars, 2)])));
+    let (rows, _) = engine.store.history(CARS, None, 10).unwrap();
+    assert_eq!(rows.iter().map(|r| r.events.clone()).collect::<Vec<_>>(), [vec![ObjectEvent::On(cars)]]);
+    checked(&mut engine, &jobs, now + Duration::from_secs(1));
+    engine.handle(Input::Infer(Done::Detected { sensor: CARS, found: Ok(Vec::new()) }));
+    assert!(engine.sensors[&CARS].schedule.recheck_at.is_some(), "missing once: looked for again soon");
+    engine.tick(now + Duration::from_secs(1));
+    assert_eq!(sent_value(&engine), Some(SensorValue::Objects(vec![(cars, 2)])), "one missed check keeps it");
+}
+
+#[test]
+fn a_taught_own_label_is_indexed_compared_and_asked_about() {
+    let f = Fixture::new();
+    f.store().create(&objects_record()).unwrap();
+    let (mut engine, _, jobs, fetch) = f.engine();
+    let now = Instant::now();
+    seed(&mut engine, now, 1);
+    engine.handle(Input::Model(ModelEvent { model: Model::Detector(Detector::DfineS), state: ModelState::Ready }));
+    engine.interest = Interest { sensor: Some(CARS), ..Interest::default() };
+    checked(&mut engine, &jobs, now);
+    engine.handle(Input::Infer(Done::Detected { sensor: CARS, found: Ok(vec![box_at([0.1, 0.5, 0.3, 0.9], Verdict::Detector)]) }));
+    engine.tick(now);
+    let frame = engine.preview.as_ref().map(|p| p.preview.frame).expect("the checked frame is the preview");
+    let ours = LabelId(77);
+    let mut settings = objects_record().settings;
+    let KindSettings::Objects(objects) = &mut settings.kind else { unreachable!() };
+    objects.labels = vec![OwnLabel { id: ours, name: "Nosso carro".to_owned().try_into().unwrap(), parent: car() }].try_into().unwrap();
+    let area: NormBox = [0.1, 0.5, 0.3, 0.9].try_into().unwrap();
+    let higher: NormBox = [0.1, 0.1, 0.3, 0.3].try_into().unwrap();
+    let drawn = UserCommand::TeachBox { id: CARS, frame, area, detected: None, label: BoxLabel::NotThis };
+    engine.user(drawn, now);
+    assert_eq!(engine.sensors[&CARS].notice.as_ref().map(|n| n.kind.clone()), Some(NoticeKind::UnknownItem), "a drawn box is something");
+    engine.user(UserCommand::TeachBox { id: CARS, frame, area, detected: Some(car()), label: BoxLabel::Own(ours) }, now);
+    assert_eq!(engine.store.counts(CARS).unwrap().taught, 0, "the label does not exist yet");
+    engine.user(UserCommand::Configure { id: CARS, settings: settings.clone() }, now);
+    let region = Region::rect(NormPoint::new(0.0, 0.0).unwrap(), NormPoint::new(1.0, 0.5).unwrap()).unwrap();
+    engine.user(UserCommand::TeachBox { id: CARS, frame, area: higher, detected: Some(car()), label: BoxLabel::Own(ours) }, now);
+    engine.user(UserCommand::TeachBox { id: CARS, frame, area, detected: Some(car()), label: BoxLabel::Own(ours) }, now);
+    assert_eq!(engine.store.counts(CARS).unwrap().taught, 2);
+    engine.user(UserCommand::Configure { id: CARS, settings: Settings { region, ..settings.clone() } }, now);
+    engine.user(UserCommand::TeachBox { id: CARS, frame, area, detected: Some(car()), label: BoxLabel::Own(ours) }, now);
+    assert_eq!(engine.sensors[&CARS].notice.as_ref().map(|n| n.kind.clone()), Some(NoticeKind::OutsideRegion), "its bottom is outside");
+    engine.tick(now + RETRAIN_DELAY);
+    assert!(fetch.try_iter().any(|m| m == Model::Backbone), "taught boxes need the backbone");
+    engine.handle(Input::Model(ModelEvent { model: Model::Backbone, state: ModelState::Ready }));
+    engine.tick(now + RETRAIN_DELAY);
+    let Some(Job::Index { rows, parents, .. }) = jobs.try_iter().find(|j| matches!(j, Job::Index { .. })) else { panic!("expected an index") };
+    assert_eq!((rows.len(), parents), (2, vec![(ours, car())]));
+    let vector = vec![1.0, 0.0];
+    let index = teach::build(rows.into_iter().map(|r| teach::TaughtRow { sample: r.sample, label: r.label, detected: r.detected, vector: vector.clone() }).collect(), [(ours, car())].into());
+    engine.handle(Input::Infer(Done::Indexed { sensor: CARS, outcome: Ok(Indexed { index, fresh: Vec::new() }) }));
+    seed(&mut engine, now + RETRAIN_DELAY, 2);
+    engine.tick(now + RETRAIN_DELAY);
+    let Some(Job::Detect { request, .. }) = jobs.try_iter().find(|j| matches!(j, Job::Detect { .. })) else { panic!("the index forces a check") };
+    assert!(request.taught.is_some(), "the check compares with the taught boxes");
+    let unsure = box_at([0.1, 0.1, 0.3, 0.45], Verdict::Unsure { label: ours, similarity: 0.8 });
+    engine.handle(Input::Infer(Done::Detected { sensor: CARS, found: Ok(vec![unsure]) }));
+    let review = engine.store.reviews(CARS, 10).unwrap();
+    assert!(matches!(review.as_slice(), [row] if matches!(row.review, Some(ReviewReason::Ask(q)) if q.label == ours)), "is this our car?");
+    let item = review[0].id;
+    engine.user(UserCommand::Resolve { id: CARS, item, label: Some(SampleLabel::Box(BoxLabel::Own(ours))) }, now);
+    let counts = engine.store.counts(CARS).unwrap();
+    assert_eq!((counts.taught, counts.pending), (3, 0), "the answer is taught");
+    engine.user(UserCommand::Configure { id: CARS, settings: Settings { kind: objects_record().settings.kind, ..settings } }, now);
+    assert_eq!(engine.store.counts(CARS).unwrap().taught, 0, "removing the label forgets its boxes");
 }

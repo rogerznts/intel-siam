@@ -78,7 +78,7 @@ impl Sensors {
                         if let Some(snapshot) = self.link.as_mut().and_then(|l| l.snapshot.as_mut()) {
                             snapshot.insert(entry.id);
                         }
-                        self.view.sensors.insert(entry.id, entry);
+                        self.view.sensors.insert(entry.id, *entry);
                     }
                     Report::Removed(id) => { self.view.sensors.remove(&id); }
                     Report::Wants(wants) => self.view.wanted_feeds = wants,

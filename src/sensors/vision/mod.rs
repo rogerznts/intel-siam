@@ -16,6 +16,7 @@ mod pixels;
 #[cfg(test)]
 pub(super) mod process_tests;
 mod store;
+mod teach;
 
 use std::ffi::OsString;
 use std::fs::File;

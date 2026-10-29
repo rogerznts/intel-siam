@@ -1,47 +1,55 @@
 //! Models and the CPU-heavy work, off the engine thread: the model registry, its download,
-//! embedding a region with the backbone, and training the per-sensor head. The network itself runs
-//! through the `Network` the binary supplies.
+//! embedding a region with the backbone, training the per-sensor head, and finding objects with a
+//! detector. The networks themselves run through the `Network` the binary supplies.
 //!
 //! The head is multinomial logistic regression on backbone embeddings (origin `classifier.py`):
 //! scikit-learn's `LogisticRegression(C, class_weight="balanced")`, L2 on the weights, not the
 //! intercept; one weight vector for two states, a softmax for more. The problem is convex, so any
-//! solver that reaches its optimum gives the same head. `fit`, `Head::predict` and `embedding` are
-//! pure.
+//! solver that reaches its optimum gives the same head. `fit`, `Head::predict`, `embedding` and
+//! `postprocess` are pure.
 //!
 //! One worker thread runs `Job`s in order; one fetch thread downloads models.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+use egui::ColorImage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::Input;
+use super::logic::{self, CONTEXT_MARGIN, Detection, ObjectFilter};
 use super::pixels::{self, Rgb};
-use super::store::{TrainRow, hex};
-use crate::sensors::types::{Region, SampleId, SensorId, StateKey, StateSet};
-use crate::sensors::{LoadNetwork, Network};
+use super::store::{TaughtSample, TrainRow, hex};
+use super::teach::{self, TEACH, TaughtIndex, TaughtRow};
+use crate::sensors::types::{
+    ClassSet, Detector, Found, LabelId, MinSize, ModelState, ObjectClass, Region, SampleId, SensorId, StateKey,
+    StateSet, Unit,
+};
+use crate::sensors::{LoadNetwork, Network, Output};
 
-/// A backbone (origin `backbones.json`). Downloaded on first need into `<data>/models/<sha256>`,
-/// verified, and renamed into place, so a file there is always complete.
+/// A model (origin `backbones.json`, `detectors.json`). Downloaded on first need into
+/// `<data>/models/<sha256>`, verified, and renamed into place, so a file there is always complete.
 pub struct ModelSpec {
     pub id: &'static str,
     pub name: &'static str,
     pub url: &'static str,
     pub sha256: &'static str,
     pub size: u64,
+    /// Side of the square input.
     pub input: usize,
+    /// Per channel, after scaling to `0.0..=1.0`.
     pub mean: [f32; 3],
     pub std: [f32; 3],
 }
 
-/// The registry's default entry, `dinov2-small-q8`, copied from `backbones.json`. New models are
-/// new constants here.
+/// The backbone registry's default entry, `dinov2-small-q8`, copied from `backbones.json`.
 pub const BACKBONE: ModelSpec = ModelSpec {
     id: "dinov2-small-q8",
     name: "DINOv2 small · 8-bit",
@@ -53,20 +61,94 @@ pub const BACKBONE: ModelSpec = ModelSpec {
     std: [0.229, 0.224, 0.225],
 };
 
+/// A `detectors.json` entry: a 640 square scaled to `0.0..=1.0`, no mean or deviation.
+const fn detector(which: Detector, url: &'static str, sha256: &'static str, size: u64) -> ModelSpec {
+    ModelSpec { id: which.id(), name: which.name(), url, sha256, size, input: 640, mean: [0.0; 3], std: [1.0; 3] }
+}
+
+const DFINE_N: ModelSpec = detector(
+    Detector::DfineN,
+    "https://huggingface.co/onnx-community/dfine-nano-coco-ONNX/resolve/89df95b0e8575ff9879f13351bafe69bbe8e6823/onnx/model.onnx",
+    "f7febe9695cd6f71120abbeb0642d3d6b6c6bcc36f0ba1d79b66d302b5860814",
+    15_434_994,
+);
+const DFINE_S: ModelSpec = detector(
+    Detector::DfineS,
+    "https://huggingface.co/onnx-community/dfine_s_coco-ONNX/resolve/a3cf03147a9b86c78475139115c8ac142577352d/onnx/model.onnx",
+    "cd8a49a945feda6d28c6304ae8ae85c2759ba1d78a5a83a22c5ce8db82ef7238",
+    41_535_197,
+);
+const DFINE_M: ModelSpec = detector(
+    Detector::DfineM,
+    "https://huggingface.co/onnx-community/dfine_m_coco-ONNX/resolve/489756db2825cb068a588fe930af239a656d1fe1/onnx/model.onnx",
+    "70aaa837978a06ba44ad17398c7079ae5a1a7b1a9032b5d7053981e1ada02d6b",
+    78_624_257,
+);
+const DFINE_L: ModelSpec = detector(
+    Detector::DfineL,
+    "https://huggingface.co/onnx-community/dfine_l_coco-ONNX/resolve/e09b218185400510b68d067bbd0c9379d905ffcd/onnx/model.onnx",
+    "d678f3baebfb909d3a20f21d1d807544d0172ed47fa1ab88e7fcdec7e365b236",
+    125_348_332,
+);
+
+/// Every model the vision process may need. New models are new variants and constants here.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Model {
+    Backbone,
+    Detector(Detector),
+}
+
+impl Model {
+    pub fn spec(self) -> &'static ModelSpec {
+        match self {
+            Self::Backbone => &BACKBONE,
+            Self::Detector(Detector::DfineN) => &DFINE_N,
+            Self::Detector(Detector::DfineS) => &DFINE_S,
+            Self::Detector(Detector::DfineM) => &DFINE_M,
+            Self::Detector(Detector::DfineL) => &DFINE_L,
+        }
+    }
+}
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 const RESPONSE_TIMEOUT: Duration = Duration::from_secs(60);
+const NMS_IOU: f32 = 0.7; // DETECTION["nms_iou"]
+const MAX_DETECTIONS: usize = 100; // DETECTION["max_detections"]
 
 pub enum Job {
     /// One checked region → one vector.
     Embed { sensor: SensorId, crop: Rgb },
     /// Embeds the samples without a cached vector (cropped with `region`), then fits.
     Train { sensor: SensorId, region: Region, rows: Vec<TrainRow> },
+    /// Embeds the taught boxes without a cached vector, then builds the index to compare with.
+    Index { sensor: SensorId, rows: Vec<TaughtSample>, parents: Vec<(LabelId, ObjectClass)> },
+    /// One check of an object sensor: detect in the region, then compare with the taught boxes.
+    Detect { sensor: SensorId, frame: Arc<ColorImage>, request: DetectRequest },
+}
+
+/// What a check of an object sensor needs from its settings.
+pub struct DetectRequest {
+    pub detector: Detector,
+    pub region: Region,
+    pub classes: ClassSet,
+    pub threshold: Unit,
+    pub min_size: MinSize,
+    pub taught: Option<Compare>,
+}
+
+/// The taught boxes to compare with, and the last check's boxes (an object that stayed keeps its
+/// answer).
+pub struct Compare {
+    pub index: Arc<TaughtIndex>,
+    pub previous: Vec<Found>,
 }
 
 pub enum Done {
     Embedded { sensor: SensorId, vector: Result<Vec<f32>, String> },
     /// `region` is the hash the job was cropped with.
     Trained { sensor: SensorId, region: u64, outcome: Result<Trained, String> },
+    Indexed { sensor: SensorId, outcome: Result<Indexed, String> },
+    Detected { sensor: SensorId, found: Result<Vec<Found>, String> },
 }
 
 pub struct Trained {
@@ -76,33 +158,39 @@ pub struct Trained {
     pub fresh: Vec<(SampleId, Vec<f32>)>,
 }
 
-pub enum ModelEvent {
-    Progress { done: u64, total: u64 },
-    Ready,
-    Failed(String),
+pub struct Indexed {
+    /// `None`: no taught box means anything now.
+    pub index: Option<TaughtIndex>,
+    pub fresh: Vec<(SampleId, Vec<f32>)>,
+}
+
+/// A model's download or verification moved on.
+pub struct ModelEvent {
+    pub model: Model,
+    pub state: ModelState,
 }
 
 pub struct Infer {
     jobs: Sender<Job>,
-    fetch: Sender<()>,
+    fetch: Sender<Model>,
     worker: Option<JoinHandle<()>>,
 }
 
 impl Infer {
-    /// The engine submits only once the model is ready.
+    /// The engine submits only once the job's models are ready.
     pub fn submit(&self, job: Job) {
         let _ = self.jobs.send(job);
     }
 
     /// Idempotent: a model on disk is verified once per process, never downloaded again. The
     /// answer arrives as `Input::Model`.
-    pub fn ensure(&self) {
-        let _ = self.fetch.send(());
+    pub fn ensure(&self, model: Model) {
+        let _ = self.fetch.send(model);
     }
 }
 
 #[cfg(test)]
-pub(super) fn test_channels() -> (Infer, Receiver<Job>, Receiver<()>) {
+pub(super) fn test_channels() -> (Infer, Receiver<Job>, Receiver<Model>) {
     let (jobs, job_rx) = mpsc::channel();
     let (fetch, fetch_rx) = mpsc::channel();
     (Infer { jobs, fetch, worker: None }, job_rx, fetch_rx)
@@ -122,43 +210,66 @@ impl Drop for Infer {
 pub fn spawn(dir: PathBuf, engine: Sender<Input>, load: LoadNetwork) -> Infer {
     let (jobs, job_rx) = mpsc::channel();
     let (fetch, fetch_rx) = mpsc::channel();
-    let model = dir.join(BACKBONE.sha256);
     let worker = {
-        let (model, engine) = (model.clone(), engine.clone());
-        thread::spawn(move || work(&model, load, job_rx, &engine))
+        let (dir, engine) = (dir.clone(), engine.clone());
+        thread::spawn(move || work(Networks { dir, load, backbone: None, detector: None }, job_rx, &engine))
     };
-    thread::spawn(move || fetch_model(&model, fetch_rx, &engine));
+    thread::spawn(move || fetch_models(&dir, fetch_rx, &engine));
     Infer { jobs, fetch, worker: Some(worker) }
 }
 
-fn work(model: &Path, load: LoadNetwork, jobs: Receiver<Job>, engine: &Sender<Input>) {
-    let mut network = None;
+/// The worker's networks, each loaded on first use.
+struct Networks {
+    dir: PathBuf,
+    load: LoadNetwork,
+    backbone: Option<Box<dyn Network>>,
+    detector: Option<(Detector, Box<dyn Network>)>,
+}
+
+impl Networks {
+    fn backbone(&mut self) -> Result<&mut dyn Network, String> {
+        if self.backbone.is_none() {
+            self.backbone = Some(self.open(Model::Backbone)?);
+        }
+        Ok(self.backbone.as_deref_mut().expect("just loaded"))
+    }
+
+    /// Another detector than the loaded one replaces it.
+    fn detector(&mut self, which: Detector) -> Result<&mut dyn Network, String> {
+        if self.detector.as_ref().is_none_or(|(d, _)| *d != which) {
+            self.detector = None;
+            self.detector = Some((which, self.open(Model::Detector(which))?));
+        }
+        Ok(self.detector.as_mut().map(|(_, n)| n.as_mut()).expect("just loaded"))
+    }
+
+    fn open(&self, model: Model) -> Result<Box<dyn Network>, String> {
+        (self.load)(&self.dir.join(model.spec().sha256)).map_err(|e| format!("modelo: {e}"))
+    }
+}
+
+fn work(mut networks: Networks, jobs: Receiver<Job>, engine: &Sender<Input>) {
     for job in jobs {
         let done = match job {
             Job::Embed { sensor, crop } => {
-                Done::Embedded { sensor, vector: loaded(&mut network, model, load).and_then(|n| embed(n, &crop)) }
+                Done::Embedded { sensor, vector: networks.backbone().and_then(|n| embed(n, &crop)) }
             }
             Job::Train { sensor, region, rows } => Done::Trained {
                 sensor,
                 region: region.hash(),
-                outcome: loaded(&mut network, model, load).and_then(|n| train(n, &region, rows)),
+                outcome: networks.backbone().and_then(|n| train(n, &region, rows)),
             },
+            Job::Index { sensor, rows, parents } => {
+                Done::Indexed { sensor, outcome: networks.backbone().and_then(|n| index(n, rows, parents)) }
+            }
+            Job::Detect { sensor, frame, request } => {
+                Done::Detected { sensor, found: detect(&mut networks, &frame, &request) }
+            }
         };
         if engine.send(Input::Infer(done)).is_err() {
             return;
         }
     }
-}
-
-fn loaded<'a>(
-    slot: &'a mut Option<Box<dyn Network>>,
-    model: &Path,
-    load: LoadNetwork,
-) -> Result<&'a mut dyn Network, String> {
-    if slot.is_none() {
-        *slot = Some(load(model).map_err(|e| format!("modelo: {e}"))?);
-    }
-    Ok(slot.as_deref_mut().expect("just loaded"))
 }
 
 fn train(network: &mut dyn Network, region: &Region, rows: Vec<TrainRow>) -> Result<Trained, String> {
@@ -167,8 +278,7 @@ fn train(network: &mut dyn Network, region: &Region, rows: Vec<TrainRow>) -> Res
         let vector = match row.cached {
             Some(vector) => vector,
             None => {
-                let frame = fs::read(&row.image).map_err(|e| e.to_string()).and_then(|b| pixels::decode(&b).map_err(|e| e.to_string()));
-                let frame = match frame {
+                let frame = match read_image(&row.image) {
                     Ok(frame) => frame,
                     Err(e) => {
                         eprintln!("sample {} skipped: {e}", row.sample.0);
@@ -186,58 +296,164 @@ fn train(network: &mut dyn Network, region: &Region, rows: Vec<TrainRow>) -> Res
     Ok(Trained { head: fit(&vectors, &labels), fresh })
 }
 
+/// The stored crops are embedded alone, one at a time, as the boxes of a check are: the 8-bit
+/// backbone quantises a batch together, so the same crop would compare differently in a batch
+/// (origin `teach.embed`). A box whose image is unreadable is left out (origin issue #45).
+fn index(network: &mut dyn Network, rows: Vec<TaughtSample>, parents: Vec<(LabelId, ObjectClass)>) -> Result<Indexed, String> {
+    let (mut taught, mut fresh) = (Vec::new(), Vec::new());
+    for row in rows {
+        let vector = match row.cached {
+            Some(vector) => vector,
+            None => {
+                let crop = match read_image(&row.image) {
+                    Ok(crop) => crop,
+                    Err(e) => {
+                        eprintln!("taught box {} skipped: {e}", row.sample.0);
+                        continue;
+                    }
+                };
+                let vector = embed(network, &Rgb::from(&crop))?;
+                fresh.push((row.sample, vector.clone()));
+                vector
+            }
+        };
+        taught.push(TaughtRow { sample: row.sample, label: row.label, detected: row.detected, vector });
+    }
+    Ok(Indexed { index: teach::build(taught, parents.into_iter().collect()), fresh })
+}
+
+/// One check of an object sensor (origin `_run_objects` up to the tracks): the detector sees the
+/// region with a margin around it, the boxes that count are kept, then compared with the taught
+/// ones. Once a box the detector missed was taught, its unsure boxes are looked at too.
+fn detect(networks: &mut Networks, frame: &ColorImage, request: &DetectRequest) -> Result<Vec<Found>, String> {
+    let analysed = logic::region_box(&request.region, CONTEXT_MARGIN);
+    let rescue = request.taught.as_ref().is_some_and(|t| t.index.rescue);
+    let threshold = f32::from(request.threshold);
+    let floor = if rescue { threshold.min(TEACH.rescue_floor) } else { threshold };
+    let spec = Model::Detector(request.detector).spec();
+    let input = tensor(&pixels::stretch(&pixels::crop_box(frame, analysed), spec.input), spec);
+    let outputs = networks.detector(request.detector)?.run(input, [1, 3, spec.input, spec.input]).map_err(|e| format!("detector: {e}"))?;
+    let raw = postprocess(&outputs, floor)?;
+    let filter = ObjectFilter { region: &request.region, classes: &request.classes, min_size: request.min_size };
+    let found = logic::filter_detections(&raw, analysed, &filter, rescue);
+    let Some(compare) = &request.taught else { return Ok(found) };
+    let (found, candidates): (Vec<Found>, Vec<Found>) = if rescue {
+        let (sure, unsure): (Vec<Found>, Vec<Found>) = found.into_iter().partition(|f| f.score >= threshold);
+        (sure.into_iter().filter(|f| request.classes.contains(f.class)).collect(), unsure)
+    } else {
+        (found, Vec::new())
+    };
+    let (checked, rescued) = teach::plan(&found, &candidates, &compare.index);
+    let backbone = networks.backbone()?;
+    let mut vector = |area: [f32; 4]| embed(backbone, &pixels::crop_box(frame, teach::crop_area(area)));
+    let checked = checked.into_iter().map(|i| Ok((i, vector(found[i].area)?))).collect::<Result<Vec<_>, String>>()?;
+    let rescued = rescued.into_iter().map(|c| Ok((c, vector(c.area)?))).collect::<Result<Vec<_>, String>>()?;
+    Ok(teach::apply(&found, &checked, &rescued, &compare.index, &request.classes, &compare.previous))
+}
+
+/// Normalised with the model's mean and deviation, channels first.
+fn tensor(square: &Rgb, spec: &ModelSpec) -> Vec<f32> {
+    let plane = square.size[0] * square.size[1];
+    let mut input = vec![0.0f32; 3 * plane];
+    for (i, rgb) in square.pixels.as_chunks::<3>().0.iter().enumerate() {
+        for c in 0..3 {
+            input[c * plane + i] = (f32::from(rgb[c]) / 255.0 - spec.mean[c]) / spec.std[c];
+        }
+    }
+    input
+}
+
+/// DETR-style outputs (`logits`: queries × classes, `pred_boxes`: queries × centre/size, both
+/// normalised to the image shown) as detections: every query and class above `min_score`, then
+/// boxes of one class overlapping more than `NMS_IOU` merged into the most certain, most certain
+/// first (origin `postprocess`).
+pub fn postprocess(outputs: &[Output], min_score: f32) -> Result<Vec<Detection>, String> {
+    let [logits, boxes, ..] = outputs else { return Err("o detector não devolveu caixas".into()) };
+    let classes = crate::sensors::COCO.len();
+    let queries = boxes.values.len() / 4;
+    if logits.shape.last() != Some(&classes) || boxes.shape.last() != Some(&4) || logits.values.len() != queries * classes {
+        return Err(format!("saída do detector com forma inesperada: {:?} e {:?}", logits.shape, boxes.shape));
+    }
+    let mut candidates: Vec<Detection> = Vec::new();
+    for (q, scores) in logits.values.chunks_exact(classes).enumerate() {
+        let [cx, cy, w, h] = boxes.values[q * 4..q * 4 + 4] else { unreachable!("four values per box") };
+        let area = [cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0].map(|v| v.clamp(0.0, 1.0));
+        for (c, logit) in scores.iter().enumerate() {
+            let score = 1.0 / (1.0 + (-logit).exp());
+            if score > min_score {
+                let class = ObjectClass::from_index(c).expect("one score per class of the set");
+                candidates.push(Detection { class, score, area });
+            }
+        }
+    }
+    candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+    let mut kept: Vec<Detection> = Vec::new();
+    for cand in candidates {
+        if !kept.iter().any(|k| k.class == cand.class && teach::box_iou(k.area, cand.area) > NMS_IOU) {
+            kept.push(cand);
+        }
+    }
+    kept.truncate(MAX_DETECTIONS);
+    Ok(kept)
+}
+
+fn read_image(path: &Path) -> Result<ColorImage, String> {
+    fs::read(path).map_err(|e| e.to_string()).and_then(|b| pixels::decode(&b).map_err(|e| e.to_string()))
+}
+
 /// Letterboxed to the input square, normalised, channels first (origin `Embedder.preprocess`), then
 /// pooled into the vector a head sees.
 fn embed(network: &mut dyn Network, crop: &Rgb) -> Result<Vec<f32>, String> {
     let side = BACKBONE.input;
-    let square = pixels::letterbox(crop, side);
-    let plane = side * side;
-    let mut input = vec![0.0f32; 3 * plane];
-    for (i, rgb) in square.pixels.as_chunks::<3>().0.iter().enumerate() {
-        for c in 0..3 {
-            input[c * plane + i] = (f32::from(rgb[c]) / 255.0 - BACKBONE.mean[c]) / BACKBONE.std[c];
-        }
-    }
-    let (dim, hidden) = network.run(input, [1, 3, side, side]).map_err(|e| format!("inferência: {e}"))?;
-    if dim == 0 || hidden.len() % dim != 0 {
+    let input = tensor(&pixels::letterbox(crop, side), &BACKBONE);
+    let outputs = network.run(input, [1, 3, side, side]).map_err(|e| format!("inferência: {e}"))?;
+    let hidden = outputs.first().ok_or("o modelo não devolveu saída")?;
+    let dim = hidden.shape.last().copied().unwrap_or(0);
+    if dim == 0 || hidden.values.len() % dim != 0 {
         return Err("saída do modelo com forma inesperada".into());
     }
-    Ok(embedding(&hidden, dim))
+    Ok(embedding(&hidden.values, dim))
 }
 
-fn fetch_model(path: &Path, requests: Receiver<()>, engine: &Sender<Input>) {
-    let mut ready = false;
-    while requests.recv().is_ok() {
-        while requests.try_recv().is_ok() {}
-        let event = if ready {
-            ModelEvent::Ready
-        } else {
-            match ensure(&BACKBONE, path, engine) {
-                Ok(()) => {
-                    ready = true;
-                    ModelEvent::Ready
+/// Requests for one model while it downloads are answered by the same download.
+fn fetch_models(dir: &Path, requests: Receiver<Model>, engine: &Sender<Input>) {
+    let mut ready: BTreeSet<Model> = BTreeSet::new();
+    while let Ok(first) = requests.recv() {
+        let pending: BTreeSet<Model> = std::iter::once(first).chain(requests.try_iter()).collect();
+        for model in pending {
+            let progress = |done, total| {
+                let _ = engine.send(Input::Model(ModelEvent { model, state: ModelState::Downloading { done, total } }));
+            };
+            let state = if ready.contains(&model) {
+                ModelState::Ready
+            } else {
+                match ensure(model.spec(), &dir.join(model.spec().sha256), &progress) {
+                    Ok(()) => {
+                        ready.insert(model);
+                        ModelState::Ready
+                    }
+                    Err(e) => ModelState::Failed(e),
                 }
-                Err(e) => ModelEvent::Failed(e),
+            };
+            if engine.send(Input::Model(ModelEvent { model, state })).is_err() {
+                return;
             }
-        };
-        if engine.send(Input::Model(event)).is_err() {
-            return;
         }
     }
 }
 
-fn ensure(spec: &ModelSpec, path: &Path, engine: &Sender<Input>) -> Result<(), String> {
+fn ensure(spec: &ModelSpec, path: &Path, progress: &dyn Fn(u64, u64)) -> Result<(), String> {
     if path.is_file() {
         if sha256_file(path).map_err(|e| e.to_string())? == spec.sha256 {
             return Ok(());
         }
         fs::remove_file(path).map_err(|e| e.to_string())?;
     }
-    download(spec, path, engine)
+    download(spec, path, progress)
 }
 
 /// Into `<path>.part`, hashing as it arrives; renamed only when the SHA-256 matches.
-fn download(spec: &ModelSpec, path: &Path, engine: &Sender<Input>) -> Result<(), String> {
+fn download(spec: &ModelSpec, path: &Path, progress: &dyn Fn(u64, u64)) -> Result<(), String> {
     let agent = ureq::Agent::config_builder()
         .timeout_connect(Some(CONNECT_TIMEOUT))
         .timeout_recv_response(Some(RESPONSE_TIMEOUT))
@@ -262,7 +478,7 @@ fn download(spec: &ModelSpec, path: &Path, engine: &Sender<Input>) -> Result<(),
         done += n as u64;
         if done * 100 / spec.size.max(1) > percent {
             percent = done * 100 / spec.size.max(1);
-            let _ = engine.send(Input::Model(ModelEvent::Progress { done, total: spec.size }));
+            progress(done, spec.size);
         }
     }
     file.sync_all().map_err(fail)?;
@@ -636,5 +852,56 @@ mod tests {
         let norm = 10f32.sqrt();
         assert_eq!(v, [1.0 / norm, 0.0, 0.0, 3.0 / norm]);
         assert_eq!(embedding(&[3.0, 4.0], 2), [0.6, 0.8], "already pooled");
+    }
+
+    /// Detector outputs with one query per `(class index, probability, [cx, cy, w, h])`, the rest
+    /// background (origin `test_objects.outputs`).
+    fn outputs(queries: &[(usize, f32, [f32; 4])]) -> Vec<Output> {
+        let classes = crate::sensors::COCO.len();
+        let mut logits = vec![-10.0f32; 10 * classes];
+        let mut boxes = vec![0.0f32; 10 * 4];
+        for (q, (class, p, area)) in queries.iter().enumerate() {
+            logits[q * classes + class] = (p / (1.0 - p)).ln();
+            boxes[q * 4..q * 4 + 4].copy_from_slice(area);
+        }
+        vec![Output { shape: vec![1, 10, classes], values: logits }, Output { shape: vec![1, 10, 4], values: boxes }]
+    }
+
+    const PERSON: usize = 0;
+    const CAR: usize = 2;
+
+    #[test]
+    fn postprocess_converts_boxes_and_drops_weak() {
+        let found = postprocess(&outputs(&[(PERSON, 0.9, [0.5, 0.5, 0.2, 0.4]), (CAR, 0.3, [0.2, 0.2, 0.1, 0.1])]), 0.5).unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].class.key(), "person");
+        assert!((found[0].score - 0.9).abs() < 1e-4);
+        for (got, want) in found[0].area.iter().zip([0.4, 0.3, 0.6, 0.7]) {
+            assert!((got - want).abs() < 1e-4, "{:?}", found[0].area);
+        }
+    }
+
+    #[test]
+    fn postprocess_merges_duplicates_of_one_class_only() {
+        let same = [0.5, 0.5, 0.2, 0.4];
+        let found = postprocess(
+            &outputs(&[
+                (PERSON, 0.9, same),
+                (PERSON, 0.8, [0.505, 0.5, 0.2, 0.4]),
+                (PERSON, 0.7, [0.1, 0.5, 0.1, 0.2]),
+                (CAR, 0.85, same),
+            ]),
+            0.5,
+        )
+        .unwrap();
+        let got: Vec<(&str, i32)> = found.iter().map(|d| (d.class.key(), (d.score * 100.0).round() as i32)).collect();
+        assert_eq!(got, [("person", 90), ("car", 85), ("person", 70)], "most certain first; the car is not merged");
+    }
+
+    #[test]
+    fn postprocess_refuses_outputs_of_another_shape() {
+        let wrong = vec![Output { shape: vec![1, 10, 91], values: vec![0.0; 910] }, Output { shape: vec![1, 10, 4], values: vec![0.0; 40] }];
+        assert!(postprocess(&wrong, 0.5).is_err(), "a model with another label set");
+        assert!(postprocess(&wrong[..1], 0.5).is_err());
     }
 }

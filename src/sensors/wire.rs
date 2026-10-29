@@ -18,7 +18,7 @@ use super::types::{FocusView, ImageId, Interest, SensorEntry, SensorId, SystemSt
 use crate::frames::StreamKey;
 use crate::plan::RtspUrl;
 
-pub(super) const PROTOCOL: u32 = 2;
+pub(super) const PROTOCOL: u32 = 3;
 /// No image on the wire is larger than this on its longer side.
 pub(super) const MAX_WIRE_EDGE: u32 = 960;
 /// The vision process sends `System` at least this often, so a silent child counts as stalled.
@@ -48,7 +48,7 @@ pub(super) enum Report {
         protocol: u32,
     },
     /// Upsert: the whole truth for that sensor.
-    Sensor(SensorEntry),
+    Sensor(Box<SensorEntry>),
     Removed(SensorId),
     Wants(BTreeSet<StreamKey>),
     /// Precedes the first `Focus` that references `id`.
@@ -177,6 +177,7 @@ mod tests {
     use crate::model::{CameraId, ChannelIndex, DvrSerial};
     use crate::plan::rtsp_url;
     use crate::procs::LocalPort;
+    use crate::sensors::ObjectClass;
     use crate::sensors::types::*;
 
     fn camera() -> CameraId {
@@ -236,12 +237,34 @@ mod tests {
         let pixels: Vec<u8> = (0..2 * 3 * 4).map(|i| i as u8).collect();
         let sent = vec![
             (Report::Hello { protocol: PROTOCOL }, vec![]),
-            (Report::Sensor(entry()), vec![]),
+            (Report::Sensor(Box::new(entry())), vec![]),
             (Report::Image { id: ImageId(4), size: [2, 3] }, pixels.clone()),
             (Report::Wants([StreamKey { camera: camera(), kind: StreamKind::Main }].into()), vec![]),
         ];
         let got = decode_all::<Report>(&encode(&sent)).unwrap();
         assert_eq!(got, sent);
+    }
+
+    #[test]
+    fn an_object_sensor_round_trips() {
+        let car = ObjectClass::by_key("car").unwrap();
+        let ours = LabelId(u64::MAX - 1);
+        let mut settings = Settings::new_objects("Garagem".to_owned().try_into().unwrap(), vec![car].try_into().unwrap());
+        if let KindSettings::Objects(objects) = &mut settings.kind {
+            objects.labels = vec![OwnLabel { id: ours, name: "Nosso carro".to_owned().try_into().unwrap(), parent: car }].try_into().unwrap();
+        }
+        let by = TaughtMatch { sample: SampleId(3), label: BoxLabel::Own(ours), similarity: 0.93 };
+        let found = Found { class: car, score: 0.8, area: [0.1, 0.2, 0.5, 0.9], verdict: Verdict::Taught { by, label: Some(ours), was: None, how: MatchHow::Clear } };
+        let present = vec![(ObjectKey::Class(car), 1), (ObjectKey::Own(ours), 1)];
+        let live = ObjectsLive {
+            frame: Some(FrameId(4)),
+            found: vec![found],
+            tracks: present.iter().map(|(key, count)| TrackView { key: *key, on: true, count: *count, score: 0.8 }).collect(),
+            ..ObjectsLive::default()
+        };
+        let entry = SensorEntry { settings, value: Some(SensorValue::Objects(present)), live: KindLive::Objects(live), ..entry() };
+        let sent = vec![(Report::Sensor(Box::new(entry)), vec![])];
+        assert_eq!(decode_all::<Report>(&encode(&sent)).unwrap(), sent);
     }
 
     #[test]
@@ -295,7 +318,7 @@ mod tests {
         let mut sensor = entry();
         sensor.status = SensorStatus::Failed("x".repeat(MAX_HEADER as usize));
         let mut bytes = Vec::new();
-        assert_eq!(write_frame(&mut bytes, &Report::Sensor(sensor), &[]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(write_frame(&mut bytes, &Report::Sensor(Box::new(sensor)), &[]).unwrap_err().kind(), io::ErrorKind::InvalidInput);
         assert!(bytes.is_empty(), "a rejected header must not corrupt the stream");
     }
 

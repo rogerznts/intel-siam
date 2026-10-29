@@ -20,6 +20,33 @@ impl Rgb {
     }
 }
 
+impl From<&ColorImage> for Rgb {
+    /// Video is opaque, so alpha is dropped.
+    fn from(frame: &ColorImage) -> Self {
+        Self { size: frame.size, pixels: frame.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]).collect() }
+    }
+}
+
+/// A normalised `[x1, y1, x2, y2]` box cut from `frame` without masking: a detector needs to
+/// see whole objects (`imaging.crop_box`). At least one pixel each way.
+pub fn crop_box(frame: &ColorImage, area: [f32; 4]) -> Rgb {
+    let [fw, fh] = frame.size;
+    let [x1, y1, x2, y2] = area;
+    let x0 = ((x1 * fw as f32) as usize).min(fw - 1);
+    let y0 = ((y1 * fh as f32) as usize).min(fh - 1);
+    let x_end = ((x2 * fw as f32) as usize).clamp(x0 + 1, fw);
+    let y_end = ((y2 * fh as f32) as usize).clamp(y0 + 1, fh);
+    let size = [x_end - x0, y_end - y0];
+    let pixels = (y0..y_end).flat_map(|y| frame.pixels[y * fw + x0..y * fw + x_end].iter().flat_map(|c| [c.r(), c.g(), c.b()])).collect();
+    Rgb { size, pixels }
+}
+
+/// Resized to a `side` square, stretched, not letterboxed: how the detectors were trained
+/// (`Detector.preprocess`).
+pub fn stretch(img: &Rgb, side: usize) -> Rgb {
+    Rgb { size: [side, side], pixels: resize(&img.pixels, 3, img.size, [side, side]) }
+}
+
 /// The region's bounding box cut from `frame`, with everything outside a polygon painted
 /// `NEUTRAL_FILL` (`imaging.crop`).
 pub fn crop(frame: &ColorImage, region: &Region) -> Rgb {
@@ -111,12 +138,10 @@ pub fn fit_rgba(frame: &ColorImage, max_edge: usize) -> ColorImage {
     ColorImage::new(size, pixels.collect())
 }
 
-/// The frame as JPEG. Video is opaque, so alpha is dropped.
-pub fn encode_jpeg(frame: &ColorImage, quality: u8) -> ImageResult<Vec<u8>> {
-    let rgb: Vec<u8> = frame.pixels.iter().flat_map(|c| [c.r(), c.g(), c.b()]).collect();
-    let [w, h] = frame.size.map(|n| n as u32);
+pub fn encode_jpeg(img: &Rgb, quality: u8) -> ImageResult<Vec<u8>> {
+    let [w, h] = img.size.map(|n| n as u32);
     let mut out = Vec::new();
-    JpegEncoder::new_with_quality(&mut out, quality).encode(&rgb, w, h, ExtendedColorType::Rgb8)?;
+    JpegEncoder::new_with_quality(&mut out, quality).encode(&img.pixels, w, h, ExtendedColorType::Rgb8)?;
     Ok(out)
 }
 
@@ -281,5 +306,15 @@ mod tests {
         assert!(fitted.pixels.iter().all(|c| *c == Color32::from_rgb(1, 2, 3)));
         let sub = ColorImage::filled([640, 360], Color32::WHITE);
         assert_eq!(fit_rgba(&sub, 960), sub);
+    }
+
+    #[test]
+    fn a_box_is_cut_unmasked_and_at_least_one_pixel() {
+        let frame = top_white([200, 100], 50);
+        let out = crop_box(&frame, [0.25, 0.25, 0.75, 1.0]);
+        assert_eq!(out.size, [100, 75]);
+        assert_eq!((pixel(&out, 0, 0), pixel(&out, 0, 74)), ([255, 255, 255], [0, 0, 0]), "the white top, then black");
+        assert_eq!(crop_box(&frame, [0.5, 0.5, 0.5, 0.5]).size, [1, 1]);
+        assert_eq!(stretch(&out, 64).size, [64, 64]);
     }
 }

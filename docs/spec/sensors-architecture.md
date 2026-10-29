@@ -515,6 +515,44 @@ relação ao esboço e ao texto acima:
   a página seguinte mais antiga e retorno à mais recente. Amostras também permitem voltar à página anterior,
   com uma pilha de cursores privada do painel e confirmação de `before` para não desenhar uma resposta de outra página.
 
+**Tipo Objetos (sem rostos), 2026-10-28.** Entrou como variantes, sem mensagem nova de protocolo:
+`KindSettings::Objects`, `KindLive::Objects`, `SensorValue::Objects`, `UserCommand::TeachBox` e
+`UserCommand::SetDetector`, `ReviewReason::Ask`, `Job::Detect` e `Job::Index`. Diferenças em relação ao texto acima e à
+origem:
+
+- **`Network` devolve todas as saídas** (`Vec<Output>` com forma e valores), não a última dimensão da primeira: o
+  D-FINE tem duas (`logits` e `pred_boxes`). O binário cria **um** ambiente do ONNX Runtime por processo
+  (`LazyLock`); o smoke mostrou que o segundo modelo carregado falhava com "only one environment is allowed per
+  process".
+- **Registro de modelos** é `infer::Model { Backbone, Detector(Detector) }`, com URL, SHA-256 e tamanho copiados de
+  `detectors.json`. A escolha do detector é global, como a configuração `detector` da origem, gravada em `setting`
+  e exposta em `SystemStatus.detector`. O conjunto `coco` (80 classes, nomes em pt-BR) fica em `sensors/coco.rs`.
+- **Uma checagem de Objetos é um job só**: o worker recorta a região com margem, roda o detector, faz o
+  `postprocess`, chama `logic::filter_detections`, `teach::plan`, embeda as caixas uma a uma e chama `teach::apply`.
+  Dois jobs (detectar, depois comparar) pediriam um estado intermediário no engine sem ganho. As funções continuam
+  puras; o engine cuida de trilhas, histórico e perguntas.
+- **Caixas ensinadas são amostras** na mesma tabela `sample` (migração 2: `answer`, `taught`), guardando o recorte
+  com margem, não o quadro. O embedding usa a tabela `embedding` com região `0` (`TAUGHT_CROP`, a `roi_key`
+  "taught" da origem). O índice de comparação vive só na memória e é reconstruído no início, após ensinar,
+  responder, reetiquetar ou configurar, pelo mesmo `retrain_at` dos Estados. `SampleLabel` cobre os dois tipos;
+  `Resolve` e `Relabel` passaram a recebê-lo.
+- **Rótulo próprio** tem id escolhido pelo app (`LabelId`), em vez do slug da origem: o `Configure` que cria o
+  rótulo e o `TeachBox` que o usa vão no mesmo quadro. Remover o rótulo apaga as caixas ensinadas com ele.
+- **Prévia de Objetos** é o último quadro checado, para as caixas ficarem sobre o quadro em que foram achadas
+  (origem: "o quadro muda junto com as caixas"). Antes da primeira checagem, a prévia é o quadro ao vivo. Só o
+  último quadro checado fica na memória por sensor.
+- **Histórico**: uma linha por checagem com todos os eventos (`On`, `Off`, `Filtered`) e as caixas, em vez de uma
+  linha por chave; cada pergunta é uma linha própria na revisão. A pergunta não se repete enquanto outra sobre o
+  mesmo rótulo espera resposta, como em `_record_question`.
+- **Não portado nesta unidade**: aviso "visto de leve" ao desenhar caixa perdida, ensino a partir de quadro do
+  histórico (só prévia e resposta da revisão), limites de ensino por sensor (`TEACH` é constante), restaurar
+  "visto por último" do histórico no início, rostos e pessoas (próxima unidade).
+- `Report::Sensor` leva `Box<SensorEntry>` (o clippy apontou a variante grande). `PROTOCOL = 3`.
+- **Evidência, 2026-10-28.** `cargo build --all-targets --release`, `cargo test` (138 testes) e
+  `cargo clippy --all-targets` sem avisos. Smoke do executável de visão real em
+  `docs/spec/sensors-ui-verification.md`. As fotos da origem têm tamanhos diferentes (640×421 e 640×424); trocar
+  uma pela outra na mesma URL vira `GeometryChanged`, como deve, então o smoke usou o gato redimensionado.
+
 ## Open questions and risks
 
 Resolvidas na síntese (padrão conservador; reverta se discordar):

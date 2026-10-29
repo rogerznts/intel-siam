@@ -3,12 +3,18 @@
 
 use std::path::Path;
 use std::process::ExitCode;
+use std::sync::LazyLock;
 
-use intel_siam::sensors::{self, Network};
+use intel_siam::sensors::{self, Network, Output};
+use ort::environment::Environment;
 use ort::logging::LogLevel;
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::Tensor;
+
+/// ONNX Runtime allows one environment per process; every model's session shares it.
+static ENVIRONMENT: LazyLock<Result<Environment, String>> =
+    LazyLock::new(|| ort::init().with_name("intel-siam-vision").build().map_err(|e| e.to_string()));
 
 fn main() -> ExitCode {
     sensors::run_vision(std::env::args_os().skip(1), Onnx::load)
@@ -18,14 +24,14 @@ fn main() -> ExitCode {
 /// logged.
 struct Onnx {
     session: Session,
-    output: String,
+    outputs: Vec<String>,
 }
 
 impl Onnx {
     fn load(model: &Path) -> Result<Box<dyn Network>, String> {
         let fail = |e: &dyn std::fmt::Display| e.to_string();
-        let env = ort::init().with_name("intel-siam-vision").build().map_err(|e| fail(&e))?;
-        let session = Session::builder(&env)
+        let env = ENVIRONMENT.as_ref().map_err(Clone::clone)?;
+        let session = Session::builder(env)
             .map_err(|e| fail(&e))?
             .with_optimization_level(GraphOptimizationLevel::Level3)
             .map_err(|e| fail(&e))?
@@ -37,17 +43,25 @@ impl Onnx {
             .map_err(|e| fail(&e))?
             .commit_from_file(model)
             .map_err(|e| fail(&e))?;
-        let output = session.outputs().first().ok_or("the model has no output")?.name().to_owned();
-        Ok(Box::new(Self { session, output }))
+        let outputs: Vec<String> = session.outputs().iter().map(|o| o.name().to_owned()).collect();
+        if outputs.is_empty() {
+            return Err("the model has no output".into());
+        }
+        Ok(Box::new(Self { session, outputs }))
     }
 }
 
 impl Network for Onnx {
-    fn run(&mut self, input: Vec<f32>, shape: [usize; 4]) -> Result<(usize, Vec<f32>), String> {
+    fn run(&mut self, input: Vec<f32>, shape: [usize; 4]) -> Result<Vec<Output>, String> {
         let tensor = Tensor::from_array((shape, input)).map_err(|e| e.to_string())?;
-        let outputs = self.session.run(ort::inputs![tensor]).map_err(|e| e.to_string())?;
-        let (shape, values) = outputs[self.output.as_str()].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
-        let dim = shape.last().copied().and_then(|d| usize::try_from(d).ok()).ok_or("the output has no dimension")?;
-        Ok((dim, values.to_vec()))
+        let results = self.session.run(ort::inputs![tensor]).map_err(|e| e.to_string())?;
+        self.outputs
+            .iter()
+            .map(|name| {
+                let (shape, values) = results[name.as_str()].try_extract_tensor::<f32>().map_err(|e| e.to_string())?;
+                let shape = shape.iter().map(|d| usize::try_from(*d).map_err(|_| "negative dimension".to_owned())).collect::<Result<_, _>>()?;
+                Ok(Output { shape, values: values.to_vec() })
+            })
+            .collect()
     }
 }

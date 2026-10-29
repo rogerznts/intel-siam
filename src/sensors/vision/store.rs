@@ -3,7 +3,8 @@
 //!
 //! ```text
 //! <data>/sensors.db                     0600, WAL; `PRAGMA user_version` is the schema version
-//! <data>/img/s/<sensor>/<sha256>.jpg     sample: the whole frame as taught, never pruned
+//! <data>/img/s/<sensor>/<sha256>.jpg     sample: the whole frame as taught (a state sensor) or the
+//!                                       crop of a taught box (an object sensor), never pruned
 //! <data>/img/h/<sensor>/<id>.jpg         history: the whole frame as checked, pruned by retention
 //! ```
 //!
@@ -19,19 +20,20 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::infer::Head;
 use super::logic::{RowCost, retention_plan};
 use crate::frames::StreamKind;
 use crate::sensors::types::{
-    Geometry, HistoryId, Retention, ReviewReason, SampleId, SensorId, SensorValue, Settings, SourceSpec, StateKey,
-    StorageUsage,
+    BoxLabel, Detector, Found, Geometry, HistoryId, LabelId, ObjectClass, ObjectEvent, Retention, ReviewReason,
+    SampleId, SampleLabel, SensorId, SensorValue, Settings, SourceSpec, StateKey, StorageUsage,
 };
 
 /// Each entry upgrades the schema by one version; `user_version` counts the entries applied.
-const MIGRATIONS: &[&str] = &["
+const MIGRATIONS: &[&str] = &[
+    "
     CREATE TABLE sensor (
         id INTEGER PRIMARY KEY,
         source TEXT NOT NULL,
@@ -75,7 +77,20 @@ const MIGRATIONS: &[&str] = &["
     ) STRICT;
     CREATE INDEX history_by_sensor ON history (sensor, id);
     CREATE TABLE setting (key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT;
-"];
+",
+    // Object sensors: a taught box is a sample with `answer` (a `BoxLabel`) and `taught` (a
+    // `TaughtBox`) instead of `label`; a history row keeps what changed and the boxes found.
+    "
+    ALTER TABLE sample ADD COLUMN answer TEXT;
+    ALTER TABLE sample ADD COLUMN taught TEXT;
+    ALTER TABLE history ADD COLUMN events TEXT;
+    ALTER TABLE history ADD COLUMN found TEXT;
+",
+];
+
+/// The `embedding.region` of a taught box: its crop is stored, so no region applies (origin
+/// `teach.EMBEDDING_KEY`).
+pub const TAUGHT_CROP: u64 = 0;
 
 #[derive(Debug)]
 pub struct StoreError(String);
@@ -133,6 +148,23 @@ pub struct TrainRow {
     pub image: PathBuf,
 }
 
+/// Where a taught box was on its frame, and what the detector had called it (`None`: drawn by
+/// the user around something it missed).
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TaughtBox {
+    pub area: [f32; 4],
+    pub detected: Option<ObjectClass>,
+}
+
+/// A taught box for an index: its cached embedding, or the crop to embed.
+pub struct TaughtSample {
+    pub sample: SampleId,
+    pub label: BoxLabel,
+    pub detected: Option<ObjectClass>,
+    pub cached: Option<Vec<f32>>,
+    pub image: PathBuf,
+}
+
 pub struct NewHistory<'a> {
     pub at: SystemTime,
     pub value: &'a SensorValue,
@@ -140,11 +172,13 @@ pub struct NewHistory<'a> {
     pub changed: bool,
     pub review: Option<ReviewReason>,
     pub jpeg: &'a [u8],
+    pub events: &'a [ObjectEvent],
+    pub found: &'a [Found],
 }
 
 pub struct StoredSample {
     pub id: SampleId,
-    pub label: Option<StateKey>,
+    pub label: Option<SampleLabel>,
     pub at: SystemTime,
     pub image: PathBuf,
 }
@@ -155,7 +189,17 @@ pub struct StoredHistory {
     pub value: SensorValue,
     pub confidence: f32,
     pub review: Option<ReviewReason>,
+    pub events: Vec<ObjectEvent>,
     pub image: PathBuf,
+}
+
+/// What a sensor has learned and what waits for the user.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Counts {
+    /// State samples per state.
+    pub states: BTreeMap<StateKey, u32>,
+    pub taught: u32,
+    pub pending: u32,
 }
 
 pub struct Store {
@@ -242,11 +286,7 @@ impl Store {
 
     /// The sample is the image's SHA-256, so teaching the same frame again relabels it.
     pub fn add_sample(&mut self, id: SensorId, jpeg: &[u8], label: StateKey) -> Result<SampleId> {
-        let sha = hex(&Sha256::digest(jpeg));
-        let path = self.sample_path(id, &sha);
-        if !path.is_file() {
-            write_atomic(&path, jpeg)?;
-        }
+        let sha = self.put_sample_file(id, jpeg)?;
         let sample = self.conn.query_row(
             "INSERT INTO sample (sensor, sha256, label, bytes, created_at) VALUES (?, ?, ?, ?, ?)
              ON CONFLICT (sensor, sha256) DO UPDATE SET label = excluded.label RETURNING id",
@@ -256,58 +296,80 @@ impl Store {
         Ok(SampleId(sample))
     }
 
-    /// `None` deletes the sample. `false` when the sensor has no such sample.
-    pub fn relabel(&mut self, id: SensorId, sample: SampleId, label: Option<StateKey>) -> Result<bool> {
-        let Some(label) = label else {
-            let sha: Option<String> = self
-                .conn
-                .query_row("DELETE FROM sample WHERE id = ? AND sensor = ? RETURNING sha256", params![sample.0, key(id)], |r| {
-                    r.get(0)
-                })
-                .optional()?;
-            let Some(sha) = sha else { return Ok(false) };
-            remove_file(&self.sample_path(id, &sha))?;
-            return Ok(true);
+    /// A taught box of an object sensor: `jpeg` is its crop. The same crop again relabels it.
+    pub fn add_taught(&mut self, id: SensorId, jpeg: &[u8], label: BoxLabel, taught: TaughtBox) -> Result<SampleId> {
+        let sha = self.put_sample_file(id, jpeg)?;
+        let sample = self.conn.query_row(
+            "INSERT INTO sample (sensor, sha256, answer, taught, bytes, created_at) VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (sensor, sha256) DO UPDATE SET answer = excluded.answer RETURNING id",
+            params![key(id), sha, json(&label)?, json(&taught)?, jpeg.len() as i64, millis(SystemTime::now())],
+            |r| r.get(0),
+        )?;
+        Ok(SampleId(sample))
+    }
+
+    fn put_sample_file(&self, id: SensorId, jpeg: &[u8]) -> Result<String> {
+        let sha = hex(&Sha256::digest(jpeg));
+        let path = self.sample_path(id, &sha);
+        if !path.is_file() {
+            write_atomic(&path, jpeg)?;
+        }
+        Ok(sha)
+    }
+
+    /// `None` deletes the sample. `false` when the sensor has no such sample of that kind.
+    pub fn relabel(&mut self, id: SensorId, sample: SampleId, label: Option<SampleLabel>) -> Result<bool> {
+        let changed = match label {
+            None => {
+                let sha: Option<String> = self
+                    .conn
+                    .query_row("DELETE FROM sample WHERE id = ? AND sensor = ? RETURNING sha256", params![sample.0, key(id)], |r| {
+                        r.get(0)
+                    })
+                    .optional()?;
+                let Some(sha) = sha else { return Ok(false) };
+                remove_file(&self.sample_path(id, &sha))?;
+                1
+            }
+            Some(SampleLabel::State(state)) => self.conn.execute(
+                "UPDATE sample SET label = ? WHERE id = ? AND sensor = ? AND taught IS NULL",
+                params![u8::from(state), sample.0, key(id)],
+            )?,
+            Some(SampleLabel::Box(label)) => self.conn.execute(
+                "UPDATE sample SET answer = ? WHERE id = ? AND sensor = ? AND taught IS NOT NULL",
+                params![json(&label)?, sample.0, key(id)],
+            )?,
         };
-        let changed = self
-            .conn
-            .execute("UPDATE sample SET label = ? WHERE id = ? AND sensor = ?", params![u8::from(label), sample.0, key(id)])?;
         Ok(changed == 1)
     }
 
-    /// Answers a history item: `Some(state)` copies its frame into a sample. `false` when the sensor
-    /// has no such item.
-    pub fn resolve(&mut self, id: SensorId, item: HistoryId, label: Option<StateKey>) -> Result<bool> {
-        let found: Option<i64> = self
-            .conn
-            .query_row("SELECT id FROM history WHERE id = ? AND sensor = ?", params![item.0, key(id)], |r| r.get(0))
-            .optional()?;
-        if found.is_none() {
-            return Ok(false);
+    /// Deletes the boxes taught as these own labels, with their files.
+    pub fn forget_labels(&mut self, id: SensorId, labels: &[LabelId]) -> Result<()> {
+        for label in labels {
+            let mut stmt = self.conn.prepare("DELETE FROM sample WHERE sensor = ? AND answer = ? RETURNING sha256")?;
+            let shas: Vec<String> = stmt.query_map(params![key(id), json(&BoxLabel::Own(*label))?], |r| r.get(0))?.collect::<Result<_, _>>()?;
+            for sha in shas {
+                remove_file(&self.sample_path(id, &sha))?;
+            }
         }
-        if let Some(label) = label {
-            let jpeg = fs::read(self.history_path(id, item))?;
-            self.add_sample(id, &jpeg, label)?;
-        }
-        self.conn.execute("UPDATE history SET resolved = 1 WHERE id = ?", [item.0])?;
-        Ok(true)
+        Ok(())
     }
 
-    /// Samples per state, and the items waiting for review.
-    pub fn counts(&self, id: SensorId) -> Result<(BTreeMap<StateKey, u32>, u32)> {
+    pub fn counts(&self, id: SensorId) -> Result<Counts> {
         let mut stmt =
             self.conn.prepare("SELECT label, COUNT(*) FROM sample WHERE sensor = ? AND label IS NOT NULL GROUP BY label")?;
-        let mut samples = BTreeMap::new();
+        let mut states = BTreeMap::new();
         for row in stmt.query_map([key(id)], |r| Ok((r.get::<_, u8>(0)?, r.get::<_, u32>(1)?)))? {
             let (label, count) = row?;
-            samples.insert(state_key(label)?, count);
+            states.insert(state_key(label)?, count);
         }
+        let taught = self.conn.query_row("SELECT COUNT(*) FROM sample WHERE sensor = ? AND answer IS NOT NULL", [key(id)], |r| r.get(0))?;
         let pending = self.conn.query_row(
             "SELECT COUNT(*) FROM history WHERE sensor = ? AND review IS NOT NULL AND resolved = 0",
             [key(id)],
             |r| r.get(0),
         )?;
-        Ok((samples, pending))
+        Ok(Counts { states, taught, pending })
     }
 
     /// The labelled samples whose label is one of `labels`.
@@ -325,15 +387,42 @@ impl Store {
             let (sample, label, sha, vector) = row?;
             let label = state_key(label)?;
             if labels.contains(&label) {
-                out.push(TrainRow {
-                    sample: SampleId(sample),
-                    label,
-                    cached: vector.map(|bytes| bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()),
-                    image: self.sample_path(id, &sha),
-                });
+                out.push(TrainRow { sample: SampleId(sample), label, cached: vector.map(floats), image: self.sample_path(id, &sha) });
             }
         }
         Ok(out)
+    }
+
+    /// Every taught box of an object sensor, oldest first.
+    pub fn taught_set(&self, id: SensorId, backbone: &str) -> Result<Vec<TaughtSample>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.answer, s.taught, s.sha256, e.vector FROM sample s
+             LEFT JOIN embedding e ON e.sample = s.id AND e.backbone = ? AND e.region = ?
+             WHERE s.sensor = ? AND s.answer IS NOT NULL ORDER BY s.id",
+        )?;
+        let rows = stmt.query_map(params![backbone, TAUGHT_CROP as i64, key(id)], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?, r.get::<_, String>(3)?, r.get::<_, Option<Vec<u8>>>(4)?))
+        })?;
+        rows.map(|row| {
+            let (sample, answer, taught, sha, vector) = row?;
+            let taught: TaughtBox = serde_json::from_str(&taught)?;
+            Ok(TaughtSample {
+                sample: SampleId(sample),
+                label: serde_json::from_str(&answer)?,
+                detected: taught.detected,
+                cached: vector.map(floats),
+                image: self.sample_path(id, &sha),
+            })
+        })
+        .collect()
+    }
+
+    /// Caches embeddings computed for (backbone, region).
+    pub fn put_embeddings(&mut self, backbone: &str, region: u64, fresh: &[(SampleId, Vec<f32>)]) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        insert_embeddings(&tx, backbone, region, fresh)?;
+        tx.commit()?;
+        Ok(())
     }
 
     /// Caches the new embeddings and keeps the head, or forgets it when there is none.
@@ -346,19 +435,7 @@ impl Store {
         fresh: &[(SampleId, Vec<f32>)],
     ) -> Result<()> {
         let tx = self.conn.transaction()?;
-        {
-            let mut insert =
-                tx.prepare("INSERT OR REPLACE INTO embedding (sample, backbone, region, vector) VALUES (?, ?, ?, ?)")?;
-            for (sample, vector) in fresh {
-                let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
-                // The sample may have been deleted while it was being embedded.
-                if let Err(e) = insert.execute(params![sample.0, backbone, region as i64, bytes])
-                    && !matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::ConstraintViolation))
-                {
-                    return Err(e.into());
-                }
-            }
-        }
+        insert_embeddings(&tx, backbone, region, fresh)?;
         match head {
             Some(head) => tx.execute(
                 "INSERT OR REPLACE INTO head (sensor, backbone, region, head) VALUES (?, ?, ?, ?)",
@@ -391,8 +468,10 @@ impl Store {
             |r| r.get(0),
         )?);
         write_atomic(&self.history_path(id, item), h.jpeg)?;
+        let list = |empty: bool, value: String| (!empty).then_some(value);
         self.conn.execute(
-            "INSERT INTO history (id, sensor, at, value, confidence, changed, review, bytes) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO history (id, sensor, at, value, confidence, changed, review, bytes, events, found)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 item.0,
                 key(id),
@@ -401,27 +480,32 @@ impl Store {
                 f64::from(h.confidence),
                 h.changed,
                 h.review.as_ref().map(json).transpose()?,
-                h.jpeg.len() as i64
+                h.jpeg.len() as i64,
+                list(h.events.is_empty(), json(h.events)?),
+                list(h.found.is_empty(), json(h.found)?),
             ],
         )?;
         Ok(item)
     }
 
     pub fn samples(&self, id: SensorId, before: Option<SampleId>, limit: usize) -> Result<(Vec<StoredSample>, Option<SampleId>)> {
-        let mut stmt = self.conn.prepare("SELECT id, label, created_at, sha256 FROM sample WHERE sensor = ? AND id < ? ORDER BY id DESC LIMIT ?")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT id, label, answer, created_at, sha256 FROM sample WHERE sensor = ? AND id < ? ORDER BY id DESC LIMIT ?",
+        )?;
         let rows = stmt.query_map(params![key(id), before.map_or(i64::MAX, |s| s.0), limit as i64 + 1], |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<u8>>(1)?, r.get::<_, i64>(2)?, r.get::<_, String>(3)?))
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<u8>>(1)?, r.get::<_, Option<String>>(2)?, r.get::<_, i64>(3)?, r.get::<_, String>(4)?))
         })?;
-        let mut rows = rows.map(|row| {
-            let (sample, label, at, sha) = row?;
-            Ok(StoredSample {
-                id: SampleId(sample),
-                label: label.map(state_key).transpose()?,
-                at: time(at),
-                image: self.sample_path(id, &sha),
+        let mut rows = rows
+            .map(|row| {
+                let (sample, label, answer, at, sha) = row?;
+                let label = match (label, answer) {
+                    (Some(state), _) => Some(SampleLabel::State(state_key(state)?)),
+                    (None, Some(answer)) => Some(SampleLabel::Box(serde_json::from_str(&answer)?)),
+                    (None, None) => None,
+                };
+                Ok(StoredSample { id: SampleId(sample), label, at: time(at), image: self.sample_path(id, &sha) })
             })
-        })
-        .collect::<Result<Vec<_>>>()?;
+            .collect::<Result<Vec<_>>>()?;
         let older = (rows.len() > limit).then(|| rows[limit - 1].id);
         rows.truncate(limit);
         Ok((rows, older))
@@ -446,24 +530,52 @@ impl Store {
         Ok((rows, older))
     }
 
-    /// The frame recorded for a history item of this sensor.
-    pub fn history_image(&self, id: SensorId, item: HistoryId) -> Result<Option<PathBuf>> {
-        let found: Option<i64> = self
+    /// One history item of this sensor.
+    pub fn history_item(&self, id: SensorId, item: HistoryId) -> Result<Option<StoredHistory>> {
+        Ok(self.history_rows(id, "WHERE sensor = ?1 AND id = ?2", params![key(id), item.0])?.pop())
+    }
+
+    /// The frame recorded for a history item of this sensor, and the boxes found in it.
+    pub fn history_image(&self, id: SensorId, item: HistoryId) -> Result<Option<(PathBuf, Vec<Found>)>> {
+        let found: Option<Option<String>> = self
             .conn
-            .query_row("SELECT id FROM history WHERE id = ? AND sensor = ?", params![item.0, key(id)], |r| r.get(0))
+            .query_row("SELECT found FROM history WHERE id = ? AND sensor = ?", params![item.0, key(id)], |r| r.get(0))
             .optional()?;
-        Ok(found.map(|_| self.history_path(id, item)))
+        let Some(found) = found else { return Ok(None) };
+        let found = found.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default();
+        Ok(Some((self.history_path(id, item), found)))
+    }
+
+    /// Takes a review item out of the queue.
+    pub fn mark_resolved(&mut self, item: HistoryId) -> Result<()> {
+        self.conn.execute("UPDATE history SET resolved = 1 WHERE id = ?", [item.0])?;
+        Ok(())
     }
 
     pub fn retention(&self) -> Result<Retention> {
-        let value: Option<String> =
-            self.conn.query_row("SELECT value FROM setting WHERE key = 'retention'", [], |r| r.get(0)).optional()?;
-        Ok(value.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default())
+        self.setting("retention").map(Option::unwrap_or_default)
     }
 
     pub fn set_retention(&mut self, retention: Retention) -> Result<()> {
-        self.conn
-            .execute("INSERT OR REPLACE INTO setting (key, value) VALUES ('retention', ?)", [json(&retention)?])?;
+        self.set_setting("retention", &retention)
+    }
+
+    pub fn detector(&self) -> Result<Detector> {
+        self.setting("detector").map(Option::unwrap_or_default)
+    }
+
+    pub fn set_detector(&mut self, detector: Detector) -> Result<()> {
+        self.set_setting("detector", &detector)
+    }
+
+    fn setting<T: for<'de> Deserialize<'de>>(&self, name: &str) -> Result<Option<T>> {
+        let value: Option<String> =
+            self.conn.query_row("SELECT value FROM setting WHERE key = ?", [name], |r| r.get(0)).optional()?;
+        Ok(value.as_deref().map(serde_json::from_str).transpose()?)
+    }
+
+    fn set_setting<T: Serialize>(&mut self, name: &str, value: &T) -> Result<()> {
+        self.conn.execute("INSERT OR REPLACE INTO setting (key, value) VALUES (?, ?)", params![name, json(value)?])?;
         Ok(())
     }
 
@@ -506,18 +618,27 @@ impl Store {
     }
 
     fn history_rows(&self, id: SensorId, filter: &str, args: impl rusqlite::Params) -> Result<Vec<StoredHistory>> {
-        let mut stmt = self.conn.prepare(&format!("SELECT id, at, value, confidence, review FROM history {filter}"))?;
+        let mut stmt =
+            self.conn.prepare(&format!("SELECT id, at, value, confidence, review, events FROM history {filter}"))?;
         let rows = stmt.query_map(args, |r| {
-            Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?, r.get::<_, String>(2)?, r.get::<_, f64>(3)?, r.get::<_, Option<String>>(4)?))
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, String>(2)?,
+                r.get::<_, f64>(3)?,
+                r.get::<_, Option<String>>(4)?,
+                r.get::<_, Option<String>>(5)?,
+            ))
         })?;
         rows.map(|row| {
-            let (item, at, value, confidence, review) = row?;
+            let (item, at, value, confidence, review, events) = row?;
             Ok(StoredHistory {
                 id: HistoryId(item),
                 at: time(at),
                 value: serde_json::from_str(&value)?,
                 confidence: confidence as f32,
                 review: review.as_deref().map(serde_json::from_str).transpose()?,
+                events: events.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default(),
                 image: self.history_path(id, HistoryId(item)),
             })
         })
@@ -565,6 +686,24 @@ impl Store {
         }
         Ok(())
     }
+}
+
+/// The sample may have been deleted while it was being embedded: its vector is then dropped.
+fn insert_embeddings(tx: &rusqlite::Transaction<'_>, backbone: &str, region: u64, fresh: &[(SampleId, Vec<f32>)]) -> Result<()> {
+    let mut insert = tx.prepare("INSERT OR REPLACE INTO embedding (sample, backbone, region, vector) VALUES (?, ?, ?, ?)")?;
+    for (sample, vector) in fresh {
+        let bytes: Vec<u8> = vector.iter().flat_map(|v| v.to_le_bytes()).collect();
+        if let Err(e) = insert.execute(params![sample.0, backbone, region as i64, bytes])
+            && !matches!(e.sqlite_error_code(), Some(rusqlite::ErrorCode::ConstraintViolation))
+        {
+            return Err(e.into());
+        }
+    }
+    Ok(())
+}
+
+fn floats(bytes: Vec<u8>) -> Vec<f32> {
+    bytes.as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect()
 }
 
 /// The database file exists with mode 0600 before SQLite opens it; SQLite gives its WAL and
@@ -646,7 +785,7 @@ pub(super) fn hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sensors::types::{Name, StateDef};
+    use crate::sensors::types::{Name, ObjectKey, StateDef};
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("intel-siam-store-{name}-{}", std::process::id()));
@@ -668,6 +807,10 @@ mod tests {
             settings: Settings::new_states("Portão".to_owned().try_into().unwrap(), states),
             geometry: None,
         }
+    }
+
+    fn history<'a>(at: SystemTime, value: &'a SensorValue, review: Option<ReviewReason>, jpeg: &'static [u8]) -> NewHistory<'a> {
+        NewHistory { at, value, confidence: 0.5, changed: true, review, jpeg, events: &[], found: &[] }
     }
 
     #[test]
@@ -697,12 +840,38 @@ mod tests {
         let a = store.add_sample(id, b"frame a", label(1)).unwrap();
         assert_eq!(store.add_sample(id, b"frame a", label(2)).unwrap(), a, "same image, same sample");
         store.add_sample(id, b"frame b", label(2)).unwrap();
-        assert_eq!(store.counts(id).unwrap().0, [(label(2), 2)].into());
+        assert_eq!(store.counts(id).unwrap().states, [(label(2), 2)].into());
         let path = store.samples(id, None, 100).unwrap().0.into_iter().find(|s| s.id == a).unwrap().image;
         assert!(path.is_file());
         assert!(store.relabel(id, a, None).unwrap());
         assert!(!path.exists());
-        assert!(!store.relabel(SensorId(8), a, Some(label(1))).unwrap(), "another sensor's sample");
+        assert!(!store.relabel(SensorId(8), a, Some(SampleLabel::State(label(1)))).unwrap(), "another sensor's sample");
+    }
+
+    #[test]
+    fn taught_boxes_keep_their_answer_and_go_with_their_own_label() {
+        let dir = temp_dir("taught");
+        let mut store = Store::open(&dir).unwrap();
+        let id = SensorId(9);
+        store.create(&record(9)).unwrap();
+        let car = ObjectClass::by_key("car").unwrap();
+        let ours = LabelId(u64::MAX - 3);
+        let taught = TaughtBox { area: [0.1, 0.2, 0.3, 0.4], detected: Some(car) };
+        let a = store.add_taught(id, b"crop a", BoxLabel::Own(ours), taught).unwrap();
+        let b = store.add_taught(id, b"crop b", BoxLabel::NotThis, TaughtBox { detected: None, ..taught }).unwrap();
+        assert_eq!(store.counts(id).unwrap().taught, 2);
+        let set = store.taught_set(id, "backbone").unwrap();
+        assert_eq!(set.iter().map(|t| (t.sample, t.label, t.detected)).collect::<Vec<_>>(), [(a, BoxLabel::Own(ours), Some(car)), (b, BoxLabel::NotThis, None)]);
+        store.put_embeddings("backbone", TAUGHT_CROP, &[(a, vec![0.5, -1.0])]).unwrap();
+        assert_eq!(store.taught_set(id, "backbone").unwrap()[0].cached, Some(vec![0.5, -1.0]));
+        assert!(!store.relabel(id, a, Some(SampleLabel::State(label(1)))).unwrap(), "a box has no state");
+        assert!(store.relabel(id, b, Some(SampleLabel::Box(BoxLabel::Class(car)))).unwrap());
+        let shown: Vec<Option<SampleLabel>> = store.samples(id, None, 10).unwrap().0.into_iter().map(|s| s.label).collect();
+        assert_eq!(shown, [Some(SampleLabel::Box(BoxLabel::Class(car))), Some(SampleLabel::Box(BoxLabel::Own(ours)))]);
+        let file = store.taught_set(id, "backbone").unwrap()[0].image.clone();
+        store.forget_labels(id, &[ours]).unwrap();
+        assert_eq!(store.taught_set(id, "backbone").unwrap().len(), 1);
+        assert!(!file.exists());
     }
 
     #[test]
@@ -715,8 +884,7 @@ mod tests {
         let items: Vec<HistoryId> = (0..5)
             .map(|i| {
                 let review = (i == 1).then_some(ReviewReason::LowConfidence);
-                let h = NewHistory { at: SystemTime::now(), value: &value, confidence: 0.5, changed: true, review, jpeg: b"jpeg" };
-                store.record(id, &h).unwrap()
+                store.record(id, &history(SystemTime::now(), &value, review, b"jpeg")).unwrap()
             })
             .collect();
         let (page, older) = store.history(id, None, 3).unwrap();
@@ -726,9 +894,37 @@ mod tests {
         assert_eq!(rest.len(), 2);
         assert!(!older);
         assert_eq!(store.reviews(id, 10).unwrap()[0].id, items[1]);
-        assert!(store.resolve(id, items[1], Some(label(2))).unwrap());
+        store.mark_resolved(items[1]).unwrap();
         assert!(store.reviews(id, 10).unwrap().is_empty());
-        assert_eq!(store.counts(id).unwrap(), ([(label(2), 1)].into(), 0));
+        assert_eq!(store.counts(id).unwrap().pending, 0);
+    }
+
+    #[test]
+    fn object_history_keeps_events_and_boxes() {
+        let dir = temp_dir("objects");
+        let mut store = Store::open(&dir).unwrap();
+        let id = SensorId(5);
+        store.create(&record(5)).unwrap();
+        let car = ObjectClass::by_key("car").unwrap();
+        let value = SensorValue::Objects(vec![(ObjectKey::Class(car), 2)]);
+        let found = [Found { class: car, score: 0.9, area: [0.1, 0.1, 0.5, 0.5], verdict: crate::sensors::types::Verdict::Detector }];
+        let events = [ObjectEvent::On(ObjectKey::Class(car))];
+        let row = NewHistory { events: &events, found: &found, ..history(SystemTime::now(), &value, None, b"jpeg") };
+        let item = store.record(id, &row).unwrap();
+        let stored = store.history_item(id, item).unwrap().unwrap();
+        assert_eq!((stored.value, stored.events), (value, events.to_vec()));
+        assert_eq!(store.history_image(id, item).unwrap().unwrap().1, found);
+        assert_eq!(store.history_image(SensorId(6), item).unwrap(), None, "another sensor's item");
+    }
+
+    #[test]
+    fn the_detector_choice_persists() {
+        let dir = temp_dir("detector");
+        let mut store = Store::open(&dir).unwrap();
+        assert_eq!(store.detector().unwrap(), Detector::DfineS);
+        store.set_detector(Detector::DfineN).unwrap();
+        drop(store);
+        assert_eq!(Store::open(&dir).unwrap().detector().unwrap(), Detector::DfineN);
     }
 
     #[test]
@@ -739,8 +935,7 @@ mod tests {
         store.create(&record(4)).unwrap();
         let value = SensorValue::Unknown;
         let old = SystemTime::now() - Duration::from_secs(8 * 24 * 3600);
-        let h = NewHistory { at: old, value: &value, confidence: 0.1, changed: false, review: None, jpeg: b"old" };
-        let item = store.record(id, &h).unwrap();
+        let item = store.record(id, &history(old, &value, None, b"old")).unwrap();
         let file = store.history_path(id, item);
         assert_eq!(store.enforce_retention(SystemTime::now()).unwrap(), 1);
         assert!(!file.exists());

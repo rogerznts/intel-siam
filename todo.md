@@ -38,11 +38,16 @@ Spec: docs/spec/viewer.md. Fluxo: pstack poteto-mode / Feature + architect.
 - [ ] Separar app/UI da lib para retirar AppKit do processo de visão.
 - [ ] Rever proteção de URLs avulsas com senha no SQLite 0600.
 
+## Sensores de Objetos
+- [x] Detector D-FINE (N/S/M/L) atrás do contrato ONNX, filtros, trilhas, recheck, rótulos próprios, revisão.
+- [x] Smoke do processo de visão com D-FINE S baixado e fotos reais (docs/spec/sensors-ui-verification.md).
+- [ ] Smoke na UI real com capturas: a janela não renderizou num Space visível e o AX ficou bloqueado.
+- [ ] Aviso "visto de leve" ao desenhar caixa perdida e ensino a partir de quadro do histórico.
+
 ## Roadmap (futuro)
 - [ ] Gravação contínua e por evento.
 - [ ] Screenshots de uma câmera ou da grade.
 - [ ] Integração com Google Drive (envio de gravações e screenshots).
-- [ ] Sensores de Objetos.
 - [ ] Sensores de Pessoas e reconhecimento facial.
 - [ ] Sensores de Leituras (placas, texto e valores).
 - [ ] Publicação MQTT.

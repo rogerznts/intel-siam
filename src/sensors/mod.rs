@@ -4,6 +4,7 @@
 //! vision process are private submodules: code outside `sensors` cannot name a protocol message.
 
 mod client;
+mod coco;
 #[cfg(test)]
 mod client_tests;
 mod types;
@@ -14,6 +15,7 @@ use std::ffi::OsString;
 use std::path::Path;
 use std::process::ExitCode;
 
+pub use coco::*;
 pub use types::*;
 pub use client::Sensors;
 
@@ -33,8 +35,14 @@ pub fn vision_child(program: &Path, data: &Path, ffmpeg: &Path, logs: &Path) -> 
 /// A neural network run on the CPU. The `intel-siam-vision` binary supplies the ONNX Runtime one,
 /// so the library never names ONNX Runtime and the UI binary links none of it.
 pub trait Network {
-    /// One NCHW `f32` input; the first output's last dimension and its values.
-    fn run(&mut self, input: Vec<f32>, shape: [usize; 4]) -> Result<(usize, Vec<f32>), String>;
+    /// One NCHW `f32` input; every output, in the model's order.
+    fn run(&mut self, input: Vec<f32>, shape: [usize; 4]) -> Result<Vec<Output>, String>;
+}
+
+/// One output tensor of a `Network`.
+pub struct Output {
+    pub shape: Vec<usize>,
+    pub values: Vec<f32>,
 }
 
 /// Opens the verified model file at the path.

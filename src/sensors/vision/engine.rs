@@ -1,6 +1,7 @@
 //! The engine: the single owner of every sensor's settings, runtime state and storage. It waits for
-//! the next input or deadline, handles it, then runs `tick`. Decisions come from `logic`, pixel work
-//! from `pixels`, persistence from `store`, frames from `feeds`, vectors and heads from `infer`.
+//! the next input or deadline, handles it, then runs `tick`. Decisions come from `logic` and
+//! `teach`, pixel work from `pixels`, persistence from `store`, frames from `feeds`, vectors, heads
+//! and boxes from `infer`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
@@ -13,19 +14,22 @@ use egui::ColorImage;
 
 use super::Input;
 use super::feeds::{FeedId, FeedSource, Feeds};
-use super::infer::{BACKBONE, Done, Infer, Job, ModelEvent, Trained};
+use super::infer::{BACKBONE, Compare, DetectRequest, Done, Indexed, Infer, Job, Model, ModelEvent, Trained};
 use super::logic::{
-    self, CheckKind, Debouncer, FeedFact, GeometryVerdict, REVIEW, Schedule, Signature, StatusFacts,
+    self, CheckKind, Debouncer, FeedFact, GeometryVerdict, ObjectTrack, REVIEW, Schedule, Signature, StatusFacts,
 };
-use super::pixels;
-use super::store::{NewHistory, SensorRecord, Store, StoreError, StoredHead, StoredHistory};
+use super::pixels::{self, Rgb};
+use super::store::{Counts, NewHistory, SensorRecord, Store, StoreError, StoredHead, StoredHistory, TAUGHT_CROP, TaughtBox};
+use super::teach::{self, TaughtIndex};
 use crate::frames::StreamKey;
 use crate::plan::RtspUrl;
 use crate::procs::UrlKey;
 use crate::sensors::types::{
-    Detail, FocusView, FrameId, Geometry, HistoryItem, ImageId, Interest, KindLive, KindSettings, ModelState,
-    ModelStatus, Notice, NoticeKind, OpenedItem, Preview, SampleItem, SensorEntry, SensorId, SensorStatus, SensorValue,
-    SourceSpec, SourceView, StateKey, StatesLive, SystemStatus, Tab, UserCommand,
+    BoxLabel, Detail, Detector, FocusView, Found, FrameId, Geometry, HistoryId, HistoryItem, ImageId, Interest, KindLive,
+    KindSettings, LabelId, MAX_TAUGHT, ModelState, ModelStatus, NormBox, Notice, NoticeKind, ObjectClass, ObjectEvent,
+    ObjectKey, ObjectsLive, ObjectsSettings, OpenedItem, Preview, Question, ReviewReason, SampleItem, SampleLabel,
+    SensorEntry, SensorId, SensorStatus, SensorValue, Settings, SourceSpec, SourceView, StateKey, StatesLive,
+    StatesSettings, SystemStatus, Tab, TrackView, UserCommand, Verdict,
 };
 use crate::sensors::wire::{Command, Desired, HEARTBEAT, MAX_WIRE_EDGE, PROTOCOL, Report};
 
@@ -69,8 +73,10 @@ pub struct Engine {
     sent_wants: Option<BTreeSet<StreamKey>>,
     /// `None` until the first `Focus`; then exactly what the app holds.
     sent_focus: Option<Option<FocusView>>,
-    model: ModelState,
-    model_retry_at: Option<Instant>,
+    /// Models never asked for are `NotNeeded`.
+    models: BTreeMap<Model, ModelState>,
+    model_retry: BTreeMap<Model, Instant>,
+    detector: Detector,
     notice: Option<Notice>,
     preview: Option<Shown>,
     next_id: u64,
@@ -86,7 +92,8 @@ struct Shown {
     sensor: SensorId,
     preview: Preview,
     image: ColorImage,
-    seq: u64,
+    /// The feed frame it came from; `None` for an object sensor's analysed frame.
+    seq: Option<u64>,
 }
 
 /// A sensor's record (written through: store first, then this copy, by the same method) and its
@@ -94,58 +101,97 @@ struct Shown {
 struct Sensor {
     rec: SensorRecord,
     schedule: Schedule,
-    debouncer: Debouncer<SensorValue>,
     /// The region's signature at the last full check: what a probe compares with.
     baseline: Option<Signature>,
-    /// Preview frames, so `Teach` labels the frame the user saw.
+    /// Frames shown in the preview, so teaching labels the frame the user saw.
     recent: VecDeque<(FrameId, Arc<ColorImage>)>,
-    /// The frame being embedded. One check in flight at most; a due check meanwhile waits.
+    /// The frame being checked. One check in flight at most; a due check meanwhile waits.
     in_flight: Option<Arc<ColorImage>>,
+    /// A head to fit (state sensor) or an index to build (object sensor).
     retrain_at: Option<Instant>,
     training: bool,
-    head: Option<StoredHead>,
-    probabilities: Vec<(StateKey, f32)>,
-    /// When the published value changed, within the flip window.
-    changes: VecDeque<Instant>,
-    last_flag: Option<Instant>,
     /// The source's size when it differs from the recorded one.
     geometry_seen: Option<Geometry>,
     last_check: Option<SystemTime>,
     failure: Option<String>,
     notice: Option<Notice>,
-    samples: BTreeMap<StateKey, u32>,
-    review_pending: u32,
+    counts: Counts,
     sent: Option<SensorEntry>,
+    run: Run,
+}
+
+/// The runtime state of the sensor's kind; always the kind of `rec.settings.kind`.
+enum Run {
+    States(StatesRun),
+    Objects(ObjectsRun),
+}
+
+#[derive(Default)]
+struct StatesRun {
+    debouncer: Debouncer<SensorValue>,
+    head: Option<StoredHead>,
+    probabilities: Vec<(StateKey, f32)>,
+    /// When the published value changed, within the flip window.
+    changes: VecDeque<Instant>,
+    last_flag: Option<Instant>,
+}
+
+#[derive(Default)]
+struct ObjectsRun {
+    tracks: BTreeMap<ObjectKey, ObjectTrack>,
+    /// What the taught boxes compare with; `None` when nothing was taught or teaching is off.
+    index: Option<Arc<TaughtIndex>>,
+    /// The last checked frame and the boxes found in it.
+    analysed: Option<(FrameId, Arc<ColorImage>)>,
+    found: Vec<Found>,
+    /// When each own label was last asked about.
+    asked: BTreeMap<LabelId, Instant>,
+    filtered: BTreeSet<ObjectClass>,
+    filtered_logged: BTreeMap<ObjectClass, Instant>,
+}
+
+/// A sensor's settings together with its runtime state of the same kind.
+enum Kind<'a> {
+    States(&'a StatesSettings, &'a mut StatesRun),
+    Objects(&'a ObjectsSettings, &'a mut ObjectsRun),
 }
 
 impl Sensor {
     fn new(rec: SensorRecord) -> Self {
+        let run = match rec.settings.kind {
+            KindSettings::States(_) => Run::States(StatesRun::default()),
+            KindSettings::Objects(_) => Run::Objects(ObjectsRun::default()),
+        };
         Self {
             rec,
             schedule: Schedule::default(),
-            debouncer: Debouncer::default(),
             baseline: None,
             recent: VecDeque::new(),
             in_flight: None,
             retrain_at: None,
             training: false,
-            head: None,
-            probabilities: Vec::new(),
-            changes: VecDeque::new(),
-            last_flag: None,
             geometry_seen: None,
             last_check: None,
             failure: None,
             notice: None,
-            samples: BTreeMap::new(),
-            review_pending: 0,
+            counts: Counts::default(),
             sent: None,
+            run,
+        }
+    }
+
+    fn kind(&mut self) -> Kind<'_> {
+        match (&self.rec.settings.kind, &mut self.run) {
+            (KindSettings::States(settings), Run::States(run)) => Kind::States(settings, run),
+            (KindSettings::Objects(settings), Run::Objects(run)) => Kind::Objects(settings, run),
+            _ => unreachable!("Configure never changes the kind"),
         }
     }
 
     /// The head, if it was trained for this backbone and the current region.
     fn head(&self) -> Option<&StoredHead> {
-        self.head.as_ref().filter(|h| h.backbone == BACKBONE.id && h.region == self.rec.settings.region.hash())
+        let Run::States(run) = &self.run else { return None };
+        run.head.as_ref().filter(|h| h.backbone == BACKBONE.id && h.region == self.rec.settings.region.hash())
     }
 
     fn feed(&self) -> FeedId {
@@ -153,6 +199,18 @@ impl Sensor {
             SourceSpec::Dvr(camera) => FeedId::Dvr(StreamKey { camera: camera.clone(), kind: self.rec.stream }),
             SourceSpec::Url(url) => FeedId::Url(UrlKey::of(url.expose()), self.rec.stream),
         }
+    }
+
+    /// Keeps a frame the user may teach from, the newest `FRAME_RING`.
+    fn hold(&mut self, frame: FrameId, image: Arc<ColorImage>) {
+        self.recent.push_back((frame, image));
+        if self.recent.len() > FRAME_RING {
+            self.recent.pop_front();
+        }
+    }
+
+    fn held(&self, frame: FrameId) -> Option<Arc<ColorImage>> {
+        self.recent.iter().find(|(f, _)| *f == frame).map(|(_, image)| image.clone())
     }
 
     fn note(&mut self, kind: NoticeKind) {
@@ -166,19 +224,21 @@ impl Engine {
         let mut sensors: BTreeMap<SensorId, Sensor> =
             store.sensors()?.into_iter().map(|rec| (rec.id, Sensor::new(rec))).collect();
         for (id, head) in store.heads()? {
-            if let Some(s) = sensors.get_mut(&id) {
-                s.head = Some(head);
+            if let Some(Run::States(run)) = sensors.get_mut(&id).map(|s| &mut s.run) {
+                run.head = Some(head);
             }
         }
         for (id, s) in &mut sensors {
-            (s.samples, s.review_pending) = store.counts(*id)?;
-            // Rebuild from durable samples if the previous process exited before training finished.
-            if !s.samples.is_empty() || s.head.is_some() {
+            s.counts = store.counts(*id)?;
+            // Rebuild from durable samples if the previous process exited before training finished,
+            // and build the index of taught boxes, which lives in memory only.
+            if !s.counts.states.is_empty() || s.head().is_some() || s.counts.taught > 0 {
                 s.retrain_at = Some(Instant::now());
             }
         }
         let now = Instant::now();
         let engine = Self {
+            detector: store.detector()?,
             store,
             feeds,
             infer,
@@ -189,8 +249,8 @@ impl Engine {
             wants: BTreeSet::new(),
             sent_wants: None,
             sent_focus: None,
-            model: ModelState::NotNeeded,
-            model_retry_at: None,
+            models: BTreeMap::new(),
+            model_retry: BTreeMap::new(),
             notice: None,
             preview: None,
             next_id: 1,
@@ -234,15 +294,13 @@ impl Engine {
             Input::Command(Command::User(cmd)) => self.user(cmd, now),
             Input::Infer(Done::Embedded { sensor, vector }) => self.embedded(sensor, vector, now),
             Input::Infer(Done::Trained { sensor, region, outcome }) => self.trained(sensor, region, outcome, now),
-            Input::Model(event) => {
-                self.model = match event {
-                    ModelEvent::Progress { done, total } => ModelState::Downloading { done, total },
-                    ModelEvent::Ready => ModelState::Ready,
-                    ModelEvent::Failed(error) => {
-                        self.model_retry_at = Some(now + MODEL_RETRY);
-                        ModelState::Failed(error)
-                    }
-                };
+            Input::Infer(Done::Indexed { sensor, outcome }) => self.indexed(sensor, outcome),
+            Input::Infer(Done::Detected { sensor, found }) => self.detected(sensor, found, now),
+            Input::Model(ModelEvent { model, state }) => {
+                if matches!(state, ModelState::Failed(_)) {
+                    self.model_retry.insert(model, now + MODEL_RETRY);
+                }
+                self.models.insert(model, state);
                 self.system_dirty = true;
             }
         }
@@ -280,32 +338,7 @@ impl Engine {
                     Err(e) => self.note(NoticeKind::Store(e.to_string())),
                 }
             }
-            UserCommand::Configure { id, settings } => {
-                let Some(s) = self.sensors.get_mut(&id) else { return };
-                if std::mem::discriminant(&s.rec.settings.kind) != std::mem::discriminant(&settings.kind) {
-                    s.note(NoticeKind::KindMismatch);
-                    return;
-                }
-                let mut rec = s.rec.clone();
-                let retrain = rec.settings.region != settings.region || rec.settings.kind != settings.kind;
-                if rec.settings.region != settings.region {
-                    s.baseline = None;
-                }
-                rec.settings = settings;
-                rec.geometry = s.geometry_seen.or(rec.geometry);
-                match self.store.update(&rec) {
-                    Ok(()) => {
-                        s.rec = rec;
-                        s.geometry_seen = None;
-                        if retrain {
-                            s.retrain_at = Some(now);
-                        }
-                        self.feeds_dirty = true;
-                        self.focus_dirty = true;
-                    }
-                    Err(e) => s.note(NoticeKind::Store(e.to_string())),
-                }
-            }
+            UserCommand::Configure { id, settings } => self.configure(id, settings, now),
             UserCommand::Delete(id) => {
                 if !self.sensors.contains_key(&id) {
                     return;
@@ -329,26 +362,36 @@ impl Engine {
             }
             UserCommand::Teach { id, frame, state } => {
                 let Some(s) = self.sensors.get_mut(&id) else { return };
-                let KindSettings::States(states) = &s.rec.settings.kind;
-                if !states.states.iter().any(|d| d.key == state) {
-                    s.note(NoticeKind::UnknownItem);
+                let refusal = match s.kind() {
+                    Kind::States(states, _) if states.states.iter().any(|d| d.key == state) => None,
+                    Kind::States(..) => Some(NoticeKind::UnknownItem),
+                    Kind::Objects(..) => Some(NoticeKind::KindMismatch),
+                };
+                if let Some(refusal) = refusal {
+                    s.note(refusal);
                     return;
                 }
-                let Some((_, image)) = s.recent.iter().find(|(f, _)| *f == frame) else {
+                let Some(image) = s.held(frame) else {
                     s.note(NoticeKind::FrameExpired);
                     return;
                 };
-                let added = pixels::encode_jpeg(image, SAMPLE_QUALITY)
-                    .map_err(|e| StoreError::from(std::io::Error::other(e)))
-                    .and_then(|jpeg| self.store.add_sample(id, &jpeg, state));
+                let added = jpeg(&Rgb::from(&*image), SAMPLE_QUALITY).and_then(|jpeg| self.store.add_sample(id, &jpeg, state));
                 self.learned(id, added.map(|_| true), now);
             }
-            UserCommand::Resolve { id, item, state } => {
-                let resolved = self.store.resolve(id, item, state);
+            UserCommand::TeachBox { id, frame, area, detected, label } => self.teach_box(id, frame, area, detected, label, now),
+            UserCommand::Resolve { id, item, label } => {
+                let resolved = self.resolve(id, item, label);
                 self.learned(id, resolved, now);
             }
-            UserCommand::Relabel { id, sample, state } => {
-                let relabelled = self.store.relabel(id, sample, state);
+            UserCommand::Relabel { id, sample, label } => {
+                let Some(s) = self.sensors.get_mut(&id) else { return };
+                let fits = match (label, s.kind()) {
+                    (None, _) => true,
+                    (Some(SampleLabel::State(state)), Kind::States(states, _)) => states.states.iter().any(|d| d.key == state),
+                    (Some(SampleLabel::Box(label)), Kind::Objects(objects, _)) => box_label_fits(objects, label, None),
+                    _ => false,
+                };
+                let relabelled = if fits { self.store.relabel(id, sample, label) } else { Ok(false) };
                 self.learned(id, relabelled, now);
             }
             UserCommand::SetRetention(retention) => {
@@ -358,7 +401,106 @@ impl Engine {
                 self.next_retention = now;
                 self.system_dirty = true;
             }
+            UserCommand::SetDetector(detector) => {
+                match self.store.set_detector(detector) {
+                    Ok(()) => self.detector = detector,
+                    Err(e) => self.note(NoticeKind::Store(e.to_string())),
+                }
+                self.system_dirty = true;
+            }
         }
+    }
+
+    fn configure(&mut self, id: SensorId, settings: Settings, now: Instant) {
+        let Some(s) = self.sensors.get_mut(&id) else { return };
+        if std::mem::discriminant(&s.rec.settings.kind) != std::mem::discriminant(&settings.kind) {
+            s.note(NoticeKind::KindMismatch);
+            return;
+        }
+        let forgotten: Vec<LabelId> = match (&s.rec.settings.kind, &settings.kind) {
+            (KindSettings::Objects(old), KindSettings::Objects(new)) => {
+                old.labels.iter().map(|l| l.id).filter(|id| new.labels.get(*id).is_none()).collect()
+            }
+            _ => Vec::new(),
+        };
+        let mut rec = s.rec.clone();
+        let retrain = rec.settings.region != settings.region || rec.settings.kind != settings.kind;
+        if rec.settings.region != settings.region {
+            s.baseline = None;
+        }
+        rec.settings = settings;
+        rec.geometry = s.geometry_seen.or(rec.geometry);
+        let saved = self.store.update(&rec).and_then(|()| self.store.forget_labels(id, &forgotten)).and_then(|()| self.store.counts(id));
+        match saved {
+            Ok(counts) => {
+                s.rec = rec;
+                s.counts = counts;
+                s.geometry_seen = None;
+                if retrain {
+                    s.retrain_at = Some(now);
+                }
+                self.feeds_dirty = true;
+                self.focus_dirty = true;
+            }
+            Err(e) => s.note(NoticeKind::Store(e.to_string())),
+        }
+    }
+
+    /// One box of a held frame taught as `label` (origin `teach_box`): its crop becomes a sample.
+    fn teach_box(&mut self, id: SensorId, frame: FrameId, area: NormBox, detected: Option<ObjectClass>, label: BoxLabel, now: Instant) {
+        let Some(s) = self.sensors.get_mut(&id) else { return };
+        let taught = s.counts.taught as usize;
+        let region = s.rec.settings.region.clone();
+        let refusal = match s.kind() {
+            Kind::States(..) => Some(NoticeKind::KindMismatch),
+            Kind::Objects(objects, _) if !box_label_fits(objects, label, Some(detected)) => Some(NoticeKind::UnknownItem),
+            Kind::Objects(..) if taught >= MAX_TAUGHT => Some(NoticeKind::TaughtFull),
+            Kind::Objects(..) => {
+                let [x1, _, x2, y2] = area.area();
+                (!logic::in_region((x1 + x2) / 2.0, y2, &region)).then_some(NoticeKind::OutsideRegion)
+            }
+        };
+        if let Some(refusal) = refusal {
+            s.note(refusal);
+            return;
+        }
+        let Some(image) = s.held(frame) else {
+            s.note(NoticeKind::FrameExpired);
+            return;
+        };
+        let added = self.add_taught(id, &image, TaughtBox { area: area.area(), detected }, label);
+        self.learned(id, added.map(|_| true), now);
+    }
+
+    fn add_taught(&mut self, id: SensorId, frame: &ColorImage, taught: TaughtBox, label: BoxLabel) -> Result<(), StoreError> {
+        let crop = pixels::crop_box(frame, teach::crop_area(taught.area));
+        let jpeg = jpeg(&crop, SAMPLE_QUALITY)?;
+        self.store.add_taught(id, &jpeg, label, taught).map(|_| ())
+    }
+
+    /// A state sensor's answer turns the frame into a sample; an object sensor's teaches the box it
+    /// asked about. `false` when the item or the answer does not belong to the sensor.
+    fn resolve(&mut self, id: SensorId, item: HistoryId, label: Option<SampleLabel>) -> Result<bool, StoreError> {
+        let Some(s) = self.sensors.get_mut(&id) else { return Ok(false) };
+        let Some(row) = self.store.history_item(id, item)? else { return Ok(false) };
+        match (label, s.kind()) {
+            (None, _) => {}
+            (Some(SampleLabel::State(state)), Kind::States(states, _)) if states.states.iter().any(|d| d.key == state) => {
+                let jpeg = fs::read(&row.image)?;
+                self.store.add_sample(id, &jpeg, state)?;
+            }
+            (Some(SampleLabel::Box(label)), Kind::Objects(objects, _)) => {
+                let Some(ReviewReason::Ask(question)) = row.review else { return Ok(false) };
+                if !box_label_fits(objects, label, Some(Some(question.detected))) {
+                    return Ok(false);
+                }
+                let frame = pixels::decode(&fs::read(&row.image)?).map_err(|e| StoreError::from(std::io::Error::other(e)))?;
+                self.add_taught(id, &frame, TaughtBox { area: question.area, detected: Some(question.detected) }, label)?;
+            }
+            _ => return Ok(false),
+        }
+        self.store.mark_resolved(item)?;
+        Ok(true)
     }
 
     /// After the samples or the review queue changed: fresh counts, a retrain within
@@ -372,7 +514,7 @@ impl Engine {
             Err(e) => s.note(NoticeKind::Store(e.to_string())),
         }
         match counts {
-            Ok(counts) => (s.samples, s.review_pending) = counts,
+            Ok(counts) => s.counts = counts,
             Err(e) => s.note(NoticeKind::Store(e.to_string())),
         }
         self.focus_dirty = true;
@@ -390,40 +532,45 @@ impl Engine {
             }
         };
         s.failure = None;
-        let KindSettings::States(states) = &s.rec.settings.kind;
-        let probabilities = s.head().map(|h| h.head.predict(&vector, &states.states)).unwrap_or_default();
+        let probabilities = match (s.head(), &s.rec.settings.kind) {
+            (Some(head), KindSettings::States(states)) => head.head.predict(&vector, &states.states),
+            _ => Vec::new(),
+        };
+        let Kind::States(states, run) = s.kind() else { return };
         let (value, top) = logic::state_verdict(&probabilities, states.threshold);
-        let changed = s.debouncer.update(value.clone(), states.debounce);
+        let changed = run.debouncer.update(value.clone(), states.debounce);
         if changed {
-            s.changes.push_back(now);
+            run.changes.push_back(now);
         }
         let confidence = top.map_or(0.0, |(_, p)| p);
         let review = if probabilities.is_empty() {
             None
         } else {
-            let recent = logic::recent_changes(&REVIEW, &mut s.changes, now);
-            let since = s.last_flag.map(|at| now.duration_since(at));
+            let recent = logic::recent_changes(&REVIEW, &mut run.changes, now);
+            let since = run.last_flag.map(|at| now.duration_since(at));
             let reason = logic::review_reason(&REVIEW, confidence, states.threshold, recent, since, roll());
             if reason.is_some() {
-                s.last_flag = Some(now);
+                run.last_flag = Some(now);
             }
             reason
         };
-        s.probabilities = probabilities;
+        run.probabilities = probabilities;
         s.last_check = Some(SystemTime::now());
         if !changed && review.is_none() {
             return;
         }
-        let at = SystemTime::now();
-        let recorded = pixels::encode_jpeg(&frame, HISTORY_QUALITY)
-            .map_err(|e| StoreError::from(std::io::Error::other(e)))
-            .and_then(|jpeg| {
-                let row = NewHistory { at, value: &value, confidence, changed, review, jpeg: &jpeg };
-                self.store.record(id, &row)
-            });
+        let row = NewHistory { at: SystemTime::now(), value: &value, confidence, changed, review, jpeg: &[], events: &[], found: &[] };
+        self.record(id, &frame, row);
+    }
+
+    /// One history row with the checked frame; a new view when the panel shows this sensor.
+    fn record(&mut self, id: SensorId, frame: &ColorImage, row: NewHistory<'_>) {
+        let review = row.review.is_some();
+        let recorded = jpeg(&Rgb::from(frame), HISTORY_QUALITY).and_then(|jpeg| self.store.record(id, &NewHistory { jpeg: &jpeg, ..row }));
+        let Some(s) = self.sensors.get_mut(&id) else { return };
         match recorded {
             Ok(_) => {
-                s.review_pending += u32::from(review.is_some());
+                s.counts.pending += u32::from(review);
                 self.focus_dirty |= self.interest.sensor == Some(id);
                 self.system_dirty = true;
             }
@@ -449,9 +596,108 @@ impl Engine {
             return;
         }
         s.failure = None;
-        s.head = head.map(|head| StoredHead { backbone: BACKBONE.id.to_owned(), region, head });
+        if let Run::States(run) = &mut s.run {
+            run.head = head.map(|head| StoredHead { backbone: BACKBONE.id.to_owned(), region, head });
+        }
         // The value follows the new head at once (origin: "the training checks again when done").
         s.schedule.force = true;
+    }
+
+    /// The taught boxes are ready to compare with; the next check uses them at once (origin
+    /// `taught_changed`).
+    fn indexed(&mut self, id: SensorId, outcome: Result<Indexed, String>) {
+        let Some(s) = self.sensors.get_mut(&id) else { return };
+        s.training = false;
+        let Indexed { index, fresh } = match outcome {
+            Ok(indexed) => indexed,
+            Err(error) => {
+                s.failure = Some(error);
+                return;
+            }
+        };
+        if let Err(e) = self.store.put_embeddings(BACKBONE.id, TAUGHT_CROP, &fresh) {
+            s.note(NoticeKind::Store(e.to_string()));
+        }
+        s.failure = None;
+        if let Run::Objects(run) = &mut s.run {
+            run.index = index.map(Arc::new);
+        }
+        s.schedule.force = true;
+    }
+
+    /// One check of an object sensor came back (origin `_run_objects` from the tracks on): the
+    /// tracks move, what changed goes to the history, unsure own labels are asked about.
+    fn detected(&mut self, id: SensorId, found: Result<Vec<Found>, String>, now: Instant) {
+        let frame_id = FrameId(self.next_id);
+        self.next_id += 1;
+        let Some(s) = self.sensors.get_mut(&id) else { return };
+        let Some(frame) = s.in_flight.take() else { return };
+        let found = match found {
+            Ok(found) => found,
+            Err(error) => {
+                s.failure = Some(error);
+                return;
+            }
+        };
+        s.failure = None;
+        s.last_check = Some(SystemTime::now());
+        let Kind::Objects(objects, run) = s.kind() else { return };
+        let keys = objects.keys();
+        let changed = logic::update_tracks(&mut run.tracks, &found, &keys, objects.debounce, objects.clear_after.get(), now);
+        let (filtered, newly) = logic::filtered_classes(&found, &run.filtered, &run.filtered_logged, now);
+        run.filtered = filtered;
+        let mut events: Vec<ObjectEvent> =
+            changed.iter().map(|k| if run.tracks[k].on { ObjectEvent::On(*k) } else { ObjectEvent::Off(*k) }).collect();
+        let mut confidence = changed.iter().map(|k| run.tracks[k].score).fold(0.0, f32::max);
+        for class in newly {
+            run.filtered_logged.insert(class, now);
+            events.push(ObjectEvent::Filtered(class));
+            confidence = found.iter().filter(|f| f.filtered() && f.class == class).map(|f| f.score).fold(confidence, f32::max);
+        }
+        let asks: Vec<Question> = logic::questions(&REVIEW, &found, &run.asked, now)
+            .into_iter()
+            .filter_map(|(label, f)| match f.verdict {
+                Verdict::Unsure { similarity, .. } => {
+                    Some(Question { label, detected: f.class, area: f.area, similarity })
+                }
+                _ => None,
+            })
+            .collect();
+        let value = logic::present(&run.tracks, &keys);
+        run.analysed = Some((frame_id, frame.clone()));
+        run.found = found.clone();
+        let recheck = logic::recheck_at(&run.tracks, now);
+        s.schedule.recheck_at = recheck;
+        self.focus_dirty |= self.interest.sensor == Some(id) && self.interest.tab == Tab::Live;
+        if !events.is_empty() {
+            let row = NewHistory { at: SystemTime::now(), value: &value, confidence, changed: true, review: None, jpeg: &[], events: &events, found: &found };
+            self.record(id, &frame, row);
+        }
+        for question in asks {
+            self.ask(id, &frame, &value, &found, question, now);
+        }
+    }
+
+    /// "Is this <label>?" in the review queue, unless a question about that label already waits
+    /// there (origin `_record_question`).
+    fn ask(&mut self, id: SensorId, frame: &ColorImage, value: &SensorValue, found: &[Found], question: Question, now: Instant) {
+        let waiting = match self.store.reviews(id, REVIEW_PAGE) {
+            Ok(rows) => rows.iter().any(|r| matches!(r.review, Some(ReviewReason::Ask(q)) if q.label == question.label)),
+            Err(e) => {
+                self.note(NoticeKind::Store(e.to_string()));
+                return;
+            }
+        };
+        if waiting {
+            return;
+        }
+        if let Some(Run::Objects(run)) = self.sensors.get_mut(&id).map(|s| &mut s.run) {
+            run.asked.insert(question.label, now);
+        }
+        let confidence = found.iter().filter(|f| f.area == question.area).map(|f| f.score).fold(0.0, f32::max);
+        let review = Some(ReviewReason::Ask(question));
+        let row = NewHistory { at: SystemTime::now(), value, confidence, changed: false, review, jpeg: &[], events: &[], found };
+        self.record(id, frame, row);
     }
 
     /// Everything time-driven, then whatever changed goes out. Returns the next deadline.
@@ -465,9 +711,9 @@ impl Engine {
         if let Some(wait) = self.feeds.poll(now) {
             soon(now + wait);
         }
-        self.ensure_model(now);
-        if let Some(at) = self.model_retry_at {
-            soon(at);
+        self.ensure_models(now);
+        for at in self.model_retry.values() {
+            soon(*at);
         }
         let ids: Vec<SensorId> = self.sensors.keys().copied().collect();
         for id in &ids {
@@ -508,25 +754,49 @@ impl Engine {
         next
     }
 
-    /// The model is needed once a sensor has samples to learn or a head to check with: fetched
-    /// once, retried after a failure. A sensor nobody taught yet downloads nothing.
-    fn ensure_model(&mut self, now: Instant) {
-        let due = match self.model {
-            ModelState::NotNeeded => self.sensors.values().any(|s| s.retrain_at.is_some() || s.head.is_some()),
-            ModelState::Failed(_) => self.model_retry_at.is_some_and(|at| at <= now),
-            ModelState::Downloading { .. } | ModelState::Ready => false,
-        };
-        if due {
-            self.model_retry_at = None;
-            self.model = ModelState::Downloading { done: 0, total: BACKBONE.size };
-            self.system_dirty = true;
-            self.infer.ensure();
+    /// The backbone is needed once a state sensor has samples to learn or a head to check with, or
+    /// an object sensor has taught boxes to compare; the detector once an object sensor exists.
+    /// Each is fetched once and retried after a failure. A sensor nobody taught downloads nothing.
+    fn ensure_models(&mut self, now: Instant) {
+        let mut needed = BTreeSet::new();
+        for s in self.sensors.values() {
+            match &s.rec.settings.kind {
+                KindSettings::States(_) if s.retrain_at.is_some() || s.head().is_some() => {
+                    needed.insert(Model::Backbone);
+                }
+                KindSettings::States(_) => {}
+                KindSettings::Objects(objects) => {
+                    needed.insert(Model::Detector(self.detector));
+                    if objects.use_taught && s.counts.taught > 0 {
+                        needed.insert(Model::Backbone);
+                    }
+                }
+            }
         }
+        for model in needed {
+            let due = match self.models.get(&model) {
+                None | Some(ModelState::NotNeeded) => true,
+                Some(ModelState::Failed(_)) => self.model_retry.get(&model).is_some_and(|at| *at <= now),
+                Some(ModelState::Downloading { .. } | ModelState::Ready) => false,
+            };
+            if due {
+                self.model_retry.remove(&model);
+                self.models.insert(model, ModelState::Downloading { done: 0, total: model.spec().size });
+                self.system_dirty = true;
+                self.infer.ensure(model);
+            }
+        }
+    }
+
+    fn model(&self, model: Model) -> ModelState {
+        self.models.get(&model).cloned().unwrap_or(ModelState::NotNeeded)
     }
 
     /// One sensor's geometry, retrain and check. Returns when it wants to run again.
     fn step(&mut self, id: SensorId, now: Instant) -> Option<Instant> {
-        let ready = self.model == ModelState::Ready;
+        let backbone = self.model(Model::Backbone) == ModelState::Ready;
+        let detector = self.model(Model::Detector(self.detector)) == ModelState::Ready;
+        let which = self.detector;
         let s = self.sensors.get_mut(&id)?;
         let feed = s.feed();
         if let Some(seen) = self.feeds.latest(&feed).and_then(|f| f.geometry) {
@@ -545,21 +815,33 @@ impl Engine {
         if let Some(at) = s.retrain_at {
             if at > now {
                 next = Some(at);
-            } else if ready && !s.training {
+            } else if backbone && !s.training {
                 s.retrain_at = None;
-                let KindSettings::States(states) = &s.rec.settings.kind;
-                let labels: BTreeSet<StateKey> = states.states.iter().map(|d| d.key).collect();
                 let region = s.rec.settings.region.clone();
-                match self.store.training_set(id, &labels, BACKBONE.id, region.hash()) {
-                    Ok(rows) => {
+                let job = match s.kind() {
+                    Kind::States(states, _) => {
+                        let labels: BTreeSet<StateKey> = states.states.iter().map(|d| d.key).collect();
+                        self.store.training_set(id, &labels, BACKBONE.id, region.hash()).map(|rows| Job::Train { sensor: id, region, rows })
+                    }
+                    Kind::Objects(objects, _) => {
+                        let parents = objects.active_labels().map(|l| (l.id, l.parent)).collect();
+                        self.store.taught_set(id, BACKBONE.id).map(|rows| Job::Index { sensor: id, rows, parents })
+                    }
+                };
+                match job {
+                    Ok(job) => {
                         s.training = true;
-                        self.infer.submit(Job::Train { sensor: id, region, rows });
+                        self.infer.submit(job);
                     }
                     Err(e) => s.note(NoticeKind::Store(e.to_string())),
                 }
             }
         }
-        if s.in_flight.is_some() || s.geometry_seen.is_some() || !ready || s.head().is_none() {
+        let ready = match &s.rec.settings.kind {
+            KindSettings::States(_) => backbone && s.head().is_some(),
+            KindSettings::Objects(_) => detector,
+        };
+        if s.in_flight.is_some() || s.geometry_seen.is_some() || !ready {
             return next;
         }
         let settings = &s.rec.settings;
@@ -569,10 +851,10 @@ impl Engine {
         }
         // No fresh frame: the feed wakes the engine when one arrives.
         let frame = self.feeds.frame(&feed, now, FRESH)?;
-        let region = &s.rec.settings.region;
+        let region = s.rec.settings.region.clone();
         if kind == CheckKind::Probe {
             s.schedule.last_probe = Some(now);
-            let signature = pixels::signature(&frame.image, region);
+            let signature = pixels::signature(&frame.image, &region);
             match &s.baseline {
                 Some(baseline) if !logic::changed(baseline, &signature) => return next,
                 Some(_) => logic::start_burst(&mut s.schedule, now),
@@ -582,15 +864,34 @@ impl Engine {
         s.schedule.last_run = Some(now);
         s.schedule.force = false;
         s.schedule.recheck_at = None;
-        s.baseline = Some(pixels::signature(&frame.image, region));
-        self.infer.submit(Job::Embed { sensor: id, crop: pixels::crop(&frame.image, region) });
+        s.baseline = Some(pixels::signature(&frame.image, &region));
+        let job = match s.kind() {
+            Kind::States(..) => Job::Embed { sensor: id, crop: pixels::crop(&frame.image, &region) },
+            Kind::Objects(objects, run) => {
+                let taught = run.index.clone().filter(|_| objects.use_taught && backbone);
+                Job::Detect {
+                    sensor: id,
+                    frame: frame.image.clone(),
+                    request: DetectRequest {
+                        detector: which,
+                        region,
+                        classes: objects.classes.clone(),
+                        threshold: objects.threshold,
+                        min_size: objects.min_size,
+                        taught: taught.map(|index| Compare { index, previous: run.found.clone() }),
+                    },
+                }
+            }
+        };
+        self.infer.submit(job);
         s.in_flight = Some(frame.image);
         // A paused sensor only had a feed for "check now"; the frame is taken, so the feed can go.
         self.feeds_dirty |= s.rec.settings.paused;
         next
     }
 
-    /// A new preview frame for the focused sensor's live tab, whenever its feed has one.
+    /// A new preview frame for the focused sensor's live tab: an object sensor's last checked frame,
+    /// so its boxes are drawn on the frame they were found in; otherwise the feed's newest frame.
     fn step_preview(&mut self, now: Instant) -> Option<Instant> {
         let focused = self.interest.sensor.filter(|_| self.interest.tab == Tab::Live);
         let Some(s) = focused.and_then(|id| self.sensors.get_mut(&id)) else {
@@ -599,10 +900,24 @@ impl Engine {
             }
             return None;
         };
+        let shown = self.preview.as_ref().filter(|p| p.sensor == s.rec.id);
+        if let Run::Objects(ObjectsRun { analysed: Some((frame, image)), .. }) = &s.run {
+            let (frame, image) = (*frame, image.clone());
+            if shown.is_none_or(|p| p.preview.frame != frame) {
+                let [width, height] = image.size.map(|n| n as u32);
+                let geometry = s.rec.geometry.unwrap_or(Geometry { width, height });
+                s.hold(frame, image.clone());
+                let preview = Preview { frame, image: ImageId(self.next_id), geometry };
+                self.next_id += 1;
+                self.preview = Some(Shown { sensor: s.rec.id, preview, image: pixels::fit_rgba(&image, MAX_WIRE_EDGE as usize), seq: None });
+                self.focus_dirty = true;
+            }
+            return None;
+        }
         let feed = s.feed();
         let frame = self.feeds.frame(&feed, now, PREVIEW_EVERY).or_else(|| self.feeds.latest(&feed).cloned())?;
         let next = (frame.at + PREVIEW_EVERY > now).then_some(frame.at + PREVIEW_EVERY);
-        if self.preview.as_ref().is_some_and(|p| p.sensor == s.rec.id && p.seq == frame.seq) {
+        if shown.is_some_and(|p| p.seq == Some(frame.seq)) {
             return next;
         }
         let image = pixels::fit_rgba(&frame.image, MAX_WIRE_EDGE as usize);
@@ -613,11 +928,8 @@ impl Engine {
             geometry: frame.geometry.unwrap_or(Geometry { width, height }),
         };
         self.next_id += 1;
-        s.recent.push_back((preview.frame, frame.image));
-        if s.recent.len() > FRAME_RING {
-            s.recent.pop_front();
-        }
-        self.preview = Some(Shown { sensor: s.rec.id, preview, image, seq: frame.seq });
+        s.hold(preview.frame, frame.image);
+        self.preview = Some(Shown { sensor: s.rec.id, preview, image, seq: Some(frame.seq) });
         self.focus_dirty = true;
         next
     }
@@ -657,19 +969,23 @@ impl Engine {
             FeedId::Dvr(key) if !self.dvr_urls.contains_key(key) => FeedFact::Waiting,
             _ => self.feeds.phase(&feed, now),
         };
+        let (model, trained) = match &s.rec.settings.kind {
+            KindSettings::States(_) => (Model::Backbone, s.head().is_some()),
+            KindSettings::Objects(_) => (Model::Detector(self.detector), true),
+        };
         let status = logic::sensor_status(StatusFacts {
             paused: s.rec.settings.paused,
             geometry: s.rec.geometry.zip(s.geometry_seen),
             feed,
-            model: self.model.clone(),
+            model: self.model(model),
             failure: s.failure.clone(),
-            trained: s.head().is_some(),
+            trained,
         });
         let entry = entry(s, status);
         let s = self.sensors.get_mut(&id).expect("looked up above");
         if s.sent.as_ref() != Some(&entry) {
             s.sent = Some(entry.clone());
-            self.emit(Report::Sensor(entry), Vec::new());
+            self.emit(Report::Sensor(Box::new(entry)), Vec::new());
         }
     }
 
@@ -681,12 +997,10 @@ impl Engine {
                 Default::default()
             }
         };
-        SystemStatus {
-            retention,
-            usage,
-            models: vec![ModelStatus { name: BACKBONE.name.to_owned(), state: self.model.clone() }],
-            notice: self.notice.clone(),
-        }
+        let models = [Model::Backbone, Model::Detector(self.detector)]
+            .map(|model| ModelStatus { name: model.spec().name.to_owned(), state: self.model(model) })
+            .into();
+        SystemStatus { retention, usage, models, detector: self.detector, notice: self.notice.clone() }
     }
 
     /// The answer to the current `Interest`. Images the app does not hold yet go first, then the
@@ -742,6 +1056,7 @@ impl Engine {
                 confidence: row.confidence,
                 review: row.review,
                 thumb: Some(thumb),
+                events: row.events,
             })
         };
         let detail = match self.interest.tab {
@@ -767,11 +1082,11 @@ impl Engine {
                 older,
             }),
         };
-        let opened = self.interest.open.map(|item| self.store.history_image(id, item).map(|path| (item, path)));
+        let opened = self.interest.open.map(|item| self.store.history_image(id, item).map(|found| (item, found)));
         let opened = match opened.transpose() {
-            Ok(Some((item, Some(path)))) => {
+            Ok(Some((item, Some((path, found))))) => {
                 let image = ImageId(HISTORY_FRAME | item.0 as u64);
-                load(image, &path, MAX_WIRE_EDGE as usize).then_some(OpenedItem { id: item, image })
+                load(image, &path, MAX_WIRE_EDGE as usize).then_some(OpenedItem { id: item, image, found })
             }
             Ok(_) => None,
             Err(e) => {
@@ -796,10 +1111,56 @@ impl Engine {
     }
 }
 
+/// Whether an object sensor can be taught `label` (origin `teach_box`'s checks): one of its
+/// objects, one of its own labels in use, or "not this" for a box the detector found.
+/// `detected` is `None` when the box is not known yet (relabelling a stored one).
+fn box_label_fits(objects: &ObjectsSettings, label: BoxLabel, detected: Option<Option<ObjectClass>>) -> bool {
+    match label {
+        BoxLabel::NotThis => detected.is_none_or(|d| d.is_some()),
+        BoxLabel::Class(class) => objects.classes.contains(class),
+        BoxLabel::Own(id) => objects.active_labels().any(|l| l.id == id),
+    }
+}
+
+fn jpeg(img: &Rgb, quality: u8) -> Result<Vec<u8>, StoreError> {
+    pixels::encode_jpeg(img, quality).map_err(|e| StoreError::from(std::io::Error::other(e)))
+}
+
 fn entry(s: &Sensor, status: SensorStatus) -> SensorEntry {
     let source = match &s.rec.source {
         SourceSpec::Dvr(camera) => SourceView::Dvr(camera.clone()),
         SourceSpec::Url(url) => SourceView::Url { display: url.display(), snapshot: url.is_snapshot() },
+    };
+    let (value, live) = match (&s.rec.settings.kind, &s.run) {
+        (KindSettings::Objects(objects), Run::Objects(run)) => {
+            let keys = objects.keys();
+            let tracks = keys
+                .iter()
+                .map(|key| {
+                    let track = run.tracks.get(key).cloned().unwrap_or_default();
+                    TrackView { key: *key, on: track.on, count: track.count, score: track.score }
+                })
+                .collect();
+            let live = ObjectsLive {
+                frame: run.analysed.as_ref().map(|(frame, _)| *frame),
+                found: run.found.clone(),
+                tracks,
+                taught: s.counts.taught,
+                indexing: s.training,
+                review_pending: s.counts.pending,
+            };
+            (run.analysed.as_ref().map(|_| logic::present(&run.tracks, &keys)), KindLive::Objects(live))
+        }
+        (_, Run::States(run)) => {
+            let live = StatesLive {
+                probabilities: run.probabilities.clone(),
+                training: s.training,
+                samples: s.counts.states.clone(),
+                review_pending: s.counts.pending,
+            };
+            (run.debouncer.published().cloned(), KindLive::States(live))
+        }
+        (KindSettings::States(_), Run::Objects(_)) => unreachable!("Configure never changes the kind"),
     };
     SensorEntry {
         id: s.rec.id,
@@ -807,13 +1168,8 @@ fn entry(s: &Sensor, status: SensorStatus) -> SensorEntry {
         stream: s.rec.stream,
         settings: s.rec.settings.clone(),
         status,
-        value: s.debouncer.published().cloned(),
-        live: KindLive::States(StatesLive {
-            probabilities: s.probabilities.clone(),
-            training: s.training,
-            samples: s.samples.clone(),
-            review_pending: s.review_pending,
-        }),
+        value,
+        live,
         last_check: s.last_check,
         notice: s.notice.clone(),
     }
