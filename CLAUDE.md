@@ -21,6 +21,11 @@ do anvil no `~/.claude/CLAUDE.md` global **não valem aqui**, exceto a seção "
 O idioma continua o mesmo: chat e documentação em pt-BR; código, identificadores, caminhos e mensagens de commit
 em inglês.
 
+## Identidade visual
+
+A cor primária é o verde do botão **Câmeras**, aplicada a todos os botões do app. Valores, estados e regras para
+código novo em [docs/design/visual.md](docs/design/visual.md); leia antes de mexer em UI.
+
 ## Engenharia reversa
 
 - Alvos em `references/simplay-1.4.1/` (gitignorado; material da Intelbras, nunca commitar): `libt2u.so` (túnel P2P,

@@ -7,7 +7,7 @@ use crate::frames::StreamKind;
 use crate::model::CameraId;
 use crate::procs::{ChildKey, ChildPhase};
 use crate::sensors::*;
-use crate::ui::{Actions, Scene};
+use crate::ui::{Actions, Scene, toggle};
 
 /// Origin `OBJECT_BOX_COLOR`.
 const BOX_COLOR: Color32 = Color32::from_rgb(0x7e, 0xe2, 0xb8);
@@ -15,6 +15,14 @@ const OWN_LABEL_COLOR: Color32 = Color32::from_rgb(0x6c, 0xc4, 0xff);
 const PERSON_COLOR: Color32 = Color32::from_rgb(0xff, 0xb3, 0x6c);
 const UNSURE_COLOR: Color32 = Color32::YELLOW;
 const FILTERED_COLOR: Color32 = Color32::from_gray(140);
+
+/// One of a row of framed choices; `true` when it was picked now.
+fn choice<T: PartialEq>(ui: &mut egui::Ui, current: &mut T, value: T, text: &str) -> bool {
+    let on = *current == value;
+    let picked = toggle(ui, on, text).clicked() && !on;
+    if picked { *current = value; }
+    picked
+}
 
 #[derive(Default)]
 pub struct SensorsPanel {
@@ -190,9 +198,9 @@ pub fn draw(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, actions:
     egui::ScrollArea::vertical().show(ui, |ui| {
         for entry in scene.sensors.sensors.values() {
             let text = format!("{}: {}", entry.settings.name.as_str(), value_label(entry, scene.sensors.people()));
-            if ui.selectable_label(panel.selected == Some(entry.id) && !panel.people_open, text).clicked() { panel.select(entry.id); }
+            if toggle(ui, panel.selected == Some(entry.id) && !panel.people_open, text).clicked() { panel.select(entry.id); }
         }
-        if ui.selectable_label(panel.people_open, format!("Pessoas ({})", scene.sensors.people().len())).clicked() {
+        if toggle(ui, panel.people_open, format!("Pessoas ({})", scene.sensors.people().len())).clicked() {
             panel.people_open = !panel.people_open;
             panel.forget_confirm = None;
         }
@@ -362,7 +370,7 @@ fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &
     };
     ui.horizontal(|ui| {
         for (tab, label) in tabs {
-            if ui.selectable_value(&mut panel.tab, *tab, *label).changed() { panel.opened = None; panel.before = None; panel.samples_before = None; panel.sample_pages.clear(); }
+            if choice(ui, &mut panel.tab, *tab, label) { panel.opened = None; panel.before = None; panel.samples_before = None; panel.sample_pages.clear(); }
         }
     });
     let Some(focus) = scene.sensors.focus.as_ref().filter(|f| f.sensor == Some(entry.id)) else { ui.spinner(); return };
@@ -860,13 +868,13 @@ fn live(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, people
     }
     ui.horizontal(|ui| {
         if objects.is_some() {
-            ui.selectable_value(&mut panel.teaching_boxes, false, "Região");
-            ui.selectable_value(&mut panel.teaching_boxes, true, "Ensinar caixas");
+            choice(ui, &mut panel.teaching_boxes, false, "Região");
+            choice(ui, &mut panel.teaching_boxes, true, "Ensinar caixas");
             ui.separator();
         }
         ui.add_enabled_ui(!panel.teaching_boxes, |ui| {
-            if ui.selectable_value(&mut panel.polygon_mode, false, "Retângulo").changed() { panel.polygon.clear(); }
-            ui.selectable_value(&mut panel.polygon_mode, true, "Polígono");
+            if choice(ui, &mut panel.polygon_mode, false, "Retângulo") { panel.polygon.clear(); }
+            choice(ui, &mut panel.polygon_mode, true, "Polígono");
             if ui.button("Limpar").clicked() { panel.region = Some(Region::WHOLE); panel.polygon.clear(); }
             if ui.add_enabled(panel.polygon.len() >= 3, egui::Button::new("Fechar")).clicked() {
                 match Region::polygon(panel.polygon.clone()) {

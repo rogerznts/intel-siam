@@ -32,6 +32,7 @@ impl ViewerApp {
             .and_then(|s| eframe::get_value::<SavedLayout>(s, LAYOUT_KEY))
             .map(Layout::from_saved)
             .unwrap_or_default();
+        cc.egui_ctx.all_styles_mut(ui::apply_theme);
         let ctx = cc.egui_ctx.clone();
         let wake: crate::procs::Waker = Arc::new({
             let ctx = ctx.clone();

@@ -11,9 +11,35 @@ use crate::plan::{Tools, TunnelBackend, Unavailable};
 use crate::procs::{ChildKey, Supervisor};
 use crate::status::{ExitReason, TileStatus, tile_status};
 
-/// Greens sampled from the top and bottom of the app icon's tiles.
-const BRAND_GREEN: Color32 = Color32::from_rgb(26, 250, 127);
-const BRAND_GREEN_DIM: Color32 = Color32::from_rgb(2, 212, 101);
+/// The primary color, sampled from the app icon's tiles: a selected button is `PRIMARY` with black
+/// text. Unselected buttons use darker greens with white text, so on and off read apart at a glance.
+const PRIMARY: Color32 = Color32::from_rgb(26, 250, 127);
+const PRIMARY_OFF: Color32 = Color32::from_rgb(0, 110, 55);
+const PRIMARY_OFF_HOVER: Color32 = Color32::from_rgb(0, 140, 70);
+
+/// Every button, toggle and dropdown takes the primary color. Text stays white outside the
+/// selected state: text edits, collapsing headers and clickable labels draw their text in these
+/// widget colors over the dark panel.
+pub fn apply_theme(style: &mut egui::Style) {
+    let widgets = &mut style.visuals.widgets;
+    for (w, fill) in [
+        (&mut widgets.inactive, PRIMARY_OFF),
+        (&mut widgets.hovered, PRIMARY_OFF_HOVER),
+        (&mut widgets.active, PRIMARY_OFF_HOVER),
+        (&mut widgets.open, PRIMARY_OFF_HOVER),
+    ] {
+        w.weak_bg_fill = fill;
+        w.bg_fill = fill;
+        w.fg_stroke.color = Color32::WHITE;
+    }
+    style.visuals.selection.bg_fill = PRIMARY;
+    style.visuals.selection.stroke.color = Color32::BLACK;
+}
+
+/// A framed toggle in the primary color, like every other button; dropdown entries stay plain.
+pub fn toggle(ui: &mut egui::Ui, on: bool, text: impl Into<egui::WidgetText>) -> egui::Response {
+    ui.add(egui::Button::new(text).selected(on))
+}
 
 pub enum AccountAction {
     SignIn,
@@ -52,12 +78,10 @@ pub fn draw(ui: &mut egui::Ui, scene: &Scene, state: &mut UiState) -> Actions {
 
     egui::Panel::top("toolbar").show(ui, |ui| {
         ui.horizontal(|ui| {
-            let fill = if state.show_picker { BRAND_GREEN } else { BRAND_GREEN_DIM };
-            let label = egui::RichText::new("Câmeras").color(Color32::BLACK).strong();
-            if ui.add(egui::Button::new(label).fill(fill)).clicked() {
+            if toggle(ui, state.show_picker, "Câmeras").clicked() {
                 state.show_picker = !state.show_picker;
             }
-            if ui.selectable_label(state.sensors.open, "Sensores").clicked() {
+            if toggle(ui, state.sensors.open, "Sensores").clicked() {
                 state.sensors.open = !state.sensors.open;
                 if state.sensors.open { state.show_picker = false; }
             }
