@@ -42,6 +42,11 @@ no dia a dia: abre direto nas câmeras que você escolheu, na ordem em que você
   valor ou acima do limite vai para a revisão, onde você confirma ou digita o valor certo; uma leitura um passo
   abaixo é a última roda girando e mantém o valor. O limite aprende com os dias de uso. Os leitores PP-OCRv6 e de
   rodas são baixados no primeiro uso.
+- **Notificações por sensor.** Cada sensor pode avisar um webhook e guardar uma cópia da imagem quando a confiança
+  passa de um limiar que você escolhe. O POST sai do processo de visão no instante da detecção, com sensor, horário,
+  confiança, valor e, se quiser, a imagem — só os dados, multipart ou base64. A cópia do JPEG vai para a pasta
+  escolhida, com o nome do sensor e o instante no arquivo. O mesmo limiar vale para as duas coisas, e a qualidade do
+  JPEG do histórico também é sua. Uma revisão nunca avisa.
 - **Botões na cor primária.** Todo botão usa o verde do ícone: verde vivo quando ligado, verde escuro quando
   desligado. Valores e regras em [docs/design/visual.md](docs/design/visual.md).
 
@@ -98,6 +103,25 @@ controlam a retenção do histórico, o detector, o reconhecedor de rostos e o l
 ensinadas não expiram.
 Uma câmera usada só por sensores não precisa estar na grade. URL avulsa aparece apenas no painel.
 As [evidências de verificação dos sensores](docs/spec/sensors-ui-verification.md) registram o smoke e seus limites.
+
+Para ser avisado das detecções, abra **Notificações: webhook, imagem e limiar** no sensor. Marque o webhook e cole um
+endereço `http://` ou `https://`, escolha o formato do corpo e, se quiser uma cópia da imagem, marque a pasta
+(**Escolher pasta…** abre o seletor do sistema) e a qualidade do JPEG. O limiar é a confiança mínima: abaixo dele nada
+sai. Só uma detecção avisa — leitura que vai para a revisão, ou checagem repetida, não.
+
+```json
+{
+  "sensor": { "id": 7, "name": "Portão da rua" },
+  "at": 1761740000123,
+  "confidence": 0.93,
+  "changed": true,
+  "value": { "State": 3 }
+}
+```
+
+`at` é o instante em milissegundos Unix e `value` vem no mesmo formato do painel: o estado, a contagem de objetos ou o
+número lido, conforme o tipo do sensor. Com imagem, ela vai como parte `image` do multipart (arquivo
+`detection.jpg`) ou no bloco `image` em base64, dentro do JSON.
 
 | Variável | Obrigatória | Conteúdo |
 |---|---|---|
