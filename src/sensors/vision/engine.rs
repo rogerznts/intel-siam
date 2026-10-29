@@ -773,6 +773,13 @@ impl Engine {
                 }
             }
         }
+        self.model_retry.retain(|model, _| needed.contains(model));
+        for (model, state) in self.models.iter_mut() {
+            if !needed.contains(model) && matches!(state, ModelState::Failed(_)) {
+                *state = ModelState::NotNeeded;
+                self.system_dirty = true;
+            }
+        }
         for model in needed {
             let due = match self.models.get(&model) {
                 None | Some(ModelState::NotNeeded) => true,

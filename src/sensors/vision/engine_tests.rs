@@ -240,6 +240,26 @@ fn an_object_sensor_needs_only_the_detector_and_counts_what_it_finds() {
 }
 
 #[test]
+fn regression_a_failed_model_nobody_needs_stops_waking_the_engine() {
+    let f = Fixture::new();
+    f.store().create(&objects_record()).unwrap();
+    let (mut engine, _, _, fetch) = f.engine();
+    let now = Instant::now();
+    seed(&mut engine, now, 1);
+    engine.tick(now);
+    assert_eq!(fetch.try_iter().collect::<Vec<_>>(), [Model::Detector(Detector::DfineS)]);
+    engine.handle(Input::Model(ModelEvent { model: Model::Detector(Detector::DfineS), state: ModelState::Failed("offline".into()) }));
+    engine.user(UserCommand::Delete(CARS), now);
+    let later = now + MODEL_RETRY * 2;
+    assert!(engine.tick(later) > later, "no deadline left in the past");
+    assert_eq!(engine.model(Model::Detector(Detector::DfineS)), ModelState::NotNeeded);
+    let rec = objects_record();
+    engine.user(UserCommand::Create { id: rec.id, source: rec.source, stream: rec.stream, settings: rec.settings }, later);
+    engine.tick(later);
+    assert_eq!(fetch.try_iter().count(), 1, "needed again, fetched again");
+}
+
+#[test]
 fn a_taught_own_label_is_indexed_compared_and_asked_about() {
     let f = Fixture::new();
     f.store().create(&objects_record()).unwrap();
