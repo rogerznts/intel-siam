@@ -9,6 +9,7 @@
 //! feeds waker ──Wake────┘
 //! ```
 
+mod change_limit;
 mod engine;
 mod faces;
 mod feeds;
@@ -17,6 +18,8 @@ mod logic;
 mod pixels;
 #[cfg(test)]
 pub(super) mod process_tests;
+mod reading;
+mod readers;
 mod store;
 mod teach;
 

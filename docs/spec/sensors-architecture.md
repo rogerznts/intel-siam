@@ -592,6 +592,41 @@ origem:
   `docs/spec/sensors-ui-verification.md`. As fotos da origem têm alturas diferentes (600 e 640 px); a de 2018 foi
   reduzida e completada com preto para 480×600, para não cair em `GeometryChanged`.
 
+**Tipo Leitura, 2026-10-28.** Entrou como variantes e uma migração aditiva: `KindSettings::Reading`
+(`ReadingSettings` com `ReadingMode`, `ReadingDisplay`, `ChangeLimit`), `SensorValue::Number(Number)`,
+`KindLive::Reading`, `ReviewReason::Rejected(ReadProblem)`, `HistoryItem.read`, `FocusView.seen`,
+`UserCommand::{AnswerReading, SetNumberReader}`, `Job::Read`, `Model::{NumberReader, WheelReader}` com URL, SHA-256 e
+tamanho de `readers.json`, migração 4 (`history.read`, `reading_day`, `reading_watch`). `PROTOCOL = 5`. Lógica pura
+em `vision/readers.rs` (imagens, CTC, rodas), `vision/reading.rs` (veredito, vazão, parcela aceita) e
+`vision/change_limit.rs`. Diferenças em relação à origem:
+
+- **`Network` recebe várias entradas** (`Vec<Tensor>`): o leitor de rodas v2 tem duas (as células e as células com
+  as vizinhas). O binário as entrega pelo nome de cada entrada do modelo e recusa outra quantidade.
+- **Valor exato.** `Number` guarda o inteiro lido e as casas (`scaled`, `decimals`), em vez de `float` formatado:
+  debounce e "assentando" comparam inteiros. Uma leitura com mais de 18 dígitos significativos não é número (a
+  origem usa inteiros sem limite).
+- **Modo e visor como enums com dados**: `digits` e o leitor só existem no visor de contador, e o limite com o seu
+  valor (`max_rate` ou `max_step`) só no modo contador; `max_step` de valor e tempo restante fica no próprio modo.
+  `device_class`, `spot_rate` por sensor e `wheel_reader` vazio ("o padrão") não foram portados: a classe é do Home
+  Assistant (MQTT fora), a conferência aleatória usa `REVIEW.spot_rate` como os Estados, e cada contador grava o seu
+  leitor de rodas (v2 por padrão).
+- **Câmera que mudou de tamanho** usa o mecanismo `GeometryChanged` existente: as checagens param, e a primeira vez
+  grava um registro com `ReadProblem::CameraChanged` e conta a leitura do dia. Não há notificação (o app não tem
+  Home Assistant).
+- **Última leitura e limite** ficam em `reading_watch` para todo sensor de Leitura, não só contadores, então o
+  reinício restaura o valor publicado sem consultar o histórico. O dia de cada leitura é o local (`localtime_r`).
+- **Revisão.** `AnswerReading { ReadRight | Showed(n) }`: confirmar só ancora problemas que são valor (inseguro,
+  desceu, mudou demais); digitar ancora sempre. Ancora apenas se a leitura é mais nova que o último valor aceito e
+  nenhum valor foi publicado depois (origem `_newest_rejected`). Descartar usa o `Resolve` existente. A resposta
+  não é gravada à parte (não há exportação).
+- **Pré-processamento.** `GaussianBlur` refaz as três caixas estendidas do PIL em ponto fixo; o redimensionamento
+  usa o mesmo filtro triangular dos outros tipos. O `round` do Python é `round_ties_even`.
+- **Não portado**: exportação das leituras com os detalhes de cada roda, entidades e notificação do Home Assistant,
+  luz do sensor (`lamp`), soltar da memória um leitor de rodas que ninguém usa.
+- **Evidência, 2026-10-28.** `cargo build --all-targets --release`, `cargo test` (183 testes) e
+  `cargo clippy --all-targets` sem avisos. Smoke do processo de visão com PP-OCRv6 tiny e rodas v1/v2 baixados e
+  conferidos em `docs/spec/sensors-ui-verification.md`; a interface não foi exercitada (tela bloqueada).
+
 ## Open questions and risks
 
 Resolvidas na síntese (padrão conservador; reverta se discordar):

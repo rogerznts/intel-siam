@@ -38,18 +38,29 @@ Spec: docs/spec/viewer.md. Fluxo: pstack poteto-mode / Feature + architect.
 - [ ] Separar app/UI da lib para retirar AppKit do processo de visão.
 - [ ] Rever proteção de URLs avulsas com senha no SQLite 0600.
 
-## Sensores de Objetos
+## Sensores de Objetos e pessoas
 - [x] Detector D-FINE (N/S/M/L) atrás do contrato ONNX, filtros, trilhas, recheck, rótulos próprios, revisão.
 - [x] Smoke do processo de visão com D-FINE S baixado e fotos reais (docs/spec/sensors-ui-verification.md).
-- [ ] Smoke na UI real com capturas: a janela não renderizou num Space visível e o AX ficou bloqueado.
+- [x] Pessoas nomeadas pelo rosto (YuNet com SFace ou AuraFace), pessoa desconhecida e perguntas na revisão.
+- [ ] Smoke na UI real com capturas: a tela do Mac estava bloqueada nas tentativas.
 - [ ] Aviso "visto de leve" ao desenhar caixa perdida e ensino a partir de quadro do histórico.
+
+## Sensores de Leitura
+- [x] Modos contador, valor e tempo restante; visores automático, LED, LCD e contador de rodas.
+- [x] PP-OCRv6 tiny/small e leitores de rodas v1/v2 baixados sob demanda e conferidos por SHA-256.
+- [x] Veredito, assentando, limite do contador (auto/fixo/passo/desligado) com dias persistidos, vazão,
+      diagnósticos, qualidade, revisão com confirmação ou correção digitada.
+- [x] Smoke do processo de visão com modelos reais e as imagens da origem (docs/spec/sensors-ui-verification.md).
+- [ ] Smoke na UI real com capturas: a tela do Mac estava bloqueada.
+- [ ] Conferência aleatória por sensor (`spot_rate`) e exportação das leituras com a posição de cada roda.
 
 ## Roadmap (futuro)
 - [ ] Gravação contínua e por evento.
 - [ ] Screenshots de uma câmera ou da grade.
 - [ ] Integração com Google Drive (envio de gravações e screenshots).
-- [ ] Sensores de Pessoas e reconhecimento facial.
-- [ ] Sensores de Leituras (placas, texto e valores).
+- [x] Sensores de Pessoas e reconhecimento facial (dentro dos sensores de Objetos).
+- [x] Sensores de Leitura para medidores e tempo restante.
+- [ ] Leitura de placas e de texto livre.
 - [ ] Publicação MQTT.
 - [ ] Modo CLI servidor (headless).
 - [ ] Servidor MCP para câmeras e eventos.

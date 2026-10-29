@@ -5,7 +5,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::sync::LazyLock;
 
-use intel_siam::sensors::{self, Network, Output};
+use intel_siam::sensors::{self, Network, Output, Tensor as Input};
 use ort::environment::Environment;
 use ort::logging::LogLevel;
 use ort::session::Session;
@@ -24,6 +24,7 @@ fn main() -> ExitCode {
 /// logged.
 struct Onnx {
     session: Session,
+    inputs: Vec<String>,
     outputs: Vec<String>,
 }
 
@@ -43,18 +44,27 @@ impl Onnx {
             .map_err(|e| fail(&e))?
             .commit_from_file(model)
             .map_err(|e| fail(&e))?;
+        let inputs: Vec<String> = session.inputs().iter().map(|i| i.name().to_owned()).collect();
         let outputs: Vec<String> = session.outputs().iter().map(|o| o.name().to_owned()).collect();
         if outputs.is_empty() {
             return Err("the model has no output".into());
         }
-        Ok(Box::new(Self { session, outputs }))
+        Ok(Box::new(Self { session, inputs, outputs }))
     }
 }
 
 impl Network for Onnx {
-    fn run(&mut self, input: Vec<f32>, shape: [usize; 4]) -> Result<Vec<Output>, String> {
-        let tensor = Tensor::from_array((shape, input)).map_err(|e| e.to_string())?;
-        let results = self.session.run(ort::inputs![tensor]).map_err(|e| e.to_string())?;
+    fn run(&mut self, inputs: Vec<Input>) -> Result<Vec<Output>, String> {
+        if inputs.len() != self.inputs.len() {
+            return Err(format!("the model takes {} inputs, not {}", self.inputs.len(), inputs.len()));
+        }
+        let feed = self
+            .inputs
+            .iter()
+            .zip(inputs)
+            .map(|(name, input)| Ok((name.clone(), Tensor::from_array((input.shape, input.values)).map_err(|e| e.to_string())?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        let results = self.session.run(feed).map_err(|e| e.to_string())?;
         self.outputs
             .iter()
             .map(|name| {

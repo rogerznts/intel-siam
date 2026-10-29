@@ -1,27 +1,33 @@
 //! The engine: the single owner of every sensor's settings, runtime state and storage, and of the
 //! people, who are shared by every sensor. It waits for the next input or deadline, handles it,
-//! then runs `tick`. Decisions come from `logic`, `teach` and `faces`, pixel work from `pixels`,
-//! persistence from `store`, frames from `feeds`, vectors, heads, boxes and faces from `infer`.
+//! then runs `tick`. Decisions come from `logic`, `teach`, `faces`, `reading` and `change_limit`,
+//! pixel work from `pixels`, persistence from `store`, frames from `feeds`, vectors, heads, boxes,
+//! faces and readings from `infer`.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use egui::ColorImage;
 
 use super::Input;
+use super::change_limit::{self, COUNTER_LIMIT, Watch};
 use super::faces::{self, FACES, Face, FaceIndex};
 use super::feeds::{FeedId, FeedSource, Feeds};
-use super::infer::{BACKBONE, DetectRequest, Done, FacesIndexed, Indexed, Infer, Job, Model, ModelEvent, Trained};
+use super::infer::{
+    BACKBONE, DetectRequest, Done, FacesIndexed, Indexed, Infer, Job, Model, ModelEvent, ReadRequest, ReadText, Trained,
+};
 use super::logic::{
     self, CheckKind, Debouncer, FaceBurst, FeedFact, GeometryVerdict, ObjectTrack, REVIEW, Schedule, Signature, StatusFacts,
 };
 use super::pixels::{self, Rgb};
+use super::reading::{self, ACCEPTED_WINDOW_S, QUALITY_PERIODS_DAYS, RATE_MIN_SPAN_S};
 use super::store::{
-    Counts, NewHistory, SensorRecord, Store, StoreError, StoredHead, StoredHistory, StoredPerson, TAUGHT_CROP, TaughtBox,
+    Counts, NewHistory, SensorRecord, Store, StoreError, StoredHead, StoredHistory, StoredPerson, StoredWatch, TAUGHT_CROP,
+    TaughtBox,
 };
 use super::teach::{self, TaughtIndex};
 use crate::frames::StreamKey;
@@ -30,10 +36,12 @@ use crate::procs::UrlKey;
 use crate::sensors::types::{
     BoxLabel, Detail, Detector, FaceFrom, FaceItem, FaceMarks, FaceProblem, FaceQuestion, FocusView, Found, FrameId,
     Geometry, HistoryId, HistoryItem, ImageId, Interest, KindLive, KindSettings, LabelId, MAX_FACES_PER_PERSON,
-    MAX_PEOPLE, MAX_TAUGHT, ModelState, ModelStatus, NormBox, Notice, NoticeKind, ObjectClass, ObjectEvent, ObjectKey,
-    ObjectsLive, ObjectsSettings, OpenedItem, PersonId, PersonPick, PersonView, Preview, Question, Recogniser,
-    ReviewReason, SampleItem, SampleLabel, SensorEntry, SensorId, SensorStatus, SensorValue, Settings, Sighting,
-    SourceSpec, SourceView, StateKey, StatesLive, StatesSettings, SystemStatus, Tab, TrackView, UserCommand, Verdict,
+    MAX_PEOPLE, MAX_TAUGHT, ModelState, ModelStatus, NormBox, Notice, NoticeKind, Number, NumberReader, ObjectClass,
+    ObjectEvent, ObjectKey, ObjectsLive, ObjectsSettings, OpenedItem, PersonId, PersonPick, PersonView, Preview,
+    QualityPeriod, Question, ReadOutcome, ReadProblem, ReadRecord, ReadingAnswer, ReadingLive, ReadingMode,
+    ReadingSettings, Recogniser, ReviewReason, SampleItem, SampleLabel, SensorEntry, SensorId, SensorStatus, SensorValue,
+    Settings, Sighting, SourceSpec, SourceView, StateKey, StatesLive, StatesSettings, SystemStatus, Tab, TrackView,
+    UserCommand, Verdict, WheelModel,
 };
 use crate::sensors::wire::{Command, Desired, HEARTBEAT, MAX_WIRE_EDGE, PROTOCOL, Report};
 
@@ -84,6 +92,7 @@ pub struct Engine {
     model_retry: BTreeMap<Model, Instant>,
     detector: Detector,
     recogniser: Recogniser,
+    number_reader: NumberReader,
     /// Everyone named, oldest first, as stored.
     people: Vec<StoredPerson>,
     /// The people's faces embedded by `recogniser`; checks name nobody until it is built.
@@ -140,6 +149,7 @@ struct Sensor {
 enum Run {
     States(StatesRun),
     Objects(ObjectsRun),
+    Reading(Box<ReadingRun>),
 }
 
 #[derive(Default)]
@@ -170,10 +180,28 @@ struct ObjectsRun {
     filtered_logged: BTreeMap<ObjectClass, Instant>,
 }
 
+#[derive(Default)]
+struct ReadingRun {
+    debouncer: Debouncer<Number>,
+    watch: Watch,
+    last: Option<ReadRecord>,
+    /// The region as the reader saw it at the last check.
+    seen: Option<(ImageId, ColorImage)>,
+    /// (time, accepted) of the readings of the last day, for the accepted share.
+    reads: VecDeque<(f64, bool)>,
+    /// (time, published value) after accepted readings, for a counter's flow.
+    flow: VecDeque<(f64, f64)>,
+    accepted: Option<f32>,
+    rate: Option<f64>,
+    limit: Option<f64>,
+    quality: Vec<QualityPeriod>,
+}
+
 /// A sensor's settings together with its runtime state of the same kind.
 enum Kind<'a> {
     States(&'a StatesSettings, &'a mut StatesRun),
     Objects(&'a ObjectsSettings, &'a mut ObjectsRun),
+    Reading(&'a ReadingSettings, &'a mut ReadingRun),
 }
 
 impl Sensor {
@@ -181,6 +209,7 @@ impl Sensor {
         let run = match rec.settings.kind {
             KindSettings::States(_) => Run::States(StatesRun::default()),
             KindSettings::Objects(_) => Run::Objects(ObjectsRun::default()),
+            KindSettings::Reading(_) => Run::Reading(Box::default()),
         };
         Self {
             rec,
@@ -204,6 +233,7 @@ impl Sensor {
         match (&self.rec.settings.kind, &mut self.run) {
             (KindSettings::States(settings), Run::States(run)) => Kind::States(settings, run),
             (KindSettings::Objects(settings), Run::Objects(run)) => Kind::Objects(settings, run),
+            (KindSettings::Reading(settings), Run::Reading(run)) => Kind::Reading(settings, run),
             _ => unreachable!("Configure never changes the kind"),
         }
     }
@@ -248,6 +278,16 @@ impl Engine {
                 run.head = Some(head);
             }
         }
+        for (id, stored) in store.watches()? {
+            if let Some(Run::Reading(run)) = sensors.get_mut(&id).map(|s| &mut s.run) {
+                if let Some(value) = stored.value {
+                    run.debouncer.anchor(value);
+                }
+                (run.watch.seen_at, run.watch.accepted_at) = (stored.seen_at, stored.accepted_at);
+                (run.watch.budget_s, run.watch.held) = (stored.budget_s, stored.held);
+            }
+        }
+        let periods = quality_periods(SystemTime::now());
         for (id, s) in &mut sensors {
             s.counts = store.counts(*id)?;
             // Rebuild from durable samples if the previous process exited before training finished,
@@ -255,11 +295,15 @@ impl Engine {
             if !s.counts.states.is_empty() || s.head().is_some() || s.counts.taught > 0 {
                 s.retrain_at = Some(Instant::now());
             }
+            if let Run::Reading(run) = &mut s.run {
+                run.quality = store.quality(*id, &periods)?;
+            }
         }
         let now = Instant::now();
         let engine = Self {
             detector: store.detector()?,
             recogniser: store.recogniser()?,
+            number_reader: store.number_reader()?,
             people: store.people()?,
             face_index: None,
             faces_reindex_at: None,
@@ -323,6 +367,7 @@ impl Engine {
             Input::Infer(Done::Indexed { sensor, outcome }) => self.indexed(sensor, outcome),
             Input::Infer(Done::Detected { sensor, found }) => self.detected(sensor, found, now),
             Input::Infer(Done::FacesIndexed { recogniser, outcome }) => self.faces_indexed(recogniser, outcome, now),
+            Input::Infer(Done::Read { sensor, read }) => self.read_done(sensor, read),
             Input::Model(ModelEvent { model, state }) => {
                 if matches!(state, ModelState::Failed(_)) {
                     self.model_retry.insert(model, now + MODEL_RETRY);
@@ -393,7 +438,7 @@ impl Engine {
                 let refusal = match s.kind() {
                     Kind::States(states, _) if states.states.iter().any(|d| d.key == state) => None,
                     Kind::States(..) => Some(NoticeKind::UnknownItem),
-                    Kind::Objects(..) => Some(NoticeKind::KindMismatch),
+                    Kind::Objects(..) | Kind::Reading(..) => Some(NoticeKind::KindMismatch),
                 };
                 if let Some(refusal) = refusal {
                     s.note(refusal);
@@ -475,6 +520,25 @@ impl Engine {
                 };
                 self.people_changed(moved.and_then(|done| if done { Ok(()) } else { Err(NoticeKind::UnknownItem) }), now);
             }
+            UserCommand::SetNumberReader(reader) => {
+                match self.store.set_number_reader(reader) {
+                    Ok(()) => self.number_reader = reader,
+                    Err(e) => self.note(NoticeKind::Store(e.to_string())),
+                }
+                self.system_dirty = true;
+            }
+            UserCommand::AnswerReading { id, item, answer } => {
+                let answered = self.answer_reading(id, item, answer);
+                let Some(s) = self.sensors.get_mut(&id) else { return };
+                if let Err(refusal) = answered {
+                    s.note(refusal);
+                }
+                match self.store.counts(id) {
+                    Ok(counts) => s.counts = counts,
+                    Err(e) => s.note(NoticeKind::Store(e.to_string())),
+                }
+                self.focus_dirty = true;
+            }
         }
     }
 
@@ -491,6 +555,172 @@ impl Engine {
         self.faces_reindex_at = Some(now + RETRAIN_DELAY);
         self.system_dirty = true;
         self.focus_dirty = true;
+    }
+
+    /// Answers a rejected reading (origin `review_answer` for a reading). The right value, when
+    /// there is one and the reading is newer than the last accepted value, becomes the last
+    /// accepted value: a counter stuck on a value read too high, or held by its limit, goes on from
+    /// there. A reading with the wrong number of digits is no value, even when read as shown.
+    fn answer_reading(&mut self, id: SensorId, item: HistoryId, answer: ReadingAnswer) -> Result<(), NoticeKind> {
+        let row = self.store.history_item(id, item).map_err(store_notice)?.ok_or(NoticeKind::UnknownItem)?;
+        let Some(ReviewReason::Rejected(problem)) = row.review else { return Err(NoticeKind::UnknownItem) };
+        let newer = !self.store.published_after(id, item).map_err(store_notice)?;
+        let s = self.sensors.get_mut(&id).ok_or(NoticeKind::UnknownItem)?;
+        let Kind::Reading(_, run) = s.kind() else { return Err(NoticeKind::KindMismatch) };
+        let read_at = epoch(row.at);
+        let right = match answer {
+            ReadingAnswer::ReadRight => {
+                let a_value = matches!(problem, ReadProblem::Unsure | ReadProblem::WentDown | ReadProblem::ChangedTooMuch);
+                row.read.and_then(|r| r.value).filter(|_| a_value)
+            }
+            ReadingAnswer::Showed(value) => Some(value),
+        };
+        if let Some(right) = right.filter(|_| newer && run.watch.accepted_at.is_none_or(|at| at < read_at)) {
+            let now = epoch(SystemTime::now());
+            run.debouncer.anchor(right);
+            run.watch.accepted_at = Some(read_at);
+            run.watch.budget_s = (now - read_at).max(0.0);
+            run.watch.held = false;
+            run.watch.seen_at = Some(now);
+            run.watch.sample = None;
+            let stored = stored_watch(run);
+            self.store.save_watch(id, &stored).map_err(store_notice)?;
+        }
+        self.store.mark_resolved(item).map_err(store_notice)
+    }
+
+    /// One check of a reading sensor came back (origin `_run_reading`): the number is parsed and
+    /// judged against the last published value and, for a counter, how much it may have gone up
+    /// since. An accepted reading is debounced and published; one step below is the last wheel
+    /// turning and keeps the value; a rejected one is kept and goes to review, once while the
+    /// same one waits there. Every reading is counted for its day.
+    fn read_done(&mut self, id: SensorId, read: Result<ReadText, String>) {
+        let next_id = self.next_id;
+        let Some(s) = self.sensors.get_mut(&id) else { return };
+        let Some(frame) = s.in_flight.take() else { return };
+        let read = match read {
+            Ok(read) => read,
+            Err(error) => {
+                s.failure = Some(error);
+                return;
+            }
+        };
+        s.failure = None;
+        let wall = SystemTime::now();
+        s.last_check = Some(wall);
+        let now = epoch(wall);
+        let interval = f64::from(u32::from(s.rec.settings.interval));
+        let Kind::Reading(settings, run) = s.kind() else { return };
+        let value = settings.parse(&read.text);
+        let last = run.debouncer.published().copied();
+        let mut failures = Vec::new();
+        let mut limit = None;
+        if let ReadingMode::Counter { limit: mode, .. } = settings.mode {
+            change_limit::advance(&mut run.watch, now, interval);
+            if let Err(e) = relearn(&self.store, id, &mut run.watch, now, wall) {
+                failures.push(e);
+            }
+            limit = change_limit::limit(mode, settings.decimals(), run.watch.learned.as_ref(), run.watch.budget_s);
+        }
+        let outcome = reading::verdict(&read.text, read.score, value, last, settings.threshold, settings, limit);
+        let over = matches!(outcome, ReadOutcome::Rejected(ReadProblem::WentDown | ReadProblem::ChangedTooMuch));
+        if settings.is_counter() && over && value.is_some() && last.is_some() {
+            change_limit::hold(&mut run.watch);
+        }
+        let accepted = !matches!(outcome, ReadOutcome::Rejected(_));
+        let changed = outcome == ReadOutcome::Accepted && value.is_some_and(|v| run.debouncer.update(v, settings.debounce));
+        let published = run.debouncer.published().copied();
+        let mut learned = None;
+        if let (true, true, Some(v)) = (settings.is_counter(), accepted, value) {
+            if published.is_some() && (changed || outcome == ReadOutcome::Settling || Some(v) == published) {
+                change_limit::accept(&mut run.watch, now);
+            }
+            learned = change_limit::observe(&mut run.watch, now, v.get(), interval);
+        }
+        run.reads.push_back((now, accepted));
+        run.accepted = reading::accepted_share(&mut run.reads, now, ACCEPTED_WINDOW_S);
+        if let ReadingMode::Counter { rate_window, .. } = settings.mode {
+            if let (true, Some(p)) = (accepted, published) {
+                run.flow.push_back((now, p.get()));
+            }
+            let (_, factor) = settings.rate_unit();
+            let window = f64::from(u32::from(rate_window)) * 60.0;
+            run.rate = reading::counter_rate(&mut run.flow, now, window, RATE_MIN_SPAN_S).map(|per_hour| per_hour * factor);
+        }
+        run.limit = limit;
+        let record = ReadRecord { text: read.text, score: read.score, value, outcome, repeats: 0 };
+        run.last = Some(record.clone());
+        let seen = ColorImage::from_rgb(read.seen.size, &read.seen.pixels);
+        run.seen = Some((ImageId(next_id), pixels::fit_rgba(&seen, MAX_WIRE_EDGE as usize)));
+        let stored = stored_watch(run);
+        self.next_id += 1;
+        let problem = match outcome {
+            ReadOutcome::Rejected(problem) => Some(problem),
+            ReadOutcome::Accepted | ReadOutcome::Settling => None,
+        };
+        let counted = self
+            .store
+            .count_reading(id, &local_day(wall), problem, learned)
+            .and_then(|()| self.store.save_watch(id, &stored))
+            .and_then(|()| self.store.quality(id, &quality_periods(wall)));
+        let spot = accepted && !changed && roll() < REVIEW.spot_rate;
+        let review = match problem {
+            Some(problem) => Some(ReviewReason::Rejected(problem)),
+            None => spot.then_some(ReviewReason::SpotCheck),
+        };
+        let repeated = match problem {
+            Some(problem) => self.store.repeat_rejected(id, problem, value),
+            None => Ok(false),
+        };
+        let Some(s) = self.sensors.get_mut(&id) else { return };
+        match counted {
+            Ok(quality) => {
+                if let Run::Reading(run) = &mut s.run {
+                    run.quality = quality;
+                }
+            }
+            Err(e) => failures.push(e),
+        }
+        let repeated = repeated.unwrap_or_else(|e| {
+            failures.push(e);
+            false
+        });
+        for e in failures {
+            s.note(NoticeKind::Store(e.to_string()));
+        }
+        self.focus_dirty |= self.interest.sensor == Some(id);
+        if changed || (review.is_some() && !repeated) {
+            let value = published.map_or(SensorValue::Unknown, SensorValue::Number);
+            let row = NewHistory {
+                at: wall,
+                value: &value,
+                confidence: record.score,
+                changed,
+                review,
+                jpeg: &[],
+                events: &[],
+                found: &[],
+                read: Some(&record),
+            };
+            self.record(id, &frame, row);
+        }
+    }
+
+    /// The source's picture has another size than the region was drawn on (origin
+    /// `_camera_changed`): checks stop until the size is back or the sensor is saved again, and
+    /// the frame is kept in the history once, counted as a rejected reading.
+    fn hold_readings(&mut self, id: SensorId, frame: &ColorImage) {
+        let wall = SystemTime::now();
+        let Some(Sensor { run: Run::Reading(run), .. }) = self.sensors.get_mut(&id) else { return };
+        let outcome = ReadOutcome::Rejected(ReadProblem::CameraChanged);
+        let record = ReadRecord { text: String::new(), score: 0.0, value: None, outcome, repeats: 0 };
+        run.last = Some(record.clone());
+        let value = run.debouncer.published().copied().map_or(SensorValue::Unknown, SensorValue::Number);
+        if let Err(e) = self.store.count_reading(id, &local_day(wall), Some(ReadProblem::CameraChanged), None) {
+            self.note(NoticeKind::Store(e.to_string()));
+        }
+        let row = NewHistory { at: wall, value: &value, confidence: 0.0, changed: false, review: None, jpeg: &[], events: &[], found: &[], read: Some(&record) };
+        self.record(id, frame, row);
     }
 
     /// Teaches the face of a person box as `pick` (origin `teach_face`). Only a face that passes the
@@ -629,7 +859,8 @@ impl Engine {
             _ => Vec::new(),
         };
         let mut rec = s.rec.clone();
-        let retrain = rec.settings.region != settings.region || rec.settings.kind != settings.kind;
+        let learns = !matches!(settings.kind, KindSettings::Reading(_));
+        let retrain = learns && (rec.settings.region != settings.region || rec.settings.kind != settings.kind);
         if rec.settings.region != settings.region {
             s.baseline = None;
         }
@@ -657,7 +888,7 @@ impl Engine {
         let taught = s.counts.taught as usize;
         let region = s.rec.settings.region.clone();
         let refusal = match s.kind() {
-            Kind::States(..) => Some(NoticeKind::KindMismatch),
+            Kind::States(..) | Kind::Reading(..) => Some(NoticeKind::KindMismatch),
             Kind::Objects(objects, _) if !box_label_fits(objects, label, Some(detected)) => Some(NoticeKind::UnknownItem),
             Kind::Objects(..) if taught >= MAX_TAUGHT => Some(NoticeKind::TaughtFull),
             Kind::Objects(..) => {
@@ -714,7 +945,8 @@ impl Engine {
         let counts = self.store.counts(id);
         let Some(s) = self.sensors.get_mut(&id) else { return };
         match outcome {
-            Ok(true) => s.retrain_at = Some(now + RETRAIN_DELAY),
+            Ok(true) if !matches!(s.run, Run::Reading(_)) => s.retrain_at = Some(now + RETRAIN_DELAY),
+            Ok(true) => {}
             Ok(false) => s.note(NoticeKind::UnknownItem),
             Err(e) => s.note(NoticeKind::Store(e.to_string())),
         }
@@ -764,7 +996,7 @@ impl Engine {
         if !changed && review.is_none() {
             return;
         }
-        let row = NewHistory { at: SystemTime::now(), value: &value, confidence, changed, review, jpeg: &[], events: &[], found: &[] };
+        let row = NewHistory { at: SystemTime::now(), value: &value, confidence, changed, review, jpeg: &[], events: &[], found: &[], read: None };
         self.record(id, &frame, row);
     }
 
@@ -908,7 +1140,7 @@ impl Engine {
         self.system_dirty |= changed.iter().any(|k| matches!(k, ObjectKey::Person(_)));
         self.focus_dirty |= self.interest.sensor == Some(id) && self.interest.tab == Tab::Live;
         if !events.is_empty() {
-            let row = NewHistory { at: SystemTime::now(), value: &value, confidence, changed: true, review: None, jpeg: &[], events: &events, found: &found };
+            let row = NewHistory { at: SystemTime::now(), value: &value, confidence, changed: true, review: None, jpeg: &[], events: &events, found: &found, read: None };
             self.record(id, &frame, row);
         }
         for question in asks {
@@ -939,7 +1171,7 @@ impl Engine {
         }
         let confidence = found.iter().filter(|f| f.area == question.area).map(|f| f.score).fold(0.0, f32::max);
         let review = Some(ReviewReason::Face(question));
-        let row = NewHistory { at: SystemTime::now(), value, confidence, changed: false, review, jpeg: &[], events: &[], found };
+        let row = NewHistory { at: SystemTime::now(), value, confidence, changed: false, review, jpeg: &[], events: &[], found, read: None };
         self.record(id, frame, row);
     }
 
@@ -961,7 +1193,7 @@ impl Engine {
         }
         let confidence = found.iter().filter(|f| f.area == question.area).map(|f| f.score).fold(0.0, f32::max);
         let review = Some(ReviewReason::Ask(question));
-        let row = NewHistory { at: SystemTime::now(), value, confidence, changed: false, review, jpeg: &[], events: &[], found };
+        let row = NewHistory { at: SystemTime::now(), value, confidence, changed: false, review, jpeg: &[], events: &[], found, read: None };
         self.record(id, frame, row);
     }
 
@@ -1044,6 +1276,9 @@ impl Engine {
                         needed.insert(Model::Recogniser(self.recogniser));
                     }
                 }
+                KindSettings::Reading(reading) => {
+                    needed.insert(Model::reader(reading.display, self.number_reader));
+                }
             }
         }
         self.model_retry.retain(|model, _| needed.contains(model));
@@ -1077,12 +1312,20 @@ impl Engine {
         let backbone = self.model(Model::Backbone) == ModelState::Ready;
         let detector = self.model(Model::Detector(self.detector)) == ModelState::Ready;
         let which = self.detector;
+        let number = self.number_reader;
         let faces_ready = self.model(Model::FaceDetector) == ModelState::Ready
             && self.model(Model::Recogniser(self.recogniser)) == ModelState::Ready;
         let face_index = self.face_index.clone().filter(|index| faces_ready && index.recogniser == self.recogniser);
+        let reader_ready = match &self.sensors.get(&id)?.rec.settings.kind {
+            KindSettings::Reading(reading) => self.model(Model::reader(reading.display, number)) == ModelState::Ready,
+            KindSettings::States(_) | KindSettings::Objects(_) => false,
+        };
         let s = self.sensors.get_mut(&id)?;
         let feed = s.feed();
-        if let Some(seen) = self.feeds.latest(&feed).and_then(|f| f.geometry) {
+        let mut camera_changed = None;
+        if let Some(latest) = self.feeds.latest(&feed)
+            && let Some(seen) = latest.geometry
+        {
             match logic::geometry_verdict(s.rec.geometry, seen) {
                 GeometryVerdict::Adopt => {
                     s.rec.geometry = Some(seen);
@@ -1091,9 +1334,18 @@ impl Engine {
                     }
                 }
                 GeometryVerdict::Same => s.geometry_seen = None,
-                GeometryVerdict::Changed => s.geometry_seen = Some(seen),
+                GeometryVerdict::Changed => {
+                    if s.geometry_seen.is_none() && matches!(s.run, Run::Reading(_)) {
+                        camera_changed = Some(latest.image.clone());
+                    }
+                    s.geometry_seen = Some(seen);
+                }
             }
         }
+        if let Some(image) = camera_changed {
+            self.hold_readings(id, &image);
+        }
+        let s = self.sensors.get_mut(&id)?;
         let mut next = None;
         if let Some(at) = s.retrain_at {
             if at > now {
@@ -1110,6 +1362,7 @@ impl Engine {
                         let parents = objects.active_labels().map(|l| (l.id, l.parent)).collect();
                         self.store.taught_set(id, BACKBONE.id).map(|rows| Job::Index { sensor: id, rows, parents })
                     }
+                    Kind::Reading(..) => unreachable!("a reading sensor learns nothing to retrain"),
                 };
                 match job {
                     Ok(job) => {
@@ -1123,6 +1376,7 @@ impl Engine {
         let ready = match &s.rec.settings.kind {
             KindSettings::States(_) => backbone && s.head().is_some(),
             KindSettings::Objects(_) => detector,
+            KindSettings::Reading(_) => reader_ready,
         };
         if s.in_flight.is_some() || s.geometry_seen.is_some() || !ready {
             return next;
@@ -1163,6 +1417,11 @@ impl Engine {
                     faces: face_index.filter(|_| objects.faces_on()),
                     previous: run.found.clone(),
                 },
+            },
+            Kind::Reading(reading, _) => Job::Read {
+                sensor: id,
+                frame: frame.image.clone(),
+                request: ReadRequest { region, display: reading.display, number },
             },
         };
         self.infer.submit(job);
@@ -1254,6 +1513,7 @@ impl Engine {
         let (model, trained) = match &s.rec.settings.kind {
             KindSettings::States(_) => (Model::Backbone, s.head().is_some()),
             KindSettings::Objects(_) => (Model::Detector(self.detector), true),
+            KindSettings::Reading(reading) => (Model::reader(reading.display, self.number_reader), true),
         };
         let status = logic::sensor_status(StatusFacts {
             paused: s.rec.settings.paused,
@@ -1279,7 +1539,15 @@ impl Engine {
                 Default::default()
             }
         };
-        let models = [Model::Backbone, Model::Detector(self.detector), Model::FaceDetector, Model::Recogniser(self.recogniser)]
+        let models = [
+            Model::Backbone,
+            Model::Detector(self.detector),
+            Model::FaceDetector,
+            Model::Recogniser(self.recogniser),
+            Model::NumberReader(self.number_reader),
+            Model::WheelReader(WheelModel::V1),
+            Model::WheelReader(WheelModel::V2),
+        ]
             .map(|model| ModelStatus { name: model.spec().name.to_owned(), state: self.model(model) })
             .into();
         let people = self
@@ -1304,6 +1572,7 @@ impl Engine {
             models,
             detector: self.detector,
             recogniser: self.recogniser,
+            number_reader: self.number_reader,
             people,
             faces_indexing: self.faces_indexing,
             notice: self.notice.clone(),
@@ -1342,6 +1611,15 @@ impl Engine {
             }
             _ => None,
         };
+        let seen = match (&self.sensors[&id].run, self.interest.tab) {
+            (Run::Reading(run), Tab::Live) => run.seen.as_ref().map(|(image, picture)| {
+                if !held.contains(image) {
+                    images.push((*image, picture.clone()));
+                }
+                *image
+            }),
+            _ => None,
+        };
         let mut load = |image: ImageId, path: &Path, edge: usize| load_image(held, images, image, path, edge);
         let history_item = |row: StoredHistory, load: &mut dyn FnMut(ImageId, &Path, usize) -> bool| {
             let thumb = ImageId(HISTORY_THUMB | row.id.0 as u64);
@@ -1353,6 +1631,7 @@ impl Engine {
                 review: row.review,
                 thumb: Some(thumb),
                 events: row.events,
+                read: row.read,
             })
         };
         let detail = match self.interest.tab {
@@ -1394,7 +1673,7 @@ impl Engine {
             self.note(NoticeKind::Store(e.to_string()));
             Detail::Live
         });
-        Some(FocusView { sensor: Some(id), preview, detail, opened })
+        Some(FocusView { sensor: Some(id), preview, detail, opened, seen })
     }
 
     /// Every taught face, newest first, for the people tab.
@@ -1411,7 +1690,7 @@ impl Engine {
                     .then_some(FaceItem { id: f.id, person: f.person, thumb, at: f.at, sensor: f.sensor })
             })
             .collect();
-        FocusView { sensor: None, preview: None, detail: Detail::People(items), opened: None }
+        FocusView { sensor: None, preview: None, detail: Detail::People(items), opened: None, seen: None }
     }
 
     fn note(&mut self, kind: NoticeKind) {
@@ -1495,7 +1774,20 @@ fn entry(s: &Sensor, status: SensorStatus, people: &[StoredPerson]) -> SensorEnt
             };
             (run.debouncer.published().cloned(), KindLive::States(live))
         }
-        (KindSettings::States(_), Run::Objects(_)) => unreachable!("Configure never changes the kind"),
+        (_, Run::Reading(run)) => {
+            let live = ReadingLive {
+                last: run.last.clone(),
+                accepted: run.accepted,
+                rate: run.rate,
+                limit: run.limit,
+                learned: run.watch.learned,
+                days: run.watch.days,
+                quality: run.quality.clone(),
+                review_pending: s.counts.pending,
+            };
+            (run.debouncer.published().copied().map(SensorValue::Number), KindLive::Reading(live))
+        }
+        (_, Run::Objects(_)) => unreachable!("Configure never changes the kind"),
     };
     SensorEntry {
         id: s.rec.id,
@@ -1513,6 +1805,54 @@ fn entry(s: &Sensor, status: SensorStatus, people: &[StoredPerson]) -> SensorEnt
 /// Uniform in `0.0..1.0`, for the review spot check.
 fn roll() -> f32 {
     (getrandom::u32().unwrap_or(0) >> 8) as f32 / (1u32 << 24) as f32
+}
+
+/// What is stored of a reading sensor between checks.
+fn stored_watch(run: &ReadingRun) -> StoredWatch {
+    StoredWatch {
+        value: run.debouncer.published().copied(),
+        seen_at: run.watch.seen_at,
+        accepted_at: run.watch.accepted_at,
+        budget_s: run.watch.budget_s,
+        held: run.watch.held,
+    }
+}
+
+/// Works out again what a counter's limit learned from its days: once an hour, and on a new day
+/// (origin `_learn_limit`).
+fn relearn(store: &Store, id: SensorId, watch: &mut Watch, now: f64, wall: SystemTime) -> Result<(), StoreError> {
+    let today = local_day(wall);
+    if watch.learned_at.is_some_and(|at| now - at < COUNTER_LIMIT.relearn_s) && watch.learned_day == today {
+        return Ok(());
+    }
+    let first = local_day(wall - Duration::from_secs(u64::from(COUNTER_LIMIT.learn_days - 1) * 86_400));
+    let days = store.reading_days(id, &first)?;
+    watch.learned = change_limit::learn(&days);
+    watch.days = days.len() as u32;
+    (watch.learned_at, watch.learned_day) = (Some(now), today);
+    Ok(())
+}
+
+/// Each quality period with its first day.
+fn quality_periods(wall: SystemTime) -> Vec<(u32, String)> {
+    QUALITY_PERIODS_DAYS.iter().map(|days| (*days, local_day(wall - Duration::from_secs(u64::from(days - 1) * 86_400)))).collect()
+}
+
+fn epoch(at: SystemTime) -> f64 {
+    at.duration_since(UNIX_EPOCH).map_or(0.0, |d| d.as_secs_f64())
+}
+
+/// The date of `at` on the user's calendar ("2026-10-28"): a day of readings is the day as the
+/// user sees it.
+fn local_day(at: SystemTime) -> String {
+    let seconds = at.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs()) as libc::time_t;
+    let mut local = std::mem::MaybeUninit::<libc::tm>::uninit();
+    // SAFETY: both pointers are valid for the call; the result is read only after it succeeded.
+    let t = unsafe {
+        assert!(!libc::localtime_r(&seconds, local.as_mut_ptr()).is_null(), "a time from the clock has a calendar date");
+        local.assume_init()
+    };
+    format!("{:04}-{:02}-{:02}", t.tm_year + 1900, t.tm_mon + 1, t.tm_mday)
 }
 
 #[cfg(test)]

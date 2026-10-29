@@ -30,8 +30,9 @@ use super::infer::Head;
 use super::logic::{RowCost, retention_plan};
 use crate::frames::StreamKind;
 use crate::sensors::types::{
-    BoxLabel, Detector, FaceId, Found, Geometry, HistoryId, LabelId, Name, ObjectClass, ObjectEvent, PersonId, Recogniser,
-    Retention, ReviewReason, SampleId, SampleLabel, SensorId, SensorValue, Settings, SourceSpec, StateKey, StorageUsage,
+    BoxLabel, Detector, FaceId, Found, Geometry, HistoryId, LabelId, Name, Number, NumberReader, ObjectClass, ObjectEvent,
+    PersonId, QualityPeriod, ReadProblem, ReadRecord, Recogniser, Retention, ReviewReason, SampleId, SampleLabel, SensorId,
+    SensorValue, Settings, SourceSpec, StateKey, StorageUsage,
 };
 
 /// Each entry upgrades the schema by one version; `user_version` counts the entries applied.
@@ -112,6 +113,30 @@ const MIGRATIONS: &[&str] = &[
         model TEXT NOT NULL,
         vector BLOB NOT NULL,
         PRIMARY KEY (face, model)
+    ) STRICT;
+",
+    // Reading sensors: a history row keeps the reading; every reading is counted per local day,
+    // with what a counter's limit learns from it; a sensor's last value and its limit between
+    // readings survive a restart.
+    "
+    ALTER TABLE history ADD COLUMN read TEXT;
+    CREATE TABLE reading_day (
+        sensor INTEGER NOT NULL REFERENCES sensor(id) ON DELETE CASCADE,
+        day TEXT NOT NULL,
+        reads INTEGER NOT NULL,
+        accepted INTEGER NOT NULL,
+        rejected TEXT NOT NULL,
+        peak REAL,
+        total REAL,
+        PRIMARY KEY (sensor, day)
+    ) STRICT;
+    CREATE TABLE reading_watch (
+        sensor INTEGER PRIMARY KEY REFERENCES sensor(id) ON DELETE CASCADE,
+        value TEXT,
+        seen_at REAL,
+        accepted_at REAL,
+        budget_s REAL NOT NULL,
+        held INTEGER NOT NULL
     ) STRICT;
 ",
 ];
@@ -202,6 +227,7 @@ pub struct NewHistory<'a> {
     pub jpeg: &'a [u8],
     pub events: &'a [ObjectEvent],
     pub found: &'a [Found],
+    pub read: Option<&'a ReadRecord>,
 }
 
 pub struct StoredSample {
@@ -218,7 +244,19 @@ pub struct StoredHistory {
     pub confidence: f32,
     pub review: Option<ReviewReason>,
     pub events: Vec<ObjectEvent>,
+    pub read: Option<ReadRecord>,
     pub image: PathBuf,
+}
+
+/// A reading sensor's last published value, and a counter's limit between readings (seconds since
+/// the epoch).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StoredWatch {
+    pub value: Option<Number>,
+    pub seen_at: Option<f64>,
+    pub accepted_at: Option<f64>,
+    pub budget_s: f64,
+    pub held: bool,
 }
 
 /// What a sensor has learned and what waits for the user.
@@ -523,8 +561,8 @@ impl Store {
         write_atomic(&self.history_path(id, item), h.jpeg)?;
         let list = |empty: bool, value: String| (!empty).then_some(value);
         self.conn.execute(
-            "INSERT INTO history (id, sensor, at, value, confidence, changed, review, bytes, events, found)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "INSERT INTO history (id, sensor, at, value, confidence, changed, review, bytes, events, found, read)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             params![
                 item.0,
                 key(id),
@@ -536,6 +574,7 @@ impl Store {
                 h.jpeg.len() as i64,
                 list(h.events.is_empty(), json(h.events)?),
                 list(h.found.is_empty(), json(h.found)?),
+                h.read.map(json).transpose()?,
             ],
         )?;
         Ok(item)
@@ -793,6 +832,129 @@ impl Store {
         Ok(doomed.len())
     }
 
+    /// Counts one reading for the sensor's `day`: accepted (`problem` `None`) or rejected, and what
+    /// it adds to a counter's limit, (largest rise over the window, rise) of that day.
+    pub fn count_reading(&mut self, id: SensorId, day: &str, problem: Option<ReadProblem>, learned: Option<(f64, f64)>) -> Result<()> {
+        let tx = self.conn.transaction()?;
+        type DayRow = (u32, u32, String, Option<f64>, Option<f64>);
+        let row: Option<DayRow> = tx
+            .query_row(
+                "SELECT reads, accepted, rejected, peak, total FROM reading_day WHERE sensor = ? AND day = ?",
+                params![key(id), day],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
+            )
+            .optional()?;
+        let (reads, accepted, rejected, peak, total) = row.unwrap_or((0, 0, "[]".into(), None, None));
+        let mut rejected: Vec<(ReadProblem, u32)> = serde_json::from_str(&rejected)?;
+        if let Some(problem) = problem {
+            match rejected.iter_mut().find(|(p, _)| *p == problem) {
+                Some((_, count)) => *count += 1,
+                None => rejected.push((problem, 1)),
+            }
+        }
+        let (peak, total) = match learned {
+            Some((rise, day_rise)) => (Some(peak.unwrap_or(0.0).max(rise)), Some(total.unwrap_or(0.0) + day_rise)),
+            None => (peak, total),
+        };
+        tx.execute(
+            "INSERT OR REPLACE INTO reading_day (sensor, day, reads, accepted, rejected, peak, total) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            params![key(id), day, reads + 1, accepted + u32::from(problem.is_none()), json(&rejected)?, peak, total],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// (largest rise over the window, rise) of every day since `first` (inclusive) on which a
+    /// counter learned something.
+    pub fn reading_days(&self, id: SensorId, first: &str) -> Result<Vec<(f64, f64)>> {
+        let mut stmt = self.conn.prepare("SELECT peak, COALESCE(total, 0) FROM reading_day WHERE sensor = ? AND day >= ? AND peak IS NOT NULL")?;
+        let rows = stmt.query_map(params![key(id), first], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<Result<_, _>>()?)
+    }
+
+    /// The readings of each period, given as (days, first day).
+    pub fn quality(&self, id: SensorId, periods: &[(u32, String)]) -> Result<Vec<QualityPeriod>> {
+        let mut stmt = self.conn.prepare("SELECT reads, accepted, rejected FROM reading_day WHERE sensor = ? AND day >= ?")?;
+        periods
+            .iter()
+            .map(|(days, first)| {
+                let mut period = QualityPeriod { days: *days, ..QualityPeriod::default() };
+                let rows = stmt.query_map(params![key(id), first], |r| Ok((r.get::<_, u32>(0)?, r.get::<_, u32>(1)?, r.get::<_, String>(2)?)))?;
+                for row in rows {
+                    let (reads, accepted, rejected) = row?;
+                    period.reads += reads;
+                    period.accepted += accepted;
+                    for (problem, count) in serde_json::from_str::<Vec<(ReadProblem, u32)>>(&rejected)? {
+                        match period.rejected.iter_mut().find(|(p, _)| *p == problem) {
+                            Some((_, total)) => *total += count,
+                            None => period.rejected.push((problem, count)),
+                        }
+                    }
+                }
+                period.rejected.sort();
+                Ok(period)
+            })
+            .collect()
+    }
+
+    /// Keeps a reading sensor's last published value and its counter limit.
+    pub fn save_watch(&mut self, id: SensorId, watch: &StoredWatch) -> Result<()> {
+        self.conn.execute(
+            "INSERT OR REPLACE INTO reading_watch (sensor, value, seen_at, accepted_at, budget_s, held) VALUES (?, ?, ?, ?, ?, ?)",
+            params![key(id), watch.value.as_ref().map(json).transpose()?, watch.seen_at, watch.accepted_at, watch.budget_s, watch.held],
+        )?;
+        Ok(())
+    }
+
+    pub fn watches(&self) -> Result<Vec<(SensorId, StoredWatch)>> {
+        let mut stmt = self.conn.prepare("SELECT sensor, value, seen_at, accepted_at, budget_s, held FROM reading_watch")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, i64>(0)?, r.get::<_, Option<String>>(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?))
+        })?;
+        rows.map(|row| {
+            let (sensor, value, seen_at, accepted_at, budget_s, held) = row?;
+            let value = value.as_deref().map(serde_json::from_str).transpose()?;
+            Ok((sensor_id(sensor), StoredWatch { value, seen_at, accepted_at, budget_s, held }))
+        })
+        .collect()
+    }
+
+    /// Counts a rejected reading on the one waiting in review with the same problem and value: a
+    /// meter standing still on a rejected value would otherwise queue a frame per check, all with
+    /// the same answer. `false` when none waits (origin `_repeat_rejected`).
+    pub fn repeat_rejected(&mut self, id: SensorId, problem: ReadProblem, value: Option<Number>) -> Result<bool> {
+        let waiting: Vec<(i64, String)> = {
+            let mut stmt = self.conn.prepare("SELECT id, read FROM history WHERE sensor = ? AND review = ? AND resolved = 0 AND read IS NOT NULL ORDER BY id")?;
+            stmt.query_map(params![key(id), json(&ReviewReason::Rejected(problem))?], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<Result<_, _>>()?
+        };
+        for (item, read) in waiting {
+            let mut read: ReadRecord = serde_json::from_str(&read)?;
+            if read.value == value {
+                read.repeats += 1;
+                self.conn.execute("UPDATE history SET read = ? WHERE id = ?", params![json(&read)?, item])?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Whether a value was published after this history item.
+    pub fn published_after(&self, id: SensorId, item: HistoryId) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS (SELECT 1 FROM history WHERE sensor = ? AND id > ? AND changed = 1)",
+            params![key(id), item.0],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn number_reader(&self) -> Result<NumberReader> {
+        self.setting("number_reader").map(Option::unwrap_or_default)
+    }
+
+    pub fn set_number_reader(&mut self, reader: NumberReader) -> Result<()> {
+        self.set_setting("number_reader", &reader)
+    }
+
     pub fn usage(&self) -> Result<StorageUsage> {
         let sum = |table: &str| -> Result<u64> {
             let bytes: i64 = self.conn.query_row(&format!("SELECT COALESCE(SUM(bytes), 0) FROM {table}"), [], |r| r.get(0))?;
@@ -803,7 +965,7 @@ impl Store {
 
     fn history_rows(&self, id: SensorId, filter: &str, args: impl rusqlite::Params) -> Result<Vec<StoredHistory>> {
         let mut stmt =
-            self.conn.prepare(&format!("SELECT id, at, value, confidence, review, events FROM history {filter}"))?;
+            self.conn.prepare(&format!("SELECT id, at, value, confidence, review, events, read FROM history {filter}"))?;
         let rows = stmt.query_map(args, |r| {
             Ok((
                 r.get::<_, i64>(0)?,
@@ -812,10 +974,11 @@ impl Store {
                 r.get::<_, f64>(3)?,
                 r.get::<_, Option<String>>(4)?,
                 r.get::<_, Option<String>>(5)?,
+                r.get::<_, Option<String>>(6)?,
             ))
         })?;
         rows.map(|row| {
-            let (item, at, value, confidence, review, events) = row?;
+            let (item, at, value, confidence, review, events, read) = row?;
             Ok(StoredHistory {
                 id: HistoryId(item),
                 at: time(at),
@@ -823,6 +986,7 @@ impl Store {
                 confidence: confidence as f32,
                 review: review.as_deref().map(serde_json::from_str).transpose()?,
                 events: events.as_deref().map(serde_json::from_str).transpose()?.unwrap_or_default(),
+                read: read.as_deref().map(serde_json::from_str).transpose()?,
                 image: self.history_path(id, HistoryId(item)),
             })
         })
@@ -1012,7 +1176,7 @@ mod tests {
     }
 
     fn history<'a>(at: SystemTime, value: &'a SensorValue, review: Option<ReviewReason>, jpeg: &'static [u8]) -> NewHistory<'a> {
-        NewHistory { at, value, confidence: 0.5, changed: true, review, jpeg, events: &[], found: &[] }
+        NewHistory { at, value, confidence: 0.5, changed: true, review, jpeg, events: &[], found: &[], read: None }
     }
 
     #[test]
@@ -1117,6 +1281,45 @@ mod tests {
         assert_eq!((stored.value, stored.events), (value, events.to_vec()));
         assert_eq!(store.history_image(id, item).unwrap().unwrap().1, found);
         assert_eq!(store.history_image(SensorId(6), item).unwrap(), None, "another sensor's item");
+    }
+
+    #[test]
+    fn readings_are_counted_per_day_and_the_last_value_survives_reopening() {
+        use crate::sensors::types::ReadOutcome;
+        let dir = temp_dir("readings");
+        let mut store = Store::open(&dir).unwrap();
+        let id = SensorId(11);
+        store.create(&record(11)).unwrap();
+        store.count_reading(id, "2026-10-27", None, Some((0.05, 0.4))).unwrap();
+        store.count_reading(id, "2026-10-28", None, Some((0.02, 0.1))).unwrap();
+        store.count_reading(id, "2026-10-28", None, Some((0.07, 0.2))).unwrap();
+        store.count_reading(id, "2026-10-28", Some(ReadProblem::WentDown), None).unwrap();
+        store.count_reading(id, "2026-10-28", Some(ReadProblem::Unsure), None).unwrap();
+        store.count_reading(id, "2026-10-28", Some(ReadProblem::WentDown), None).unwrap();
+        let days = store.reading_days(id, "2026-10-28").unwrap();
+        assert_eq!(days.len(), 1);
+        assert!((days[0].0 - 0.07).abs() < 1e-12 && (days[0].1 - 0.3).abs() < 1e-12, "the day's largest rise and its total");
+        let quality = store.quality(id, &[(1, "2026-10-28".into()), (7, "2026-10-22".into())]).unwrap();
+        assert_eq!((quality[0].reads, quality[0].accepted), (5, 2));
+        assert_eq!(quality[0].rejected, [(ReadProblem::Unsure, 1), (ReadProblem::WentDown, 2)]);
+        assert_eq!((quality[1].reads, quality[1].accepted), (6, 3));
+
+        let value = Number { scaled: 629_558, decimals: 3 };
+        let watch = StoredWatch { value: Some(value), seen_at: Some(10.0), accepted_at: Some(5.0), budget_s: 5.0, held: true };
+        store.save_watch(id, &watch).unwrap();
+        let read = ReadRecord { text: "0629551".into(), score: 0.9, value: Some(Number { scaled: 629_551, decimals: 3 }), outcome: ReadOutcome::Rejected(ReadProblem::WentDown), repeats: 0 };
+        let published = SensorValue::Number(value);
+        let row = NewHistory { read: Some(&read), ..history(SystemTime::now(), &published, Some(ReviewReason::Rejected(ReadProblem::WentDown)), b"jpeg") };
+        let item = store.record(id, &row).unwrap();
+        assert!(store.repeat_rejected(id, ReadProblem::WentDown, read.value).unwrap(), "the same rejected reading waits already");
+        assert!(!store.repeat_rejected(id, ReadProblem::WentDown, None).unwrap(), "another value is queued");
+        assert!(!store.repeat_rejected(id, ReadProblem::Unsure, read.value).unwrap(), "another problem is queued");
+        assert_eq!(store.history_item(id, item).unwrap().unwrap().read.unwrap().repeats, 1);
+        assert!(!store.published_after(id, item).unwrap());
+        drop(store);
+        let store = Store::open(&dir).unwrap();
+        assert_eq!(store.watches().unwrap(), [(id, watch)]);
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

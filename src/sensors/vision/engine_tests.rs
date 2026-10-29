@@ -438,7 +438,140 @@ fn a_person_named_on_one_sensor_is_known_to_every_sensor_and_forgetting_them_rem
     engine.tick(now + Duration::from_secs(4));
     let tracks = match &engine.sensors[&HALL].sent.as_ref().unwrap().live {
         KindLive::Objects(live) => live.tracks.iter().map(|t| t.key).collect::<Vec<_>>(),
-        KindLive::States(_) => unreachable!(),
+        _ => unreachable!(),
     };
     assert_eq!(tracks, [ObjectKey::Class(ObjectClass::PERSON), ObjectKey::Stranger], "nobody to report but the unknown person");
+}
+
+const METER: SensorId = SensorId(77);
+
+fn meter_record() -> SensorRecord {
+    use crate::sensors::types::{Amount, ChangeLimit, CounterReader, RateWindow, ReadingDisplay};
+    let reading = ReadingSettings {
+        mode: ReadingMode::Counter { limit: ChangeLimit::Step { max_step: Amount::try_from(0.05).unwrap() }, rate_window: RateWindow::DEFAULT },
+        display: ReadingDisplay::Counter { digits: 7.try_into().unwrap(), reader: CounterReader::Wheels(WheelModel::V2) },
+        decimals: 3.try_into().unwrap(),
+        ..ReadingSettings::default()
+    };
+    SensorRecord {
+        id: METER,
+        source: SourceSpec::Dvr(CameraId { dvr: DvrSerial::new("CAM"), channel: ChannelIndex::new(5) }),
+        stream: StreamKind::Main,
+        settings: Settings::new_reading("Água".to_owned().try_into().unwrap(), reading),
+        geometry: None,
+    }
+}
+
+/// One forced check of the meter, answered with what the wheel reader read.
+fn read_meter(engine: &mut Engine, jobs: &Receiver<Job>, seq: u64, text: &str, score: f32) {
+    std::thread::sleep(Duration::from_millis(2));
+    let now = Instant::now();
+    seed_feed(engine, METER, now, seq);
+    engine.sensors.get_mut(&METER).unwrap().schedule.force = true;
+    engine.tick(now);
+    assert!(matches!(jobs.try_recv(), Ok(Job::Read { sensor: METER, .. })), "a reading of the meter");
+    let seen = Rgb { size: [2, 1], pixels: vec![0; 6] };
+    engine.handle(Input::Infer(Done::Read { sensor: METER, read: Ok(ReadText { text: text.into(), score, seen }) }));
+    engine.tick(now);
+}
+
+fn meter_now(engine: &Engine) -> (Option<String>, Option<ReadOutcome>) {
+    let entry = engine.sensors[&METER].sent.as_ref().unwrap();
+    let KindLive::Reading(live) = &entry.live else { unreachable!() };
+    let value = match &entry.value {
+        Some(SensorValue::Number(n)) => Some(n.to_string()),
+        _ => None,
+    };
+    (value, live.last.as_ref().map(|r| r.outcome))
+}
+
+fn meter_engine(f: &Fixture) -> (Engine, Receiver<Job>, Receiver<Model>) {
+    let (mut engine, _, jobs, fetch) = f.engine();
+    engine.tick(Instant::now());
+    assert_eq!(fetch.try_iter().collect::<Vec<_>>(), [Model::WheelReader(WheelModel::V2)], "the counter's own wheel reader, nothing else");
+    engine.handle(Input::Model(ModelEvent { model: Model::WheelReader(WheelModel::V2), state: ModelState::Ready }));
+    (engine, jobs, fetch)
+}
+
+#[test]
+fn a_counter_never_goes_down_nor_jumps_and_one_step_below_is_settling() {
+    let f = Fixture::new();
+    f.store().create(&meter_record()).unwrap();
+    let (mut engine, jobs, _) = meter_engine(&f);
+    let value = |s: &str| Some(s.to_owned());
+    read_meter(&mut engine, &jobs, 1, "0629550", 0.95);
+    assert_eq!(meter_now(&engine), (value("629.550"), Some(ReadOutcome::Accepted)));
+    read_meter(&mut engine, &jobs, 2, "0629549", 0.95);
+    assert_eq!(meter_now(&engine), (value("629.550"), Some(ReadOutcome::Settling)), "one step below: the last wheel turning");
+    read_meter(&mut engine, &jobs, 3, "0629540", 0.95);
+    assert_eq!(meter_now(&engine), (value("629.550"), Some(ReadOutcome::Rejected(ReadProblem::WentDown))));
+    read_meter(&mut engine, &jobs, 4, "0629540", 0.95);
+    read_meter(&mut engine, &jobs, 5, "0729550", 0.95);
+    assert_eq!(meter_now(&engine), (value("629.550"), Some(ReadOutcome::Rejected(ReadProblem::ChangedTooMuch))), "a jump over the limit");
+    read_meter(&mut engine, &jobs, 6, "062955", 0.99);
+    assert_eq!(meter_now(&engine).1, Some(ReadOutcome::Rejected(ReadProblem::WrongDigitCount)));
+    read_meter(&mut engine, &jobs, 7, "0629552", 0.5);
+    assert_eq!(meter_now(&engine), (value("629.550"), Some(ReadOutcome::Rejected(ReadProblem::Unsure))));
+    read_meter(&mut engine, &jobs, 8, "0629552", 0.95);
+    assert_eq!(meter_now(&engine), (value("629.552"), Some(ReadOutcome::Accepted)));
+
+    let reviews = engine.store.reviews(METER, 10).unwrap();
+    let problems: Vec<ReviewReason> = reviews.iter().rev().filter_map(|r| r.review).collect();
+    let rejected = |p| ReviewReason::Rejected(p);
+    assert_eq!(
+        problems,
+        [rejected(ReadProblem::WentDown), rejected(ReadProblem::ChangedTooMuch), rejected(ReadProblem::WrongDigitCount), rejected(ReadProblem::Unsure)],
+        "the same rejected reading waits in review once"
+    );
+    assert_eq!(reviews.last().unwrap().read.as_ref().unwrap().repeats, 1);
+    let (history, _) = engine.store.history(METER, None, 20).unwrap();
+    assert_eq!(history.iter().filter(|h| h.review.is_none()).count(), 2, "the two published values");
+    let entry = engine.sensors[&METER].sent.as_ref().unwrap();
+    let KindLive::Reading(live) = &entry.live else { unreachable!() };
+    assert_eq!((live.quality[0].reads, live.quality[0].accepted), (8, 3));
+    assert_eq!(live.accepted, Some(37.5));
+    assert_eq!(live.limit, Some(0.05));
+}
+
+#[test]
+fn a_restart_keeps_checking_against_the_last_value() {
+    let f = Fixture::new();
+    f.store().create(&meter_record()).unwrap();
+    let (mut engine, jobs, _) = meter_engine(&f);
+    read_meter(&mut engine, &jobs, 1, "0629550", 0.95);
+    drop(engine);
+    let (mut engine, jobs, _) = meter_engine(&f);
+    read_meter(&mut engine, &jobs, 2, "0629500", 0.95);
+    assert_eq!(meter_now(&engine), (Some("629.550".into()), Some(ReadOutcome::Rejected(ReadProblem::WentDown))), "memory empty is no reason to go down");
+}
+
+#[test]
+fn a_rejected_reading_confirmed_or_corrected_in_review_is_the_new_last_value() {
+    let f = Fixture::new();
+    f.store().create(&meter_record()).unwrap();
+    let (mut engine, jobs, _) = meter_engine(&f);
+    read_meter(&mut engine, &jobs, 1, "0629550", 0.95);
+    read_meter(&mut engine, &jobs, 2, "0629400", 0.95);
+    let went_down = engine.store.reviews(METER, 10).unwrap()[0].id;
+    engine.user(UserCommand::AnswerReading { id: METER, item: went_down, answer: ReadingAnswer::ReadRight }, Instant::now());
+    engine.tick(Instant::now());
+    assert_eq!(meter_now(&engine).0, Some("629.400".into()), "the meter was replaced: the lower value is right");
+    read_meter(&mut engine, &jobs, 3, "0629401", 0.95);
+    assert_eq!(meter_now(&engine), (Some("629.401".into()), Some(ReadOutcome::Accepted)), "checked against the confirmed value");
+
+    read_meter(&mut engine, &jobs, 4, "062940", 0.95);
+    let short = engine.store.reviews(METER, 10).unwrap()[0].id;
+    engine.user(UserCommand::AnswerReading { id: METER, item: short, answer: ReadingAnswer::ReadRight }, Instant::now());
+    engine.tick(Instant::now());
+    assert_eq!(meter_now(&engine).0, Some("629.401".into()), "a wrong number of digits is no value, even read as shown");
+    assert!(engine.store.reviews(METER, 10).unwrap().is_empty(), "both answered");
+
+    read_meter(&mut engine, &jobs, 5, "0639402", 0.95);
+    let jump = engine.store.reviews(METER, 10).unwrap()[0].id;
+    let typed = engine.sensors[&METER].rec.settings.kind.clone();
+    let KindSettings::Reading(reading) = typed else { unreachable!() };
+    let showed = reading.typed("629,402").unwrap();
+    engine.user(UserCommand::AnswerReading { id: METER, item: jump, answer: ReadingAnswer::Showed(showed) }, Instant::now());
+    engine.tick(Instant::now());
+    assert_eq!(meter_now(&engine).0, Some("629.402".into()), "the value typed in review");
 }

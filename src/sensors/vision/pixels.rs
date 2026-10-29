@@ -200,7 +200,7 @@ pub fn decode(bytes: &[u8]) -> ImageResult<ColorImage> {
 
 /// Separable resampling with a triangle filter widened by the scale, as PIL's BILINEAR: a large
 /// reduction averages every source pixel instead of sampling a few.
-fn resize(src: &[u8], channels: usize, [sw, sh]: [usize; 2], [dw, dh]: [usize; 2]) -> Vec<u8> {
+pub(super) fn resize(src: &[u8], channels: usize, [sw, sh]: [usize; 2], [dw, dh]: [usize; 2]) -> Vec<u8> {
     let columns = taps(sw, dw);
     let mut mid = vec![0.0f32; sh * dw * channels];
     for y in 0..sh {

@@ -18,7 +18,7 @@ use super::types::{FocusView, ImageId, Interest, SensorEntry, SensorId, SystemSt
 use crate::frames::StreamKey;
 use crate::plan::RtspUrl;
 
-pub(super) const PROTOCOL: u32 = 4;
+pub(super) const PROTOCOL: u32 = 5;
 /// No image on the wire is larger than this on its longer side.
 pub(super) const MAX_WIRE_EDGE: u32 = 960;
 /// The vision process sends `System` at least this often, so a silent child counts as stalled.

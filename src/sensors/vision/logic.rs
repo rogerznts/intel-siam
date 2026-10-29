@@ -250,6 +250,14 @@ impl<V: Clone + PartialEq> Debouncer<V> {
     pub fn published(&self) -> Option<&V> {
         self.published.as_ref()
     }
+
+    /// A value confirmed elsewhere (restored, or answered in review) is the published one, with
+    /// nothing pending.
+    pub fn anchor(&mut self, value: V) {
+        self.published = Some(value);
+        self.candidate = None;
+        self.count = 0;
+    }
 }
 
 /// Whether a checked frame goes to the review queue, and why (origin `review_reason`).

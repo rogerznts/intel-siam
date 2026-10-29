@@ -44,6 +44,10 @@ pub struct SensorsPanel {
     /// Names being edited, by person.
     renames: HashMap<PersonId, String>,
     forget_confirm: Option<PersonId>,
+    /// A reading sensor's settings being edited, saved with one `Configure`.
+    reading_draft: Option<(SensorId, ReadingSettings)>,
+    /// What the display really showed, typed per rejected reading.
+    corrections: HashMap<HistoryId, String>,
 }
 
 /// A box chosen on the preview, to teach what it is.
@@ -57,21 +61,30 @@ struct Picked {
     face: Option<FaceLook>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NewKind {
+    States,
+    Objects,
+    Reading,
+}
+
 struct NewSensor {
     name: String,
     url: String,
     camera: Option<CameraId>,
     use_url: bool,
     stream: StreamKind,
-    objects: bool,
+    kind: NewKind,
     states: Vec<String>,
     classes: Vec<ObjectClass>,
+    reading: ReadingSettings,
 }
 
 impl Default for NewSensor {
     fn default() -> Self {
-        Self { name: String::new(), url: String::new(), camera: None, use_url: true, stream: StreamKind::Sub, objects: false,
-            states: vec!["Aberto".into(), "Fechado".into()], classes: ObjectClass::by_key("person").into_iter().collect() }
+        Self { name: String::new(), url: String::new(), camera: None, use_url: true, stream: StreamKind::Sub, kind: NewKind::States,
+            states: vec!["Aberto".into(), "Fechado".into()], classes: ObjectClass::by_key("person").into_iter().collect(),
+            reading: ReadingSettings::default() }
     }
 }
 
@@ -96,6 +109,8 @@ impl SensorsPanel {
         self.teaching_boxes = false;
         self.delete_confirm = false;
         self.error = None;
+        self.reading_draft = None;
+        self.corrections.clear();
     }
 }
 
@@ -104,6 +119,7 @@ pub fn value_label(entry: &SensorEntry, people: &[PersonView]) -> String {
         SensorStatus::Live => match &entry.settings.kind {
             KindSettings::States(_) => state_label(entry, entry.value.as_ref()),
             KindSettings::Objects(objects) => presence_label(objects, people, entry.value.as_ref()),
+            KindSettings::Reading(reading) => number_label(reading, entry.value.as_ref()),
         },
         SensorStatus::Paused => "pausado".into(),
         SensorStatus::GeometryChanged { .. } => "mudou a resolução".into(),
@@ -130,6 +146,18 @@ fn presence_label(objects: &ObjectsSettings, people: &[PersonView], value: Optio
         Some(SensorValue::Objects(present)) => present.iter().map(|(key, count)| format!("{} {count}", objects.key_name(*key, people))).collect::<Vec<_>>().join(" · "),
         _ => "?".into(),
     }
+}
+
+/// "629.558 m³": the value with its unit.
+fn number_label(reading: &ReadingSettings, value: Option<&SensorValue>) -> String {
+    match value {
+        Some(SensorValue::Number(number)) => with_unit(number, reading.unit.as_str()),
+        _ => "?".into(),
+    }
+}
+
+fn with_unit(value: impl std::fmt::Display, unit: &str) -> String {
+    if unit.is_empty() { value.to_string() } else { format!("{value} {unit}") }
 }
 
 fn box_label_name(objects: &ObjectsSettings, label: BoxLabel) -> String {
@@ -192,8 +220,11 @@ fn new_sensor(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, form: 
     ui.group(|ui| {
         ui.horizontal(|ui| {
             ui.label("Tipo");
-            ui.radio_value(&mut form.objects, false, "Estado");
-            ui.radio_value(&mut form.objects, true, "Objetos");
+            ui.radio_value(&mut form.kind, NewKind::States, "Estado");
+            ui.radio_value(&mut form.kind, NewKind::Objects, "Objetos");
+            if ui.radio_value(&mut form.kind, NewKind::Reading, "Leitura").changed() {
+                form.stream = StreamKind::Main;
+            }
         });
         ui.label("Nome");
         ui.text_edit_singleline(&mut form.name);
@@ -220,17 +251,24 @@ fn new_sensor(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, form: 
             ui.radio_value(&mut form.stream, StreamKind::Sub, "Sub");
             ui.radio_value(&mut form.stream, StreamKind::Main, "Main");
         });
-        if form.objects {
-            ui.label(format!("Objetos ({} de {OBJECT_MAX_CLASSES})", form.classes.len()));
-            class_picker(ui, "new-sensor-classes", &mut form.classes);
-        } else {
-            for (index, state) in form.states.iter_mut().enumerate() {
-                ui.horizontal(|ui| { ui.label(format!("Estado {}", index + 1)); ui.text_edit_singleline(state); });
+        match form.kind {
+            NewKind::Objects => {
+                ui.label(format!("Objetos ({} de {OBJECT_MAX_CLASSES})", form.classes.len()));
+                class_picker(ui, "new-sensor-classes", &mut form.classes);
             }
-            ui.horizontal(|ui| {
-                if ui.add_enabled(form.states.len() < MAX_STATES, egui::Button::new("+ Estado")).clicked() { form.states.push(String::new()); }
-                if ui.add_enabled(form.states.len() > 1, egui::Button::new("− Estado")).clicked() { form.states.pop(); }
-            });
+            NewKind::States => {
+                for (index, state) in form.states.iter_mut().enumerate() {
+                    ui.horizontal(|ui| { ui.label(format!("Estado {}", index + 1)); ui.text_edit_singleline(state); });
+                }
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(form.states.len() < MAX_STATES, egui::Button::new("+ Estado")).clicked() { form.states.push(String::new()); }
+                    if ui.add_enabled(form.states.len() > 1, egui::Button::new("− Estado")).clicked() { form.states.pop(); }
+                });
+            }
+            NewKind::Reading => {
+                ui.weak("Depois de criar, desenhe na aba Ao vivo uma caixa justa em volta do número.");
+                ui.push_id("new-sensor-reading", |ui| reading_editor(ui, &mut form.reading));
+            }
         }
         ui.horizontal(|ui| {
             if ui.button("Criar").clicked() {
@@ -238,9 +276,13 @@ fn new_sensor(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, form: 
                     let source = if form.use_url { SourceSpec::Url(form.url.clone().try_into()?) }
                         else { SourceSpec::Dvr(form.camera.clone().ok_or(InvalidInput("escolha uma câmera"))?) };
                     let name: Name = form.name.clone().try_into()?;
-                    let settings = if form.objects { Settings::new_objects(name, form.classes.clone().try_into()?) } else {
-                        let states = form.states.iter().enumerate().map(|(i, name)| Ok(StateDef { key: ((i + 1) as u8).try_into()?, name: name.clone().try_into()? })).collect::<Result<Vec<_>, InvalidInput>>()?.try_into()?;
-                        Settings::new_states(name, states)
+                    let settings = match form.kind {
+                        NewKind::Objects => Settings::new_objects(name, form.classes.clone().try_into()?),
+                        NewKind::Reading => Settings::new_reading(name, form.reading.clone()),
+                        NewKind::States => {
+                            let states = form.states.iter().enumerate().map(|(i, name)| Ok(StateDef { key: ((i + 1) as u8).try_into()?, name: name.clone().try_into()? })).collect::<Result<Vec<_>, InvalidInput>>()?.try_into()?;
+                            Settings::new_states(name, states)
+                        }
                     };
                     Ok((source, settings))
                 })();
@@ -308,11 +350,19 @@ fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &
             if ui.button("Cancelar exclusão").clicked() { panel.delete_confirm = false; }
         });
     }
-    if let KindSettings::Objects(objects) = &entry.settings.kind { objects_settings(ui, entry, objects, scene.sensors.system.as_ref(), actions); }
-    let samples = if matches!(entry.settings.kind, KindSettings::Objects(_)) { "Ensinados" } else { "Amostras" };
+    match &entry.settings.kind {
+        KindSettings::Objects(objects) => objects_settings(ui, entry, objects, scene.sensors.system.as_ref(), actions),
+        KindSettings::Reading(reading) => reading_settings(ui, panel, entry, reading, actions),
+        KindSettings::States(_) => {}
+    }
+    let tabs: &[(Tab, &str)] = match entry.settings.kind {
+        KindSettings::States(_) => &[(Tab::Live, "Ao vivo"), (Tab::Samples, "Amostras"), (Tab::Review, "Revisão"), (Tab::History, "Histórico")],
+        KindSettings::Objects(_) => &[(Tab::Live, "Ao vivo"), (Tab::Samples, "Ensinados"), (Tab::Review, "Revisão"), (Tab::History, "Histórico")],
+        KindSettings::Reading(_) => &[(Tab::Live, "Ao vivo"), (Tab::Review, "Revisão"), (Tab::History, "Histórico")],
+    };
     ui.horizontal(|ui| {
-        for (tab, label) in [(Tab::Live, "Ao vivo"), (Tab::Samples, samples), (Tab::Review, "Revisão"), (Tab::History, "Histórico")] {
-            if ui.selectable_value(&mut panel.tab, tab, label).changed() { panel.opened = None; panel.before = None; panel.samples_before = None; panel.sample_pages.clear(); }
+        for (tab, label) in tabs {
+            if ui.selectable_value(&mut panel.tab, *tab, *label).changed() { panel.opened = None; panel.before = None; panel.samples_before = None; panel.sample_pages.clear(); }
         }
     });
     let Some(focus) = scene.sensors.focus.as_ref().filter(|f| f.sensor == Some(entry.id)) else { ui.spinner(); return };
@@ -367,7 +417,12 @@ fn selected(ui: &mut egui::Ui, scene: &Scene, panel: &mut SensorsPanel, entry: &
                             if let Some(reason) = row.review { ui.label(review_label(entry, people, reason)); }
                         });
                     });
-                    if panel.tab == Tab::Review { review_answers(ui, entry, row, people, &mut panel.new_person, &mut panel.error, actions); }
+                    if panel.tab == Tab::Review {
+                        match &entry.settings.kind {
+                            KindSettings::Reading(reading) => reading_answers(ui, entry.id, reading, row, &mut panel.corrections, &mut panel.error, actions),
+                            _ => review_answers(ui, entry, row, people, &mut panel.new_person, &mut panel.error, actions),
+                        }
+                    }
                 });
             }
             if let Detail::History { older, .. } = &focus.detail {
@@ -393,6 +448,7 @@ fn label_choices(kind: &KindSettings) -> Vec<(SampleLabel, String)> {
     match kind {
         KindSettings::States(states) => states.states.iter().map(|s| (SampleLabel::State(s.key), s.name.as_str().to_owned())).collect(),
         KindSettings::Objects(objects) => box_choices(objects, true).into_iter().map(|label| (SampleLabel::Box(label), box_label_name(objects, label))).collect(),
+        KindSettings::Reading(_) => Vec::new(),
     }
 }
 
@@ -403,8 +459,10 @@ fn box_choices(objects: &ObjectsSettings, found_by_detector: bool) -> Vec<BoxLab
 }
 
 fn history_label(entry: &SensorEntry, people: &[PersonView], row: &HistoryItem) -> String {
-    let KindSettings::Objects(objects) = &entry.settings.kind else {
-        return format!("{} · {:.0}%", state_label(entry, Some(&row.value)), row.confidence * 100.0);
+    let objects = match &entry.settings.kind {
+        KindSettings::Objects(objects) => objects,
+        KindSettings::Reading(reading) => return reading_history_label(reading, row),
+        KindSettings::States(_) => return format!("{} · {:.0}%", state_label(entry, Some(&row.value)), row.confidence * 100.0),
     };
     let events: Vec<String> = row.events.iter().map(|event| match event {
         ObjectEvent::On(key) => format!("{} chegou", objects.key_name(*key, people)),
@@ -427,7 +485,8 @@ fn review_label(entry: &SensorEntry, people: &[PersonView], reason: ReviewReason
             format!("É {}? ({:.0}% parecido)", person_name(people, person), similarity * 100.0)
         }
         (ReviewReason::Face(FaceQuestion { person: None, .. }), _) => "Quem é? Rosto de ninguém nomeado".into(),
-        (ReviewReason::Ask(_), KindSettings::States(_)) => "Pergunta".into(),
+        (ReviewReason::Rejected(problem), _) => format!("Rejeitada: {}", problem_label(problem)),
+        (ReviewReason::Ask(_), KindSettings::States(_) | KindSettings::Reading(_)) => "Pergunta".into(),
     }
 }
 
@@ -458,10 +517,282 @@ fn review_answers(ui: &mut egui::Ui, entry: &SensorEntry, row: &HistoryItem, peo
                     if ui.button(format!("É {}", state.name.as_str())).clicked() { actions.sensors.push(resolve(Some(SampleLabel::State(state.key)))); }
                 }
             }
-            (KindSettings::Objects(_), _) => {}
+            (KindSettings::Objects(_) | KindSettings::Reading(_), _) => {}
         }
         if ui.button("Descartar").clicked() { actions.sensors.push(resolve(None)); }
     });
+}
+
+/// A rejected reading: it was read right, the display showed another number, or dismiss it.
+fn reading_answers(ui: &mut egui::Ui, id: SensorId, reading: &ReadingSettings, row: &HistoryItem, corrections: &mut HashMap<HistoryId, String>, error: &mut Option<String>, actions: &mut Actions) {
+    let answer = |answer: ReadingAnswer| UserCommand::AnswerReading { id, item: row.id, answer };
+    ui.horizontal_wrapped(|ui| {
+        if let Some(value) = row.read.as_ref().and_then(|r| r.value)
+            && ui.button(format!("Leitura certa ({})", with_unit(value, reading.unit.as_str()))).clicked()
+        {
+            actions.sensors.push(answer(ReadingAnswer::ReadRight));
+        }
+        let typed = corrections.entry(row.id).or_default();
+        ui.add(egui::TextEdit::singleline(typed).hint_text("O visor mostrava…").desired_width(120.0));
+        let typed = typed.clone();
+        if ui.button("Corrigir").clicked() {
+            match reading.typed(&typed) {
+                Some(value) => {
+                    actions.sensors.push(answer(ReadingAnswer::Showed(value)));
+                    corrections.remove(&row.id);
+                }
+                None => *error = Some("Digite o número que o visor mostrava, ex.: 629.558 ou 0629558; tempo como 1:25 ou 85.".into()),
+            }
+        }
+        if ui.button("Descartar").clicked() { actions.sensors.push(UserCommand::Resolve { id, item: row.id, label: None }); }
+    });
+}
+
+/// "629.558 m³ · leu «0629551» (93%) · rejeitada: o contador desceu".
+fn reading_history_label(reading: &ReadingSettings, row: &HistoryItem) -> String {
+    let published = number_label(reading, Some(&row.value));
+    let Some(read) = &row.read else { return published };
+    let text = if read.text.is_empty() { "—" } else { read.text.as_str() };
+    let again = if read.repeats > 0 { format!(" · lida de novo {} vezes", read.repeats) } else { String::new() };
+    format!("{published} · leu «{text}» ({:.0}%) · {}{again}", read.score * 100.0, outcome_label(read.outcome))
+}
+
+fn outcome_label(outcome: ReadOutcome) -> String {
+    match outcome {
+        ReadOutcome::Accepted => "aceita".into(),
+        ReadOutcome::Settling => "assentando (a última roda está girando; o valor fica)".into(),
+        ReadOutcome::Rejected(problem) => format!("rejeitada: {}", problem_label(problem)),
+    }
+}
+
+fn problem_label(problem: ReadProblem) -> &'static str {
+    match problem {
+        ReadProblem::NothingRead => "nada lido",
+        ReadProblem::Unsure => "leitura insegura",
+        ReadProblem::WrongDigitCount => "número de dígitos diferente das rodas",
+        ReadProblem::WentDown => "o contador desceu",
+        ReadProblem::ChangedTooMuch => "mudou mais que o limite",
+        ReadProblem::CameraChanged => "a imagem da câmera mudou de tamanho",
+    }
+}
+
+/// A value without trailing zeros, at most four decimals.
+fn amount(value: f64) -> String {
+    let text = format!("{value:.4}");
+    text.trim_end_matches('0').trim_end_matches('.').to_owned()
+}
+
+/// The value with its unit and flow, what the reader saw, the last reading and how the readings go.
+fn reading_live(ui: &mut egui::Ui, images: &HashMap<ImageId, TextureHandle>, entry: &SensorEntry, reading: &ReadingSettings, live: &ReadingLive, focus: &FocusView) {
+    let unit = reading.unit.as_str();
+    ui.label(egui::RichText::new(number_label(reading, entry.value.as_ref())).size(24.0).strong());
+    if let Some(rate) = live.rate {
+        ui.label(format!("Vazão: {} {}", amount(rate), reading.rate_unit().0));
+    }
+    if let Some(seen) = focus.seen {
+        ui.weak("O que o leitor viu:");
+        image(ui, images, seen, ui.available_width().min(480.0));
+    }
+    match &live.last {
+        Some(last) => {
+            let text = if last.text.is_empty() { "—" } else { last.text.as_str() };
+            ui.label(format!("Última leitura: «{text}» · {:.0}% · {}", last.score * 100.0, outcome_label(last.outcome)));
+        }
+        None => { ui.weak("Ainda sem leitura neste processo."); }
+    }
+    if let Some(share) = live.accepted { ui.weak(format!("Aceitas nas últimas 24 h: {share:.1}%")); }
+    if let ReadingMode::Counter { limit, .. } = reading.mode {
+        let allowed = live.limit.map_or_else(|| "sem limite de subida".into(), |l| format!("pode subir até {} agora", with_unit(amount(l), unit)));
+        ui.weak(format!("Limite: {allowed}"));
+        match (limit, live.learned) {
+            (ChangeLimit::Auto { .. }, Some(learned)) => {
+                ui.weak(format!("Aprendido em {} dias: até {} por hora e {} por dia", learned.days, with_unit(amount(learned.per_hour), unit), with_unit(amount(learned.per_day), unit)));
+            }
+            (ChangeLimit::Auto { .. }, None) => { ui.weak(format!("Aprendendo o limite: {} de 7 dias com leituras", live.days)); }
+            _ => {}
+        }
+    }
+    if live.review_pending > 0 { ui.weak(format!("{} leituras rejeitadas na revisão", live.review_pending)); }
+    egui::CollapsingHeader::new("Qualidade").id_salt(("quality", entry.id)).show(ui, |ui| {
+        for period in &live.quality {
+            let name = match period.days { 1 => "Hoje".to_owned(), days => format!("{days} dias") };
+            let share = if period.reads > 0 { format!(" · {:.0}% aceitas", 100.0 * f64::from(period.accepted) / f64::from(period.reads)) } else { String::new() };
+            let rejected: Vec<String> = period.rejected.iter().map(|(problem, count)| format!("{} {count}", problem_label(*problem))).collect();
+            let rejected = if rejected.is_empty() { String::new() } else { format!(" · rejeitadas: {}", rejected.join(", ")) };
+            ui.label(format!("{name}: {} leituras{share}{rejected}", period.reads));
+        }
+    });
+}
+
+/// A reading sensor's settings, edited as a draft and saved with one `Configure`.
+fn reading_settings(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, reading: &ReadingSettings, actions: &mut Actions) {
+    egui::CollapsingHeader::new("Leitura: modo, visor, unidade e limite").id_salt(("reading", entry.id)).show(ui, |ui| {
+        if panel.reading_draft.as_ref().is_none_or(|(id, _)| *id != entry.id) {
+            panel.reading_draft = Some((entry.id, reading.clone()));
+        }
+        let (_, draft) = panel.reading_draft.as_mut().expect("set above");
+        ui.push_id(("reading-editor", entry.id), |ui| reading_editor(ui, draft));
+        let changed = draft != reading;
+        ui.horizontal(|ui| {
+            if ui.add_enabled(changed, egui::Button::new("Salvar leitura")).clicked() {
+                let mut settings = entry.settings.clone();
+                settings.kind = KindSettings::Reading(draft.clone());
+                actions.sensors.push(UserCommand::Configure { id: entry.id, settings });
+            }
+            if ui.add_enabled(changed, egui::Button::new("Desfazer")).clicked() { *draft = reading.clone(); }
+        });
+    });
+}
+
+fn mode_name(mode: &ReadingMode) -> &'static str {
+    match mode {
+        ReadingMode::Counter { .. } => "Contador (só sobe: água, gás, energia)",
+        ReadingMode::Value { .. } => "Valor (qualquer número)",
+        ReadingMode::TimeLeft { .. } => "Tempo restante (h:mm ou minutos)",
+    }
+}
+
+fn display_name(display: &ReadingDisplay) -> &'static str {
+    match display {
+        ReadingDisplay::Auto => "Automático",
+        ReadingDisplay::Led => "LED (dígitos claros no escuro)",
+        ReadingDisplay::Lcd => "LCD (dígitos escuros no claro)",
+        ReadingDisplay::Counter { .. } => "Contador de rodas",
+    }
+}
+
+fn limit_name(limit: &ChangeLimit) -> &'static str {
+    match limit {
+        ChangeLimit::Auto { .. } => "Automático (aprende com as leituras)",
+        ChangeLimit::Fixed { .. } => "Taxa fixa por hora",
+        ChangeLimit::Step { .. } => "Passo fixo por leitura",
+        ChangeLimit::Off => "Sem limite",
+    }
+}
+
+fn amount_field(ui: &mut egui::Ui, value: &mut Amount, suffix: &str) {
+    let mut v = f64::from(*value);
+    if ui.add(egui::DragValue::new(&mut v).range(0.0..=MAX_AMOUNT).speed(0.01).max_decimals(4).suffix(suffix)).changed()
+        && let Ok(amount) = Amount::try_from(v)
+    {
+        *value = amount;
+    }
+}
+
+/// Mode, display, decimals, unit, confidence, confirmations and, for a counter, how fast it may
+/// go up (origin `READING_DEFAULTS`, `READING_LIMITS`).
+fn reading_editor(ui: &mut egui::Ui, reading: &mut ReadingSettings) {
+    let standard = 40.0 * 10f64.powi(-i32::from(u8::from(reading.decimals)));
+    egui::ComboBox::from_id_salt("mode").selected_text(mode_name(&reading.mode)).show_ui(ui, |ui| {
+        let choices = [
+            ReadingMode::Counter { limit: ChangeLimit::Auto { max_rate: Amount::ZERO }, rate_window: RateWindow::DEFAULT },
+            ReadingMode::Value { max_step: Amount::ZERO },
+            ReadingMode::TimeLeft { max_step: Amount::ZERO },
+        ];
+        for choice in choices {
+            let current = std::mem::discriminant(&reading.mode) == std::mem::discriminant(&choice);
+            if ui.selectable_label(current, mode_name(&choice)).clicked() && !current {
+                if matches!(choice, ReadingMode::TimeLeft { .. }) && reading.unit.as_str().is_empty() {
+                    reading.unit = UnitLabel::try_from("min".to_owned()).expect("a short unit");
+                }
+                reading.mode = choice;
+            }
+        }
+    });
+    egui::ComboBox::from_id_salt("display").selected_text(display_name(&reading.display)).show_ui(ui, |ui| {
+        let choices = [ReadingDisplay::Auto, ReadingDisplay::Led, ReadingDisplay::Lcd, ReadingDisplay::Counter { digits: Digits::DEFAULT, reader: CounterReader::Wheels(WheelModel::default()) }];
+        for choice in choices {
+            let current = std::mem::discriminant(&reading.display) == std::mem::discriminant(&choice);
+            if ui.selectable_label(current, display_name(&choice)).clicked() && !current { reading.display = choice; }
+        }
+    });
+    if let ReadingDisplay::Counter { digits, reader } = &mut reading.display {
+        ui.horizontal(|ui| {
+            let mut n = u8::from(*digits);
+            if ui.add(egui::DragValue::new(&mut n).range(DIGITS_LIMITS.0..=DIGITS_LIMITS.1).suffix(" rodas")).changed()
+                && let Ok(d) = Digits::try_from(n)
+            {
+                *digits = d;
+            }
+            let wheels = matches!(reader, CounterReader::Wheels(_));
+            if ui.radio(wheels, "Leitor de rodas").clicked() && !wheels { *reader = CounterReader::Wheels(WheelModel::default()); }
+            if ui.radio(!wheels, "Texto (OCR)").clicked() { *reader = CounterReader::Ocr; }
+        });
+        if let CounterReader::Wheels(model) = reader {
+            egui::ComboBox::from_id_salt("wheels").selected_text(model.name()).show_ui(ui, |ui| {
+                for choice in WheelModel::ALL { ui.selectable_value(model, choice, choice.name()).on_hover_text(choice.description()); }
+            });
+        }
+    }
+    ui.horizontal(|ui| {
+        if !matches!(reading.mode, ReadingMode::TimeLeft { .. }) {
+            let mut decimals = u8::from(reading.decimals);
+            if ui.add(egui::DragValue::new(&mut decimals).range(0..=MAX_DECIMALS).suffix(" casas decimais")).changed()
+                && let Ok(d) = Decimals::try_from(decimals)
+            {
+                reading.decimals = d;
+            }
+        }
+        let mut unit = reading.unit.as_str().to_owned();
+        ui.label("Unidade");
+        if ui.add(egui::TextEdit::singleline(&mut unit).desired_width(60.0)).changed()
+            && let Ok(u) = UnitLabel::try_from(unit)
+        {
+            reading.unit = u;
+        }
+        for suggestion in ["m³", "L", "kWh", "Wh", "min"] {
+            if ui.small_button(suggestion).clicked() { reading.unit = UnitLabel::try_from(suggestion.to_owned()).expect("a short unit"); }
+        }
+    });
+    ui.horizontal(|ui| {
+        let mut threshold = f32::from(reading.threshold);
+        if ui.add(egui::Slider::new(&mut threshold, 0.0..=1.0).text("confiança mínima")).changed()
+            && let Ok(t) = Unit::try_from(threshold)
+        {
+            reading.threshold = t;
+        }
+        let mut debounce = u8::from(reading.debounce);
+        if ui.add(egui::DragValue::new(&mut debounce).range(DEBOUNCE_LIMITS.0..=DEBOUNCE_LIMITS.1).suffix(" leituras iguais")).changed()
+            && let Ok(d) = Debounce::try_from(debounce)
+        {
+            reading.debounce = d;
+        }
+    });
+    match &mut reading.mode {
+        ReadingMode::Counter { limit, rate_window } => {
+            egui::ComboBox::from_id_salt("limit").selected_text(limit_name(limit)).show_ui(ui, |ui| {
+                let fill = |v: f64| Amount::try_from(v).unwrap_or(Amount::ZERO);
+                let choices = [
+                    ChangeLimit::Auto { max_rate: Amount::ZERO },
+                    ChangeLimit::Fixed { max_rate: fill(standard * 60.0) },
+                    ChangeLimit::Step { max_step: fill(standard) },
+                    ChangeLimit::Off,
+                ];
+                for choice in choices {
+                    let current = std::mem::discriminant(&*limit) == std::mem::discriminant(&choice);
+                    if ui.selectable_label(current, limit_name(&choice)).clicked() && !current { *limit = choice; }
+                }
+            });
+            ui.horizontal(|ui| match limit {
+                ChangeLimit::Auto { max_rate } => { ui.label("Até aprender, no máximo"); amount_field(ui, max_rate, " por hora (0 = padrão)"); }
+                ChangeLimit::Fixed { max_rate } => { ui.label("No máximo"); amount_field(ui, max_rate, " por hora (0 = sem limite)"); }
+                ChangeLimit::Step { max_step } => { ui.label("No máximo"); amount_field(ui, max_step, " por leitura (0 = sem limite)"); }
+                ChangeLimit::Off => { ui.weak("Qualquer subida é aceita; descer continua rejeitado."); }
+            });
+            ui.horizontal(|ui| {
+                let mut minutes = u32::from(*rate_window);
+                ui.label("Vazão medida em");
+                if ui.add(egui::DragValue::new(&mut minutes).range(RATE_WINDOW_LIMITS_MIN.0..=RATE_WINDOW_LIMITS_MIN.1).suffix(" min")).changed()
+                    && let Ok(w) = RateWindow::try_from(minutes)
+                {
+                    *rate_window = w;
+                }
+            });
+        }
+        ReadingMode::Value { max_step } | ReadingMode::TimeLeft { max_step } => {
+            ui.horizontal(|ui| { ui.label("Maior mudança entre leituras"); amount_field(ui, max_step, " (0 = sem limite)"); });
+        }
+    }
 }
 
 /// One button per person (but `except`) and a field to name a new one; the person chosen.
@@ -523,6 +854,10 @@ fn objects_settings(ui: &mut egui::Ui, entry: &SensorEntry, objects: &ObjectsSet
 
 fn live(ui: &mut egui::Ui, panel: &mut SensorsPanel, entry: &SensorEntry, people: &[PersonView], focus: &FocusView, actions: &mut Actions) {
     let objects = match (&entry.settings.kind, &entry.live) { (KindSettings::Objects(o), KindLive::Objects(l)) => Some((o, l)), _ => None };
+    if let (KindSettings::Reading(reading), KindLive::Reading(state)) = (&entry.settings.kind, &entry.live) {
+        reading_live(ui, &panel.images, entry, reading, state, focus);
+        ui.weak("Desenhe um retângulo justo em volta do número e salve a região.");
+    }
     ui.horizontal(|ui| {
         if objects.is_some() {
             ui.selectable_value(&mut panel.teaching_boxes, false, "Região");
@@ -833,6 +1168,11 @@ fn settings(ui: &mut egui::Ui, view: &SensorsView, actions: &mut Actions) {
                 for choice in Recogniser::ALL { ui.selectable_value(&mut recogniser, choice, choice.name()).on_hover_text(choice.description()); }
             });
             if recogniser != system.recogniser { actions.sensors.push(UserCommand::SetRecogniser(recogniser)); }
+            let mut number_reader = system.number_reader;
+            egui::ComboBox::from_label("Leitor de números").selected_text(number_reader.name()).show_ui(ui, |ui| {
+                for choice in NumberReader::ALL { ui.selectable_value(&mut number_reader, choice, choice.name()).on_hover_text(choice.description()); }
+            });
+            if number_reader != system.number_reader { actions.sensors.push(UserCommand::SetNumberReader(number_reader)); }
             for model in &system.models {
                 let state = match &model.state {
                     ModelState::NotNeeded => "não baixado".into(),

@@ -35,8 +35,14 @@ pub fn vision_child(program: &Path, data: &Path, ffmpeg: &Path, logs: &Path) -> 
 /// A neural network run on the CPU. The `intel-siam-vision` binary supplies the ONNX Runtime one,
 /// so the library never names ONNX Runtime and the UI binary links none of it.
 pub trait Network {
-    /// One NCHW `f32` input; every output, in the model's order.
-    fn run(&mut self, input: Vec<f32>, shape: [usize; 4]) -> Result<Vec<Output>, String>;
+    /// NCHW `f32` inputs in the model's input order; every output, in the model's order.
+    fn run(&mut self, inputs: Vec<Tensor>) -> Result<Vec<Output>, String>;
+}
+
+/// One input of a `Network`.
+pub struct Tensor {
+    pub shape: [usize; 4],
+    pub values: Vec<f32>,
 }
 
 /// One output tensor of a `Network`.

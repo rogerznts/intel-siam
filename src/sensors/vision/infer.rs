@@ -11,7 +11,7 @@
 //!
 //! One worker thread runs `Job`s in order; one fetch thread downloads models.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
@@ -28,13 +28,15 @@ use super::Input;
 use super::faces::{self, FACES, Face, FaceIndex, Identity, MIN_FACE_PX};
 use super::logic::{self, CONTEXT_MARGIN, Detection, ObjectFilter};
 use super::pixels::{self, Rgb};
+use super::reading;
+use super::readers::{self, Grey};
 use super::store::{FaceSample, TaughtSample, TrainRow, hex};
 use super::teach::{self, TEACH, TaughtIndex, TaughtRow};
 use crate::sensors::types::{
-    ClassSet, Detector, FaceId, FaceProblem, Found, LabelId, MinSize, ModelState, ObjectClass, Recogniser, Region,
-    SampleId, SensorId, StateKey, StateSet, Unit,
+    ClassSet, CounterReader, Detector, FaceId, FaceProblem, Found, LabelId, MinSize, ModelState, NumberReader, ObjectClass,
+    ReadingDisplay, Recogniser, Region, SampleId, SensorId, StateKey, StateSet, Unit, WheelModel,
 };
-use crate::sensors::{LoadNetwork, Network, Output};
+use crate::sensors::{LoadNetwork, Network, Output, Tensor};
 
 /// A model (origin `backbones.json`, `detectors.json`). Downloaded on first need into
 /// `<data>/models/<sha256>`, verified, and renamed into place, so a file there is always complete.
@@ -128,6 +130,52 @@ const AURAFACE: ModelSpec = ModelSpec {
     std: [0.5; 3],
 };
 
+/// The number readers (origin `readers.json`, `readers`): PP-OCR text recognition, 48 high, BGR
+/// scaled to `-1..=1`; its own preprocessing is in `readers`.
+const PPOCR_TINY: ModelSpec = ModelSpec {
+    id: NumberReader::Tiny.id(),
+    name: NumberReader::Tiny.name(),
+    url: "https://huggingface.co/PaddlePaddle/PP-OCRv6_tiny_rec_onnx/resolve/2612ab37152ae0a677521bae4e1e3d4fb4cf7c30/inference.onnx",
+    sha256: "9ef676d6ed3c88256a2d92c640c44f25b0c40947e111b14b8be8f594091563e6",
+    size: 4_462_639,
+    input: readers::OCR_HEIGHT,
+    mean: [0.5; 3],
+    std: [0.5; 3],
+};
+const PPOCR_SMALL: ModelSpec = ModelSpec {
+    id: NumberReader::Small.id(),
+    name: NumberReader::Small.name(),
+    url: "https://huggingface.co/PaddlePaddle/PP-OCRv6_small_rec_onnx/resolve/b8f84f0b80c529de40b4fbb3544b84fa7233a513/inference.onnx",
+    sha256: "5435fd747c9e0efe15a96d0b378d5bd157e9492ed8fd80edf08f30d02fa24634",
+    size: 21_159_378,
+    input: readers::OCR_HEIGHT,
+    mean: [0.5; 3],
+    std: [0.5; 3],
+};
+
+/// The wheel readers (origin `readers.json`, `wheel_readers`): grey cells in `0.0..=1.0`; their
+/// shapes are `readers::wheel_spec`.
+const WHEELS_V1: ModelSpec = ModelSpec {
+    id: WheelModel::V1.id(),
+    name: WheelModel::V1.name(),
+    url: "https://huggingface.co/oleost/visionstate-wheel-reader/resolve/42f32402973b3bd3de0258766404232b11e8216f/wheels-v1.onnx",
+    sha256: "37912f885b061a7b12298872fbdfa1b73ca0664363b293a55617b1d3680a98ac",
+    size: 2_264_691,
+    input: 48,
+    mean: [0.0; 3],
+    std: [1.0; 3],
+};
+const WHEELS_V2: ModelSpec = ModelSpec {
+    id: WheelModel::V2.id(),
+    name: WheelModel::V2.name(),
+    url: "https://huggingface.co/oleost/visionstate-wheel-reader/resolve/563f365a5b377c10c7248517ef2576ac5cee3cbf/wheels-v2.onnx",
+    sha256: "5644705e1f0e684b30bf3c7a6cb23e7eb1ddda616cd16b5321423f45bf7fd8b6",
+    size: 6_102_872,
+    input: 48,
+    mean: [0.0; 3],
+    std: [1.0; 3],
+};
+
 /// Every model the vision process may need. New models are new variants and constants here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Model {
@@ -135,6 +183,8 @@ pub enum Model {
     Detector(Detector),
     FaceDetector,
     Recogniser(Recogniser),
+    NumberReader(NumberReader),
+    WheelReader(WheelModel),
 }
 
 impl Model {
@@ -148,6 +198,18 @@ impl Model {
             Self::FaceDetector => &YUNET,
             Self::Recogniser(Recogniser::Sface) => &SFACE,
             Self::Recogniser(Recogniser::AuraFace) => &AURAFACE,
+            Self::NumberReader(NumberReader::Tiny) => &PPOCR_TINY,
+            Self::NumberReader(NumberReader::Small) => &PPOCR_SMALL,
+            Self::WheelReader(WheelModel::V1) => &WHEELS_V1,
+            Self::WheelReader(WheelModel::V2) => &WHEELS_V2,
+        }
+    }
+
+    /// What reads a reading sensor's display: its wheel reader, or the number reader.
+    pub fn reader(display: ReadingDisplay, number: NumberReader) -> Self {
+        match display {
+            ReadingDisplay::Counter { reader: CounterReader::Wheels(wheels), .. } => Self::WheelReader(wheels),
+            _ => Self::NumberReader(number),
         }
     }
 }
@@ -169,6 +231,24 @@ pub enum Job {
     Detect { sensor: SensorId, frame: Arc<ColorImage>, request: DetectRequest },
     /// Embeds the taught faces without a cached vector, then builds the people's index.
     IndexFaces { recogniser: Recogniser, rows: Vec<FaceSample> },
+    /// One check of a reading sensor: read the number in the region.
+    Read { sensor: SensorId, frame: Arc<ColorImage>, request: ReadRequest },
+}
+
+/// What a check of a reading sensor needs from its settings.
+pub struct ReadRequest {
+    pub region: Region,
+    pub display: ReadingDisplay,
+    /// The global number reader, for a display not read by wheels.
+    pub number: NumberReader,
+}
+
+/// What the reader saw: the text, how sure it was, and the picture it read.
+#[derive(Clone)]
+pub struct ReadText {
+    pub text: String,
+    pub score: f32,
+    pub seen: Rgb,
 }
 
 /// What a check of an object sensor needs from its settings.
@@ -193,6 +273,7 @@ pub enum Done {
     Indexed { sensor: SensorId, outcome: Result<Indexed, String> },
     Detected { sensor: SensorId, found: Result<Vec<Found>, String> },
     FacesIndexed { recogniser: Recogniser, outcome: Result<FacesIndexed, String> },
+    Read { sensor: SensorId, read: Result<ReadText, String> },
 }
 
 pub struct Trained {
@@ -261,7 +342,10 @@ pub fn spawn(dir: PathBuf, engine: Sender<Input>, load: LoadNetwork) -> Infer {
     let (fetch, fetch_rx) = mpsc::channel();
     let worker = {
         let (dir, engine) = (dir.clone(), engine.clone());
-        thread::spawn(move || work(Networks { dir, load, backbone: None, detector: None, faces: None, recogniser: None }, job_rx, &engine))
+        thread::spawn(move || {
+            let networks = Networks { dir, load, backbone: None, detector: None, faces: None, recogniser: None, number: None, wheels: BTreeMap::new() };
+            work(networks, job_rx, &engine)
+        })
     };
     thread::spawn(move || fetch_models(&dir, fetch_rx, &engine));
     Infer { jobs, fetch, worker: Some(worker) }
@@ -275,6 +359,9 @@ struct Networks {
     detector: Option<(Detector, Box<dyn Network>)>,
     faces: Option<Box<dyn Network>>,
     recogniser: Option<(Recogniser, Box<dyn Network>)>,
+    number: Option<(NumberReader, Box<dyn Network>)>,
+    /// Each counter names its own wheel reader.
+    wheels: BTreeMap<WheelModel, Box<dyn Network>>,
 }
 
 impl Networks {
@@ -310,6 +397,23 @@ impl Networks {
         Ok(self.recogniser.as_mut().map(|(_, n)| n.as_mut()).expect("just loaded"))
     }
 
+    /// Another number reader than the loaded one replaces it.
+    fn number(&mut self, which: NumberReader) -> Result<&mut dyn Network, String> {
+        if self.number.as_ref().is_none_or(|(n, _)| *n != which) {
+            self.number = None;
+            self.number = Some((which, self.open(Model::NumberReader(which))?));
+        }
+        Ok(self.number.as_mut().map(|(_, n)| n.as_mut()).expect("just loaded"))
+    }
+
+    fn wheels(&mut self, which: WheelModel) -> Result<&mut dyn Network, String> {
+        if !self.wheels.contains_key(&which) {
+            let network = self.open(Model::WheelReader(which))?;
+            self.wheels.insert(which, network);
+        }
+        Ok(self.wheels.get_mut(&which).map(|n| n.as_mut()).expect("just loaded"))
+    }
+
     fn open(&self, model: Model) -> Result<Box<dyn Network>, String> {
         (self.load)(&self.dir.join(model.spec().sha256)).map_err(|e| format!("modelo: {e}"))
     }
@@ -335,11 +439,88 @@ fn work(mut networks: Networks, jobs: Receiver<Job>, engine: &Sender<Input>) {
             Job::IndexFaces { recogniser, rows } => {
                 Done::FacesIndexed { recogniser, outcome: index_faces(&mut networks, recogniser, rows) }
             }
+            Job::Read { sensor, frame, request } => Done::Read { sensor, read: read(&mut networks, &frame, &request) },
         };
         if engine.send(Input::Infer(done)).is_err() {
             return;
         }
     }
+}
+
+/// One check of a reading sensor (origin `read_number`): the region's bounding box, read by its
+/// wheel reader or by the number reader the way its display asks.
+fn read(networks: &mut Networks, frame: &ColorImage, request: &ReadRequest) -> Result<ReadText, String> {
+    let area = logic::region_box(&request.region, 0.0);
+    if let ReadingDisplay::Counter { digits, reader: CounterReader::Wheels(model) } = request.display {
+        let [fw, fh] = frame.size;
+        let x0 = ((area[0] * fw as f32) as usize).min(fw - 1);
+        let y0 = ((area[1] * fh as f32) as usize).min(fh - 1);
+        let x1 = ((area[2] * fw as f32) as usize).clamp(x0 + 1, fw);
+        let y1 = ((area[3] * fh as f32) as usize).clamp(y0 + 1, fh);
+        return read_wheels(networks.wheels(model)?, model, frame, usize::from(u8::from(digits)), [x0, y0, x1, y1]);
+    }
+    let region = pixels::crop_box(frame, area);
+    let classes = readers::ocr_classes(request.number);
+    let network = networks.number(request.number)?;
+    let mut ocr = |picture: Grey| -> Result<ReadText, String> {
+        let (text, score) = read_line(network, &picture, classes)?;
+        Ok(ReadText { text, score, seen: picture.to_rgb() })
+    };
+    match request.display {
+        ReadingDisplay::Counter { digits, .. } => {
+            let digits = usize::from(u8::from(digits));
+            let line = readers::darkest(&readers::counter_line(&region, digits));
+            let mut whole: Option<ReadText> = None;
+            let mut best: Option<ReadText> = None;
+            for band in readers::counter_bands(&line) {
+                let read = ocr(band)?;
+                if reading::digit_count(&read.text) == digits && best.as_ref().is_none_or(|b| read.score > b.score) {
+                    best = Some(read.clone());
+                }
+                whole.get_or_insert(read);
+            }
+            best.or(whole).ok_or_else(|| "o contador não tem faixas".into())
+        }
+        ReadingDisplay::Led | ReadingDisplay::Lcd => ocr(readers::segments(&region, request.display == ReadingDisplay::Led)),
+        ReadingDisplay::Auto => {
+            let first = ocr(readers::plain(&region))?;
+            if !first.text.is_empty() && first.score >= readers::SEGMENTS_FALLBACK_BELOW {
+                return Ok(first);
+            }
+            let second = ocr(readers::segments(&region, readers::is_light_on_dark(&region)))?;
+            Ok(if second.score > first.score { second } else { first })
+        }
+    }
+}
+
+/// One line of digits read by the number reader.
+fn read_line(network: &mut dyn Network, picture: &Grey, classes: usize) -> Result<(String, f32), String> {
+    let (values, shape) = readers::ocr_input(picture);
+    let outputs = network.run(vec![Tensor { shape, values }]).map_err(|e| format!("leitor de números: {e}"))?;
+    let out = outputs.first().ok_or("o leitor de números não devolveu saída")?;
+    if out.shape.last() != Some(&classes) || out.values.len() % classes != 0 {
+        return Err(format!("saída do leitor de números com forma inesperada: {:?}", out.shape));
+    }
+    Ok(readers::ctc_decode(&out.values, classes))
+}
+
+/// A mechanical counter read wheel by wheel (origin `WheelReader.read_counter`): the cells of the
+/// region `[x0, y0, x1, y1)` and, for a reader with context, the cells with their neighbours, cut
+/// from the whole frame. What it saw is the cells side by side.
+fn read_wheels(network: &mut dyn Network, model: WheelModel, frame: &ColorImage, digits: usize, [x0, y0, x1, y1]: [usize; 4]) -> Result<ReadText, String> {
+    let spec = readers::wheel_spec(model);
+    let [w, h] = spec.cell;
+    let cells = readers::wheel_cells(&pixels::crop_pixels(frame, [x0, y0, x1, y1]), digits, spec.cell);
+    let mut inputs = vec![Tensor { shape: [digits, 1, h, w], values: cells.clone() }];
+    if let Some((context, width)) = spec.context {
+        let rows = pixels::crop_pixels(frame, [0, y0, frame.size[0], y1]);
+        inputs.push(Tensor { shape: [digits, 1, h, width], values: readers::wheel_context_cells(&rows, [x0, x1], digits, [width, h], context) });
+    }
+    let outputs = network.run(inputs).map_err(|e| format!("leitor de rodas: {e}"))?;
+    let logits = outputs.first().filter(|o| o.values.len() == digits * spec.bins).ok_or("saída do leitor de rodas com forma inesperada")?;
+    let probs = readers::wheel_probabilities(&logits.values, spec.bins);
+    let (text, score) = readers::wheel_reading(&probs, spec.confidence, digits);
+    Ok(ReadText { text, score, seen: readers::cells_image(&cells, spec.cell) })
 }
 
 fn train(network: &mut dyn Network, region: &Region, rows: Vec<TrainRow>) -> Result<Trained, String> {
@@ -428,7 +609,7 @@ fn detect(networks: &mut Networks, frame: &ColorImage, request: &DetectRequest) 
     let floor = if rescue { threshold.min(TEACH.rescue_floor) } else { threshold };
     let spec = Model::Detector(request.detector).spec();
     let input = tensor(&pixels::stretch(&pixels::crop_box(frame, analysed), spec.input), spec);
-    let outputs = networks.detector(request.detector)?.run(input, [1, 3, spec.input, spec.input]).map_err(|e| format!("detector: {e}"))?;
+    let outputs = networks.detector(request.detector)?.run(vec![Tensor { shape: [1, 3, spec.input, spec.input], values: input }]).map_err(|e| format!("detector: {e}"))?;
     let raw = postprocess(&outputs, floor)?;
     let filter = ObjectFilter { region: &request.region, classes: &request.classes, min_size: request.min_size };
     let mut found = logic::filter_detections(&raw, analysed, &filter, rescue);
@@ -531,7 +712,7 @@ fn find_faces(network: &mut dyn Network, regions: &[Rgb]) -> Result<Vec<Option<F
             }
             placed.push((ox as f32, oy as f32, size.map(|n| n as f32), scale));
         }
-        let outputs = network.run(canvas, [1, 3, side, side]).map_err(|e| format!("detector de rostos: {e}"))?;
+        let outputs = network.run(vec![Tensor { shape: [1, 3, side, side], values: canvas }]).map_err(|e| format!("detector de rostos: {e}"))?;
         let found = faces::decode_yunet(&outputs, side, FACES.detect_score)?;
         for (ox, oy, [w, h], scale) in placed {
             let inside = |f: &&Face| {
@@ -550,7 +731,7 @@ fn find_faces(network: &mut dyn Network, regions: &[Rgb]) -> Result<Vec<Option<F
 fn embed_face(network: &mut dyn Network, recogniser: Recogniser, aligned: &Rgb) -> Result<Vec<f32>, String> {
     let side = faces::ALIGNED;
     let input = tensor(&faces::even_light(aligned), Model::Recogniser(recogniser).spec());
-    let outputs = network.run(input, [1, 3, side, side]).map_err(|e| format!("reconhecedor de rostos: {e}"))?;
+    let outputs = network.run(vec![Tensor { shape: [1, 3, side, side], values: input }]).map_err(|e| format!("reconhecedor de rostos: {e}"))?;
     let out = outputs.first().filter(|o| !o.values.is_empty()).ok_or("o reconhecedor não devolveu saída")?;
     let norm = out.values.iter().map(|v| v * v).sum::<f32>().sqrt().max(1e-8);
     Ok(out.values.iter().map(|v| v / norm).collect())
@@ -611,7 +792,7 @@ fn read_image(path: &Path) -> Result<ColorImage, String> {
 fn embed(network: &mut dyn Network, crop: &Rgb) -> Result<Vec<f32>, String> {
     let side = BACKBONE.input;
     let input = tensor(&pixels::letterbox(crop, side), &BACKBONE);
-    let outputs = network.run(input, [1, 3, side, side]).map_err(|e| format!("inferência: {e}"))?;
+    let outputs = network.run(vec![Tensor { shape: [1, 3, side, side], values: input }]).map_err(|e| format!("inferência: {e}"))?;
     let hidden = outputs.first().ok_or("o modelo não devolveu saída")?;
     let dim = hidden.shape.last().copied().unwrap_or(0);
     if dim == 0 || hidden.values.len() % dim != 0 {

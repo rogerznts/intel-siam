@@ -245,3 +245,71 @@ de rostos no sensor, a seção Pessoas (lista, renomear, apagar, mover e excluir
 nomear tocando numa pessoa em Ensinar caixas, as perguntas "É <pessoa>?"/"Quem é?" na revisão e o selo com os nomes
 compilam e foram exercitados só pelo protocolo acima. Nenhum sensor ou pessoa do usuário foi criado; os dados do
 smoke ficaram só em `/tmp/smoke-people`.
+
+# Verificação dos sensores de Leitura
+
+## Compilação e testes
+
+`cargo build --all-targets --release`, `cargo test` (183 testes aprovados) e `cargo clippy --all-targets` terminaram
+sem avisos, em 2026-10-28. Os testes novos portam `test_reading.py` (parse, plausibilidade, contagem de dígitos,
+assentando, valor digitado, parcela aceita, vazão, decodificação CTC, posições das rodas, decodificador de rodas com
+leitura consistente, confiança da roda mais fraca, linha do contador sem divisórias, canal mais escuro, segmentos em
+imagem lisa e grande) e `test_change_limit.py` inteiro (limite no tempo, aprendizado com o segundo dia mais
+movimentado, só o tempo não visto conta, subida na janela, `accept`, `hold`, a leitura errada da issue #40). No
+engine: um contador que desce, pula, lê dígitos a menos ou inseguro é rejeitado, um passo abaixo é "assentando", a
+mesma rejeição espera na revisão uma vez só; o valor sobrevive a um reinício; confirmar ou digitar na revisão vira o
+último valor, e dígitos a menos nunca viram valor.
+
+## Smoke do processo de visão com modelos reais
+
+`/tmp/smoke-reading/driver.py` fala o protocolo 5 com `target/release/intel-siam-vision` e serve por HTTP em
+loopback o `lcd.png`, o `counter_red.jpg` e o `counter_turning.jpg` da origem, um timer LED "2:38" e uma sequência de
+LCDs desenhados pelo `tests/displays.py` da origem (mesmo tamanho do `lcd.png`). Os modelos foram baixados nesta
+máquina numa primeira rodada; a segunda rodada (`run2.log`) conferiu os SHA-256 e leu:
+
+```text
+[   0.0s] Hello {'Hello': {'protocol': 5}}
+[   0.1s] LCD automático       published=123456.7 read='0123456.7' score=0.951 outcome="Accepted"
+[   0.1s] LCD segmentos        published=123456.7 read='0123456.7' score=0.994 outcome="Accepted"
+[   0.1s] Rodas v2 vermelho    published=632.289 read='0632289' score=1.000 outcome="Accepted"
+[   0.1s] Rodas v2 girando     published=632.590 read='0632590' score=1.000 outcome="Accepted"
+[   0.1s] Rodas v1 vermelho    published=632.289 read='0632289' score=0.988 outcome="Accepted"
+[   0.1s] Rodas v1 girando     published=632.590 read='0632590' score=0.992 outcome="Accepted"
+[   0.1s] Rodas por OCR        published=632.289 read='0632289' score=0.967 outcome="Accepted"
+[   0.1s] Lavadora             published=158 read='2:38' score=0.945 outcome="Accepted"
+[   0.1s] ppocrv6-tiny 4462639 bytes, sha256 9ef676d6ed3c88256a2d92c640c44f25b0c40947e111b14b8be8f594091563e6 matches
+[   0.2s] wheels-v1 2264691 bytes, sha256 37912f885b061a7b12298872fbdfa1b73ca0664363b293a55617b1d3680a98ac matches
+[   0.2s] wheels-v2 6102872 bytes, sha256 5644705e1f0e684b30bf3c7a6cb23e7eb1ddda616cd16b5321423f45bf7fd8b6 matches
+[   0.2s] seen image 8 size [472, 96] preview 1
+[   0.2s] seq_accept.png   published=123456.7 read='0123456.7' score=0.994 outcome="Accepted"
+[   6.2s] seq_settle.png   published=123456.7 read='0123456.6' score=0.996 outcome="Settling"
+[  12.2s] seq_down.png     published=123456.7 read='0123450.0' score=0.999 outcome={"Rejected": "WentDown"}
+[  18.3s] seq_jump.png     published=123456.7 read='0123999.9' score=0.991 outcome={"Rejected": "ChangedTooMuch"}
+[  24.3s] seq_next.png     published=123456.8 read='0123456.8' score=0.980 outcome="Accepted"
+[  30.3s] review 11 {"Rejected": "ChangedTooMuch"} read 0123999.9 {"Rejected": "ChangedTooMuch"}
+[  30.3s] review 10 {"Rejected": "WentDown"} read 0123450.0 {"Rejected": "WentDown"}
+[  30.3s] quality {"days": 1, "reads": 5, "accepted": 3, "rejected": [["WentDown", 1], ["ChangedTooMuch", 1]]} accepted share 60.0 limit 1.0
+[  30.4s] exit code 0
+```
+
+- O `lcd.png` saiu `0123456.7` nos visores automático e LCD, como o teste de CI da origem.
+- `counter_red.jpg` deu `0632289` e `counter_turning.jpg` deu `0632590` nos leitores de rodas v1 e v2, os valores do
+  `test_wheel_reader_reads_a_real_meter`; no segundo, a penúltima roda está entre 8 e 9 com a última em 0, e o
+  leitor a leu certa. Lido como texto (OCR), o vermelho também deu `0632289`.
+- A sequência (limite "passo" de 1,0 kWh) aceitou 123456.7, tratou 123456.6 como assentando sem mudar o valor,
+  rejeitou a descida e o salto, que foram para a revisão e para o histórico, e aceitou 123456.8.
+- A aba Ao vivo recebeu a imagem "o que o leitor viu" (as sete células lado a lado, 472×96). O processo terminou com
+  código 0 ao fechar o stdin; todos os sensores do smoke foram apagados antes.
+
+Na primeira rodada o driver esperava a leitura de cada sensor só nas mensagens seguintes e perdia as que já tinham
+chegado; foi corrigido para olhar também o último estado recebido. Os modelos e o processo não mudaram entre as
+rodadas.
+
+## Smoke na interface real: não feito
+
+Às 23:50 a tela do Mac estava bloqueada (`CGSSessionScreenIsLocked` = true no `ioreg`), e não tentei desbloquear. O
+formulário de criação com o tipo Leitura (Main por padrão, modo, visor, rodas, unidade, casas, limite), a prévia com
+a caixa, o valor com unidade e vazão, os diagnósticos, a qualidade, as respostas da revisão (leitura certa, corrigir
+digitando, descartar), o histórico, o leitor de números nas configurações e o selo com valor e unidade compilam e
+foram exercitados só pelo protocolo acima. Nenhum sensor do usuário foi criado; os dados ficaram em
+`/tmp/smoke-reading`.
